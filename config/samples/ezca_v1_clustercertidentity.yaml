@@ -1,0 +1,9 @@
+apiVersion: ezca.keytos.io/v1
+kind: ClusterCertIdentity
+metadata:
+  labels:
+    app.kubernetes.io/name: ezca-cert-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: clustercertidentity-sample
+spec:
+  # TODO(user): Add fields here
