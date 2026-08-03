@@ -31,9 +31,27 @@ type ClusterCertIdentitySpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	// foo is an example field of ClusterCertIdentity. Edit clustercertidentity_types.go to remove/update
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name *string `json:"name"`
+
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	TenantID *string `json:"tenantID,omitempty"`
+
+	// +optional
+	AppID *string `json:"appID,omitempty"`
+
+	// +optional
+	// +kubebuilder:default:="cluster-cert-identity"
+	CertSecretName *string `json:"certSecretName,omitempty"`
+
+	// +optional
+	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
+
+	// +optional
+	// +kubebuilder:default:=20
+	RenewalThreshold *int32 `json:"RenewalThreshold,omitempty"`
 }
 
 // ClusterCertIdentityStatus defines the observed state of ClusterCertIdentity.
