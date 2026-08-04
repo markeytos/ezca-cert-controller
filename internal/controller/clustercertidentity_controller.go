@@ -71,6 +71,11 @@ const (
 	// propagationRequeue is how often the controller re-checks whether a staged
 	// certificate has become usable in Entra ID.
 	propagationRequeue = 30 * time.Second
+	// propagationGrace is the minimum time to wait after adding a key before
+	// promoting it, even once it authenticates. A single successful token
+	// acquisition only proves one token-endpoint replica has the key; this
+	// window lets it propagate to the rest.
+	propagationGrace = 5 * time.Minute
 	// propagationTimeout is how long propagation may take before the controller
 	// surfaces a Degraded condition (it keeps retrying afterwards).
 	propagationTimeout = 15 * time.Minute
@@ -311,7 +316,21 @@ func (r *ClusterCertIdentityReconciler) promoteIfReady(ctx context.Context, cci 
 		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
 	}
 
-	// Usable: promote the staged certificate into the active Secret.
+	// It authenticated on the replica we hit, but a single success does not mean
+	// every token-endpoint replica has the key yet. Wait out a grace window
+	// since the key was added before promoting, so we don't switch the active
+	// certificate to one other replicas would still reject.
+	if cci.Status.PendingSince != nil && now.Sub(cci.Status.PendingSince.Time) < propagationGrace {
+		meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
+			Type:    typeProgressingClusterCertIdentity,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Stabilizing",
+			Message: fmt.Sprintf("Renewed certificate authenticated; waiting %s for Entra ID propagation to stabilize", propagationGrace),
+		})
+		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+	}
+
+	// Usable and past the grace window: promote the staged certificate.
 	if err := r.promoteSecret(ctx, secret); err != nil {
 		tel.TrackError(err, "Failed to promote renewed certificate Secret", identityProps(cci))
 		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to promote renewed certificate: %v", err))

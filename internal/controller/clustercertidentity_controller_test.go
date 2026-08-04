@@ -103,6 +103,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		reconciler  *ClusterCertIdentityReconciler
 		ezcaClient  *fakeEZCA
 		entraClient *fakeEntra
+		clockNow    time.Time
 	)
 
 	newReconciler := func() *ClusterCertIdentityReconciler {
@@ -110,7 +111,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
 			DefaultNamespace: namespace,
-			Now:              func() time.Time { return now },
+			Now:              func() time.Time { return clockNow },
 			NewEZCAClient:    func(string) (ezcaRenewer, error) { return ezcaClient, nil },
 			NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 				return entraClient, nil
@@ -154,6 +155,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	}
 
 	BeforeEach(func() {
+		clockNow = now
 		ezcaClient = &fakeEZCA{}
 		entraClient = &fakeEntra{}
 		reconciler = newReconciler()
@@ -233,17 +235,29 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
 		Expect(cci.Status.ManagedKeyCredentials[0].KeyID).To(Equal("new-key-id"))
 
-		// Reconcile #2: still propagating -> stays staged, active unchanged.
+		reconcileNow := func() {
+			_, e := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+			Expect(e).NotTo(HaveOccurred())
+		}
+
+		// Reconcile #2: auth still failing (even past the grace window) -> staged.
+		clockNow = now.Add(6 * time.Minute)
 		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
-		Expect(err).NotTo(HaveOccurred())
+		reconcileNow()
 		Expect(hasPending()).To(BeTrue())
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
 
-		// Reconcile #3: propagation complete -> promote.
+		// Reconcile #3: auth succeeds but grace window has NOT elapsed -> still
+		// staged (guards against a false positive from one propagated replica).
+		clockNow = now
 		entraClient.verifyErr = nil
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
-		Expect(err).NotTo(HaveOccurred())
+		reconcileNow()
+		Expect(hasPending()).To(BeTrue(), "must not promote before the grace window even if auth succeeds")
+		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+
+		// Reconcile #4: auth succeeds and grace window elapsed -> promote.
+		clockNow = now.Add(6 * time.Minute)
+		reconcileNow()
 		Expect(hasPending()).To(BeFalse())
 		Expect(activeLeaf().Equal(parsedNew)).To(BeTrue(), "renewed cert must be promoted after propagation")
 
