@@ -151,6 +151,10 @@ func (in *ClusterCertIdentityStatus) DeepCopyInto(out *ClusterCertIdentityStatus
 		in, out := &in.LastRenewalTime, &out.LastRenewalTime
 		*out = (*in).DeepCopy()
 	}
+	if in.PendingSince != nil {
+		in, out := &in.PendingSince, &out.PendingSince
+		*out = (*in).DeepCopy()
+	}
 	if in.ManagedKeyCredentials != nil {
 		in, out := &in.ManagedKeyCredentials, &out.ManagedKeyCredentials
 		*out = make([]ManagedKeyCredential, len(*in))

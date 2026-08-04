@@ -127,6 +127,15 @@ func NewClient(tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rs
 	}, nil
 }
 
+// VerifyCredential attempts to acquire a Graph token with the client's
+// certificate. It returns an error while the certificate is not yet usable —
+// for example, a freshly added keyCredential that is still propagating across
+// Entra ID's token-issuing replicas.
+func (c *Client) VerifyCredential(ctx context.Context) error {
+	_, err := c.cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{c.scope}})
+	return err
+}
+
 // AddKey adds a certificate to the app registration and returns the keyId Graph
 // assigned to it. newCertDER is the DER encoding of the certificate to add.
 func (c *Client) AddKey(ctx context.Context, objectID string, newCertDER []byte) (string, error) {

@@ -24,6 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -176,6 +177,24 @@ func TestGraphErrorStatus(t *testing.T) {
 	c := testClient(t, doer)
 	if _, err := c.AddKey(context.Background(), "obj-1", []byte{0x30}); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("expected 403 error, got %v", err)
+	}
+}
+
+type errToken struct{ err error }
+
+func (e errToken) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{}, e.err
+}
+
+func TestVerifyCredential(t *testing.T) {
+	c := testClient(t, &fakeDoer{})
+	if err := c.VerifyCredential(context.Background()); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+
+	c.cred = errToken{err: errors.New("AADSTS700027")}
+	if err := c.VerifyCredential(context.Background()); err == nil {
+		t.Fatalf("expected error while credential is not yet usable")
 	}
 }
 

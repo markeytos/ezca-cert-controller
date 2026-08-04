@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"time"
 
@@ -55,9 +56,12 @@ func (f *fakeEZCA) RenewCertificateV3(_ context.Context, _ *x509.Certificate, _ 
 }
 
 type fakeEntra struct {
-	added   [][]byte
-	removed []string
+	verifyErr error
+	added     [][]byte
+	removed   []string
 }
+
+func (f *fakeEntra) VerifyCredential(_ context.Context) error { return f.verifyErr }
 
 func (f *fakeEntra) AddKey(_ context.Context, _ string, der []byte) (string, error) {
 	f.added = append(f.added, der)
@@ -194,22 +198,62 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(cci.Status.Thumbprint).To(Equal(pki.Thumbprint(parsedNew)))
 	})
 
-	It("renews and rotates the certificate onto the app registration", func() {
-		certPEM, keyPEM, _ := genCert("app.ezca.io", now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+	It("adds the renewed cert to the app, waits for propagation, then promotes it", func() {
+		certPEM, keyPEM, oldCert := genCert("app.ezca.io", now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
 		createSecret("app-secret", certPEM, keyPEM)
 		cci := createIdentity("app-identity", "app-secret", true)
 
 		_, _, parsedNew := genCert("app.ezca.io", now, now.Add(100*24*time.Hour))
 		ezcaClient.newChain = []*x509.Certificate{parsedNew}
 
+		secretName := types.NamespacedName{Name: "app-secret", Namespace: namespace}
+		activeLeaf := func() *x509.Certificate {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			chain, err := pki.ParseCertChainPEM(s.Data["tls.crt"])
+			Expect(err).NotTo(HaveOccurred())
+			return chain[0]
+		}
+		hasPending := func() bool {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			return len(s.Data["tls.crt.pending"]) > 0
+		}
+
+		// Reconcile #1: renew + addKey + stage pending. Active cert unchanged.
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(entraClient.added).To(HaveLen(1))
 		Expect(entraClient.added[0]).To(Equal(parsedNew.Raw))
+		Expect(activeLeaf().Equal(oldCert)).To(BeTrue(), "active cert must remain the old one while pending")
+		Expect(hasPending()).To(BeTrue())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(parsedNew)))
 		Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
 		Expect(cci.Status.ManagedKeyCredentials[0].KeyID).To(Equal("new-key-id"))
+
+		// Reconcile #2: still propagating -> stays staged, active unchanged.
+		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasPending()).To(BeTrue())
+		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+
+		// Reconcile #3: propagation complete -> promote.
+		entraClient.verifyErr = nil
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasPending()).To(BeFalse())
+		Expect(activeLeaf().Equal(parsedNew)).To(BeTrue(), "renewed cert must be promoted after propagation")
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(cci.Status.PendingThumbprint).To(BeEmpty())
+		Expect(cci.Status.LastRenewalTime).NotTo(BeNil())
+		Expect(cci.Status.Thumbprint).To(Equal(pki.Thumbprint(parsedNew)))
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableClusterCertIdentity)).To(BeTrue())
+		// addKey happened exactly once across the whole flow.
+		Expect(entraClient.added).To(HaveLen(1))
 	})
 
 	It("removes expired managed credentials from the app", func() {

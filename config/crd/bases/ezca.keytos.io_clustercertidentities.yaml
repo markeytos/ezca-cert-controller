@@ -248,6 +248,18 @@ spec:
                   window.
                 format: date-time
                 type: string
+              pendingSince:
+                description: |-
+                  pendingSince is when the pending certificate was added, used to bound how
+                  long the controller waits for Entra ID propagation.
+                format: date-time
+                type: string
+              pendingThumbprint:
+                description: |-
+                  pendingThumbprint is the SHA-1 thumbprint (hex) of a renewed certificate
+                  that has been added to the app registration and is awaiting propagation
+                  in Entra ID before it is promoted into the Secret.
+                type: string
               thumbprint:
                 description: thumbprint is the SHA-1 thumbprint (hex) of the current
                   certificate.

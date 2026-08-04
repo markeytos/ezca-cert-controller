@@ -57,10 +57,23 @@ const (
 
 	tlsCertKey = "tls.crt"
 	tlsKeyKey  = "tls.key"
+	// tlsCertPendingKey and tlsKeyPendingKey stage a renewed certificate that
+	// has been added to the app registration but is awaiting Entra ID
+	// propagation. The active tls.crt/tls.key keep serving the current
+	// certificate until the staged one can authenticate.
+	tlsCertPendingKey = "tls.crt.pending"
+	tlsKeyPendingKey  = "tls.key.pending"
 
 	// maxRequeueAfter bounds how long the controller waits before re-checking a
 	// certificate, so managed-credential cleanup also runs at least this often.
 	maxRequeueAfter = 24 * time.Hour
+
+	// propagationRequeue is how often the controller re-checks whether a staged
+	// certificate has become usable in Entra ID.
+	propagationRequeue = 30 * time.Second
+	// propagationTimeout is how long propagation may take before the controller
+	// surfaces a Degraded condition (it keeps retrying afterwards).
+	propagationTimeout = 15 * time.Minute
 )
 
 // ezcaRenewer renews a certificate through EZCA. Satisfied by
@@ -72,6 +85,7 @@ type ezcaRenewer interface {
 // entraManager manages certificate credentials on an app registration.
 // Satisfied by *entra.Client; overridable in tests.
 type entraManager interface {
+	VerifyCredential(ctx context.Context) error
 	AddKey(ctx context.Context, objectID string, newCertDER []byte) (string, error)
 	RemoveKey(ctx context.Context, objectID, keyID string) error
 }
@@ -177,6 +191,13 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	now := r.now()
 	setObservedCert(cci, current)
 
+	// If a renewed certificate is staged and awaiting propagation in Entra ID,
+	// try to promote it. The active tls.crt/tls.key keep serving the current
+	// (trusted) certificate until the renewed one can authenticate.
+	if hasPendingCert(&secret) {
+		return r.promoteIfReady(ctx, cci, &secret, tel, now)
+	}
+
 	remaining := pki.LifetimeFractionRemaining(current, now)
 	if remaining > float64(cci.Spec.RenewalThreshold) {
 		// Not due for renewal. Still clean up any managed credentials that have
@@ -205,31 +226,105 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	}
 	newLeaf := newChain[0]
 
-	// Add the renewed certificate to the app registration BEFORE promoting it
-	// into the Secret, so the Secret always holds a certificate the app already
-	// trusts. Cleanup of expired credentials runs in the same call.
-	if appConfigured(cci) {
-		if err := r.manageApp(ctx, cci, current, key, newLeaf, tel, now); err != nil {
-			r.setDegraded(cci, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
+	// Certificate-only identity: nothing to authenticate against, so promote
+	// the renewed certificate immediately.
+	if !appConfigured(cci) {
+		if err := r.writeActiveSecret(ctx, &secret, newChain, newKey); err != nil {
+			tel.TrackError(err, "Failed to write renewed certificate Secret", identityProps(cci))
+			r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to write renewed certificate to Secret: %v", err))
 			return ctrl.Result{}, err
 		}
+		setObservedCert(cci, newLeaf)
+		cci.Status.LastRenewalTime = &metav1.Time{Time: now}
+		tel.TrackEvent("CertificateRenewed", identityProps(cci))
+		log.Info("Renewed certificate", "thumbprint", pki.Thumbprint(newLeaf), "notAfter", newLeaf.NotAfter)
+		r.setAvailable(cci, "CertificateRenewed", "Certificate renewed successfully")
+		return ctrl.Result{RequeueAfter: r.requeueForRenewal(newLeaf, cci.Spec.RenewalThreshold, now)}, nil
 	}
 
-	time.Sleep(time.Minute * 2)
-
-	if err := r.writeSecret(ctx, &secret, newChain, newKey); err != nil {
-		tel.TrackError(err, "Failed to write renewed certificate Secret", identityProps(cci))
-		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to write renewed certificate to Secret: %v", err))
+	// App identity: add the renewed certificate to the app registration using
+	// the current (trusted) certificate, then stage it as pending. It is
+	// promoted into the active Secret only once Entra ID can authenticate with
+	// it (see promoteIfReady), so the Secret never serves an unusable cert to
+	// the controller or to other consumers.
+	if err := r.manageApp(ctx, cci, current, key, newLeaf, tel, now); err != nil {
+		r.setDegraded(cci, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
 		return ctrl.Result{}, err
 	}
+	if err := r.writePendingSecret(ctx, &secret, newChain, newKey); err != nil {
+		tel.TrackError(err, "Failed to stage renewed certificate Secret", identityProps(cci))
+		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to stage renewed certificate: %v", err))
+		return ctrl.Result{}, err
+	}
+	cci.Status.PendingThumbprint = pki.Thumbprint(newLeaf)
+	cci.Status.PendingSince = &metav1.Time{Time: now}
+	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
+		Type:    typeProgressingClusterCertIdentity,
+		Status:  metav1.ConditionTrue,
+		Reason:  "PendingPropagation",
+		Message: "Renewed certificate added to the app registration; waiting for Entra ID propagation",
+	})
+	log.Info("Staged renewed certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
+	return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+}
 
-	setObservedCert(cci, newLeaf)
+// promoteIfReady checks whether the staged (pending) certificate can now
+// authenticate to Entra ID and, if so, promotes it into the active Secret.
+// Until then the active certificate is left untouched, so consumers keep using
+// a certificate Entra ID already trusts.
+func (r *ClusterCertIdentityReconciler) promoteIfReady(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, tel *telemetry.Telemetry, now time.Time) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	pendingChain, pendingKey, err := parsePendingSecret(secret)
+	if err != nil {
+		// The staged data is unusable; drop it and renew again next pass.
+		delete(secret.Data, tlsCertPendingKey)
+		delete(secret.Data, tlsKeyPendingKey)
+		if uerr := r.Update(ctx, secret); uerr != nil {
+			return ctrl.Result{}, uerr
+		}
+		cci.Status.PendingThumbprint = ""
+		cci.Status.PendingSince = nil
+		r.setDegraded(cci, "InvalidPendingCertificate", fmt.Sprintf("Staged certificate is invalid: %v", err))
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+	pendingLeaf := pendingChain[0]
+
+	cl, err := r.newEntraClient(*cci.Spec.TenantID, *cci.Spec.AppID, cloudFor(cci.Spec.Cloud), pendingLeaf, pendingKey)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if verr := cl.VerifyCredential(ctx); verr != nil {
+		// Not usable yet. Keep waiting, but surface Degraded if propagation is
+		// taking abnormally long (retries continue regardless).
+		if cci.Status.PendingSince != nil && now.Sub(cci.Status.PendingSince.Time) > propagationTimeout {
+			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(cci))
+			r.setDegraded(cci, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
+		} else {
+			meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
+				Type:    typeProgressingClusterCertIdentity,
+				Status:  metav1.ConditionTrue,
+				Reason:  "PendingPropagation",
+				Message: "Waiting for the renewed certificate to propagate in Entra ID",
+			})
+		}
+		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+	}
+
+	// Usable: promote the staged certificate into the active Secret.
+	if err := r.promoteSecret(ctx, secret); err != nil {
+		tel.TrackError(err, "Failed to promote renewed certificate Secret", identityProps(cci))
+		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to promote renewed certificate: %v", err))
+		return ctrl.Result{}, err
+	}
+	setObservedCert(cci, pendingLeaf)
 	cci.Status.LastRenewalTime = &metav1.Time{Time: now}
+	cci.Status.PendingThumbprint = ""
+	cci.Status.PendingSince = nil
 	tel.TrackEvent("CertificateRenewed", identityProps(cci))
-	log.Info("Renewed certificate", "thumbprint", pki.Thumbprint(newLeaf), "notAfter", newLeaf.NotAfter)
-
+	log.Info("Promoted renewed certificate", "thumbprint", pki.Thumbprint(pendingLeaf), "notAfter", pendingLeaf.NotAfter)
 	r.setAvailable(cci, "CertificateRenewed", "Certificate renewed successfully")
-	return ctrl.Result{RequeueAfter: r.requeueForRenewal(newLeaf, cci.Spec.RenewalThreshold, now)}, nil
+	return ctrl.Result{RequeueAfter: r.requeueForRenewal(pendingLeaf, cci.Spec.RenewalThreshold, now)}, nil
 }
 
 // renew builds a renewal CSR (with a fresh key) and renews the certificate
@@ -295,8 +390,35 @@ func (r *ClusterCertIdentityReconciler) manageApp(ctx context.Context, cci *ezca
 	return nil
 }
 
-// writeSecret rewrites the TLS Secret with the renewed chain and key.
-func (r *ClusterCertIdentityReconciler) writeSecret(ctx context.Context, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+// writeActiveSecret rewrites the active tls.crt/tls.key with the renewed chain
+// and key.
+func (r *ClusterCertIdentityReconciler) writeActiveSecret(ctx context.Context, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if err := setTLSData(secret, tlsCertKey, tlsKeyKey, chain, key); err != nil {
+		return err
+	}
+	return r.Update(ctx, secret)
+}
+
+// writePendingSecret stages the renewed chain and key under the pending keys,
+// leaving the active certificate untouched.
+func (r *ClusterCertIdentityReconciler) writePendingSecret(ctx context.Context, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if err := setTLSData(secret, tlsCertPendingKey, tlsKeyPendingKey, chain, key); err != nil {
+		return err
+	}
+	return r.Update(ctx, secret)
+}
+
+// promoteSecret moves the staged certificate into the active tls.crt/tls.key
+// and removes the pending keys.
+func (r *ClusterCertIdentityReconciler) promoteSecret(ctx context.Context, secret *corev1.Secret) error {
+	secret.Data[tlsCertKey] = secret.Data[tlsCertPendingKey]
+	secret.Data[tlsKeyKey] = secret.Data[tlsKeyPendingKey]
+	delete(secret.Data, tlsCertPendingKey)
+	delete(secret.Data, tlsKeyPendingKey)
+	return r.Update(ctx, secret)
+}
+
+func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
 	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
 	if err != nil {
 		return err
@@ -304,9 +426,9 @@ func (r *ClusterCertIdentityReconciler) writeSecret(ctx context.Context, secret 
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
 	}
-	secret.Data[tlsCertKey] = pki.EncodeCertChainPEM(chain)
-	secret.Data[tlsKeyKey] = keyPEM
-	return r.Update(ctx, secret)
+	secret.Data[certKey] = pki.EncodeCertChainPEM(chain)
+	secret.Data[keyKey] = keyPEM
+	return nil
 }
 
 func (r *ClusterCertIdentityReconciler) requeueForRenewal(cert *x509.Certificate, thresholdPct int32, now time.Time) time.Duration {
@@ -403,13 +525,25 @@ func (r *ClusterCertIdentityReconciler) secretToRequests(ctx context.Context, ob
 }
 
 func parseSecret(secret *corev1.Secret) ([]*x509.Certificate, *rsa.PrivateKey, error) {
-	certData := secret.Data[tlsCertKey]
+	return parseTLS(secret, tlsCertKey, tlsKeyKey)
+}
+
+func parsePendingSecret(secret *corev1.Secret) ([]*x509.Certificate, *rsa.PrivateKey, error) {
+	return parseTLS(secret, tlsCertPendingKey, tlsKeyPendingKey)
+}
+
+func hasPendingCert(secret *corev1.Secret) bool {
+	return len(secret.Data[tlsCertPendingKey]) > 0 && len(secret.Data[tlsKeyPendingKey]) > 0
+}
+
+func parseTLS(secret *corev1.Secret, certKey, keyKey string) ([]*x509.Certificate, *rsa.PrivateKey, error) {
+	certData := secret.Data[certKey]
 	if len(certData) == 0 {
-		return nil, nil, fmt.Errorf("missing %q", tlsCertKey)
+		return nil, nil, fmt.Errorf("missing %q", certKey)
 	}
-	keyData := secret.Data[tlsKeyKey]
+	keyData := secret.Data[keyKey]
 	if len(keyData) == 0 {
-		return nil, nil, fmt.Errorf("missing %q", tlsKeyKey)
+		return nil, nil, fmt.Errorf("missing %q", keyKey)
 	}
 	chain, err := pki.ParseCertChainPEM(certData)
 	if err != nil {

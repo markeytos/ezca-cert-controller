@@ -168,6 +168,17 @@ type ClusterCertIdentityStatus struct {
 	// +optional
 	LastRenewalTime *metav1.Time `json:"lastRenewalTime,omitempty"`
 
+	// pendingThumbprint is the SHA-1 thumbprint (hex) of a renewed certificate
+	// that has been added to the app registration and is awaiting propagation
+	// in Entra ID before it is promoted into the Secret.
+	// +optional
+	PendingThumbprint string `json:"pendingThumbprint,omitempty"`
+
+	// pendingSince is when the pending certificate was added, used to bound how
+	// long the controller waits for Entra ID propagation.
+	// +optional
+	PendingSince *metav1.Time `json:"pendingSince,omitempty"`
+
 	// managedKeyCredentials are the certificates the controller has added to
 	// the Entra ID app registration, tracked so expired ones can be removed.
 	// +listType=map
