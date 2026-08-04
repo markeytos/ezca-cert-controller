@@ -11,10 +11,19 @@ spec:
     kind: ClusterCertIdentity
     listKind: ClusterCertIdentityList
     plural: clustercertidentities
+    shortNames:
+    - cci
     singular: clustercertidentity
   scope: Cluster
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Available')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.notAfter
+      name: NotAfter
+      type: string
+    name: v1
     schema:
       openAPIV3Schema:
         description: ClusterCertIdentity is the Schema for the clustercertidentities
@@ -40,26 +49,86 @@ spec:
           spec:
             description: spec defines the desired state of ClusterCertIdentity
             properties:
-              RenewalThreshold:
-                default: 20
-                format: int32
-                type: integer
               appID:
+                description: |-
+                  appID is the Entra ID (Azure AD) application (client) ID whose
+                  certificate credentials are rotated. It is used to authenticate as the
+                  app and as the proof-of-possession issuer. It must be set together with
+                  tenantID and appObjectID.
+                minLength: 1
                 type: string
               appInsightsConnString:
+                description: |-
+                  appInsightsConnString is an optional Azure Application Insights
+                  connection string. When set, renewals, rotations, and errors are
+                  reported to Application Insights.
+                minLength: 1
+                type: string
+              appObjectID:
+                description: |-
+                  appObjectID is the Entra ID directory object ID of the app registration
+                  (the "id" of the application object, not the appId). It is required to
+                  call Graph addKey/removeKey directly, avoiding a lookup that needs
+                  directory read permissions. It must be set together with tenantID and
+                  appID.
+                minLength: 1
                 type: string
               certSecretName:
                 default: cluster-cert-identity
+                description: |-
+                  certSecretName is the name of the kubernetes.io/tls Secret holding the
+                  bootstrapped certificate (tls.crt, leaf plus chain) and its RSA private
+                  key (tls.key). The controller reads and rewrites this Secret.
                 type: string
-              name:
+              certSecretNamespace:
+                description: |-
+                  certSecretNamespace is the namespace of the certificate Secret. When
+                  empty it defaults to the namespace the controller runs in.
                 minLength: 1
                 type: string
+              cloud:
+                default: Public
+                description: |-
+                  cloud selects the Azure sovereign cloud used to reach Entra ID and
+                  Microsoft Graph.
+                enum:
+                - Public
+                - USGov
+                type: string
+              ezcaURL:
+                description: |-
+                  ezcaURL is the base URL of the EZCA instance used to renew the
+                  certificate (for example https://portal.ezca.io).
+                minLength: 1
+                type: string
+              name:
+                description: name is a friendly identifier for this certificate identity.
+                minLength: 1
+                type: string
+              renewalThreshold:
+                default: 20
+                description: |-
+                  renewalThreshold is the percentage of the certificate's total lifetime
+                  remaining at or below which the certificate is renewed.
+                format: int32
+                maximum: 99
+                minimum: 1
+                type: integer
               tenantID:
+                description: |-
+                  tenantID is the Entra ID (Azure AD) tenant that owns the app
+                  registration. It must be set together with appID.
                 minLength: 1
                 type: string
             required:
+            - certSecretName
+            - ezcaURL
             - name
+            - renewalThreshold
             type: object
+            x-kubernetes-validations:
+            - message: tenantID, appID, and appObjectID must be set together
+              rule: has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)
           status:
             description: status defines the observed state of ClusterCertIdentity
             properties:
@@ -132,6 +201,57 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastRenewalTime:
+                description: lastRenewalTime is when the controller last renewed the
+                  certificate.
+                format: date-time
+                type: string
+              managedKeyCredentials:
+                description: |-
+                  managedKeyCredentials are the certificates the controller has added to
+                  the Entra ID app registration, tracked so expired ones can be removed.
+                items:
+                  description: |-
+                    ManagedKeyCredential records a certificate the controller added to an Entra ID
+                    app registration so it can be removed once it expires.
+                  properties:
+                    keyID:
+                      description: keyID is the keyCredential identifier assigned
+                        by Microsoft Graph.
+                      type: string
+                    notAfter:
+                      description: |-
+                        notAfter is the managed certificate's expiry. The credential is removed
+                        from the app registration only after this time.
+                      format: date-time
+                      type: string
+                    thumbprint:
+                      description: thumbprint is the SHA-1 thumbprint (hex) of the
+                        managed certificate.
+                      type: string
+                  required:
+                  - keyID
+                  - notAfter
+                  - thumbprint
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - thumbprint
+                x-kubernetes-list-type: map
+              notAfter:
+                description: notAfter is the end of the current certificate's validity
+                  window.
+                format: date-time
+                type: string
+              notBefore:
+                description: notBefore is the start of the current certificate's validity
+                  window.
+                format: date-time
+                type: string
+              thumbprint:
+                description: thumbprint is the SHA-1 thumbprint (hex) of the current
+                  certificate.
+                type: string
             type: object
         required:
         - spec

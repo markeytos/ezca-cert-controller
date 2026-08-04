@@ -1,0 +1,196 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package pki
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"net/url"
+	"testing"
+	"time"
+)
+
+func makeCert(t *testing.T, notBefore, notAfter time.Time) (*x509.Certificate, *rsa.PrivateKey) {
+	t.Helper()
+	const cn = "app.ezca.io"
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, _ := url.Parse("spiffe://cluster/app")
+	tmpl := &x509.Certificate{
+		SerialNumber:   big.NewInt(1),
+		Subject:        pkix.Name{CommonName: cn, Organization: []string{"Keytos"}},
+		NotBefore:      notBefore,
+		NotAfter:       notAfter,
+		DNSNames:       []string{cn, "alt." + cn},
+		EmailAddresses: []string{"admin@" + cn},
+		IPAddresses:    []net.IP{net.ParseIP("10.0.0.1")},
+		URIs:           []*url.URL{uri},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, key
+}
+
+func TestParseCertChainAndKeyRoundTrip(t *testing.T) {
+	cert, key := makeCert(t, time.Now(), time.Now().Add(24*time.Hour))
+
+	certPEM := EncodeCertChainPEM([]*x509.Certificate{cert})
+	keyPEM, err := EncodeRSAPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chain, err := ParseCertChainPEM(certPEM)
+	if err != nil {
+		t.Fatalf("parse chain: %v", err)
+	}
+	if len(chain) != 1 || !chain[0].Equal(cert) {
+		t.Fatalf("round-trip cert mismatch")
+	}
+
+	parsedKey, err := ParseRSAPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse key: %v", err)
+	}
+	if parsedKey.N.Cmp(key.N) != 0 {
+		t.Fatalf("round-trip key mismatch")
+	}
+}
+
+func TestParseCertChainSkipsEmptyBlocks(t *testing.T) {
+	cert, _ := makeCert(t, time.Now(), time.Now().Add(24*time.Hour))
+	// A valid leaf followed by an empty CERTIFICATE block (as some CA
+	// responses emit for an absent root).
+	pemBytes := append(EncodeCertChainPEM([]*x509.Certificate{cert}),
+		[]byte("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n")...)
+
+	chain, err := ParseCertChainPEM(pemBytes)
+	if err != nil {
+		t.Fatalf("expected empty block to be skipped, got: %v", err)
+	}
+	if len(chain) != 1 || !chain[0].Equal(cert) {
+		t.Fatalf("expected only the leaf, got %d certs", len(chain))
+	}
+}
+
+func TestParseRSAPrivateKeyPKCS1(t *testing.T) {
+	_, key := makeCert(t, time.Now(), time.Now().Add(time.Hour))
+	pkcs1 := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if _, err := ParseRSAPrivateKey(pkcs1); err != nil {
+		t.Fatalf("PKCS1 parse: %v", err)
+	}
+}
+
+func TestParseRSAPrivateKeyRejectsNonRSA(t *testing.T) {
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if _, err := ParseRSAPrivateKey(ecPEM); err == nil {
+		t.Fatalf("expected error for non-RSA key")
+	}
+}
+
+func TestLifetimeFractionRemaining(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cert, _ := makeCert(t, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+	got := LifetimeFractionRemaining(cert, now)
+	if got < 9.9 || got > 10.1 {
+		t.Fatalf("expected ~10%%, got %v", got)
+	}
+
+	expired, _ := makeCert(t, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	if f := LifetimeFractionRemaining(expired, now); f != 0 {
+		t.Fatalf("expected 0 for expired, got %v", f)
+	}
+}
+
+func TestNextRenewalTime(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// 100-day lifetime; threshold 20% => renew when 20 days remain => day 80.
+	cert, _ := makeCert(t, now, now.Add(100*24*time.Hour))
+	next := NextRenewalTime(cert, 20)
+	want := now.Add(80 * 24 * time.Hour)
+	if next.Sub(want).Abs() > time.Minute {
+		t.Fatalf("expected renewal near %v, got %v", want, next)
+	}
+}
+
+func TestValidityInDays(t *testing.T) {
+	now := time.Now()
+	cert, _ := makeCert(t, now, now.Add(90*24*time.Hour))
+	if d := ValidityInDays(cert); d != 90 {
+		t.Fatalf("expected 90 days, got %d", d)
+	}
+}
+
+func TestBuildRenewalCSRPreservesIdentity(t *testing.T) {
+	cert, _ := makeCert(t, time.Now(), time.Now().Add(24*time.Hour))
+
+	csrDER, newKey, err := BuildRenewalCSR(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newKey.N.BitLen() != 2048 {
+		t.Fatalf("expected 2048-bit key, got %d", newKey.N.BitLen())
+	}
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		t.Fatalf("CSR signature: %v", err)
+	}
+	if csr.Subject.CommonName != "app.ezca.io" {
+		t.Fatalf("subject CN not preserved: %q", csr.Subject.CommonName)
+	}
+	if len(csr.DNSNames) != 2 || len(csr.EmailAddresses) != 1 || len(csr.IPAddresses) != 1 || len(csr.URIs) != 1 {
+		t.Fatalf("SANs not preserved: dns=%v email=%v ip=%v uri=%v", csr.DNSNames, csr.EmailAddresses, csr.IPAddresses, csr.URIs)
+	}
+	// The CSR must be signed by the new key, not the old one.
+	if csr.PublicKey.(*rsa.PublicKey).N.Cmp(newKey.N) != 0 {
+		t.Fatalf("CSR not signed with the new key")
+	}
+}
+
+func TestThumbprint(t *testing.T) {
+	cert, _ := makeCert(t, time.Now(), time.Now().Add(time.Hour))
+	tp := Thumbprint(cert)
+	if len(tp) != 40 {
+		t.Fatalf("expected 40 hex chars, got %d (%q)", len(tp), tp)
+	}
+}

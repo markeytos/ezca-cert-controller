@@ -179,8 +179,9 @@ func main() {
 	}
 
 	if err := (&controller.ClusterCertIdentityReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "clustercertidentity")
 		os.Exit(1)
