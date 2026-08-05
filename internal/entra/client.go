@@ -51,7 +51,10 @@ import (
 // sovereign clouds.
 const graphProofAudience = "00000002-0000-0000-c000-000000000000"
 
-const graphEndpointPublic = "https://graph.microsoft.com"
+const (
+	graphEndpointPublic     = "https://graph.microsoft.com"
+	graphEndpointGovernment = "https://graph.microsoft.us"
+)
 
 // Cloud selects the Azure sovereign cloud.
 type Cloud string
@@ -70,7 +73,7 @@ type cloudConfig struct {
 
 var cloudConfigs = map[Cloud]cloudConfig{
 	CloudPublic: {cloud.AzurePublic, graphEndpointPublic},
-	CloudUSGov:  {cloud.AzureGovernment, "https://graph.microsoft.us"},
+	CloudUSGov:  {cloud.AzureGovernment, graphEndpointGovernment},
 }
 
 type tokenGetter interface {
