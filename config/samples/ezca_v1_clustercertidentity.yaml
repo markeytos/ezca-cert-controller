@@ -27,3 +27,10 @@ spec:
   appObjectID: 22222222-2222-2222-2222-222222222222
   # Optional Application Insights connection string for telemetry.
   appInsightsConnString: InstrumentationKey=...;IngestionEndpoint=https://...
+  # Optional: keep an Azure Key Vault certificate in sync with this Secret. The
+  # controller authenticates to the vault as the app above (appID) using this
+  # certificate, so keyVault requires the app fields and that app's service
+  # principal must have get + import permission on the vault.
+  # keyVault:
+  #   vaultName: my-key-vault
+  #   certName: cluster-cert-identity

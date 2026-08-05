@@ -101,6 +101,30 @@ spec:
                   certificate (for example https://portal.ezca.io).
                 minLength: 1
                 type: string
+              keyVault:
+                description: |-
+                  keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
+                  the Secret. On every reconcile the controller ensures the named vault
+                  certificate matches the Secret, importing the current certificate (and
+                  key) whenever they differ. The controller authenticates to the vault as
+                  the identity's app using its certificate, so this requires the app fields
+                  (tenantID, appID, appObjectID) and the app service principal must have get
+                  and import permission on the vault.
+                properties:
+                  certName:
+                    description: certName is the name of the certificate in the vault
+                      to keep in sync.
+                    minLength: 1
+                    type: string
+                  vaultName:
+                    description: vaultName is the name of the Azure Key Vault (not
+                      the full URL).
+                    minLength: 1
+                    type: string
+                required:
+                - certName
+                - vaultName
+                type: object
               name:
                 description: name is a friendly identifier for this certificate identity.
                 minLength: 1
@@ -129,6 +153,9 @@ spec:
             x-kubernetes-validations:
             - message: tenantID, appID, and appObjectID must be set together
               rule: has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)
+            - message: keyVault requires the Entra app fields (tenantID, appID, appObjectID);
+                the certificate authenticates to Key Vault as that app
+              rule: '!has(self.keyVault) || has(self.appID)'
           status:
             description: status defines the observed state of ClusterCertIdentity
             properties:

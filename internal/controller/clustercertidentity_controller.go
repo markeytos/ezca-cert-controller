@@ -21,6 +21,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,7 @@ import (
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
 	"github.com/markeytos/ezca-cert-controller/internal/entra"
+	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
 )
@@ -95,6 +97,13 @@ type entraManager interface {
 	RemoveKey(ctx context.Context, objectID, keyID string) error
 }
 
+// keyVaultManager keeps a certificate in Azure Key Vault in sync. Satisfied by
+// *keyvault.Client; overridable in tests.
+type keyVaultManager interface {
+	CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error)
+	ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error
+}
+
 // ClusterCertIdentityReconciler reconciles a ClusterCertIdentity object
 type ClusterCertIdentityReconciler struct {
 	client.Client
@@ -104,11 +113,12 @@ type ClusterCertIdentityReconciler struct {
 	// spec does not set one (the namespace the controller runs in).
 	DefaultNamespace string
 
-	// Now, NewEZCAClient, and NewEntraClient are injection points for tests.
-	// When nil, real implementations are used.
-	Now            func() time.Time
-	NewEZCAClient  func(ezcaURL string) (ezcaRenewer, error)
-	NewEntraClient func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
+	// Now, NewEZCAClient, NewEntraClient, and NewKeyVaultClient are injection
+	// points for tests. When nil, real implementations are used.
+	Now               func() time.Time
+	NewEZCAClient     func(ezcaURL string) (ezcaRenewer, error)
+	NewEntraClient    func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
+	NewKeyVaultClient func(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
 }
 
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities,verbs=get;list;watch;create;update;patch;delete
@@ -162,11 +172,9 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 	return result, reconcileErr
 }
 
-// reconcile performs the core renewal/rotation logic and updates status
-// conditions on cci in place (persisted by the caller).
+// reconcile loads the certificate Secret, runs the certificate state machine,
+// then optionally mirrors the active certificate into Azure Key Vault.
 func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezcav1.ClusterCertIdentity, tel *telemetry.Telemetry) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	secretNS := cci.Spec.CertSecretNamespace
 	if secretNS == "" {
 		secretNS = r.DefaultNamespace
@@ -192,15 +200,78 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 		r.setDegraded(cci, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
-	current := chain[0]
 	now := r.now()
-	setObservedCert(cci, current)
+	setObservedCert(cci, chain[0])
+
+	result, coreErr := r.reconcileCertState(ctx, cci, &secret, chain, key, now, tel)
+
+	if cci.Spec.KeyVault != nil {
+		r.syncKeyVaultBestEffort(ctx, cci, &secret, now, tel, &result, coreErr)
+	}
+	return result, coreErr
+}
+
+// syncKeyVaultBestEffort runs the Key Vault sync without letting it override a
+// successful core result. It defers while a freshly changed certificate is
+// still propagating across Entra ID token replicas, and treats the
+// "certificate not yet registered" auth error as a quiet, transient retry
+// rather than a hard failure.
+func (r *ClusterCertIdentityReconciler) syncKeyVaultBestEffort(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, now time.Time, tel *telemetry.Telemetry, result *ctrl.Result, coreErr error) {
+	log := logf.FromContext(ctx)
+
+	// A certificate that was just renewed/promoted may not yet be usable on
+	// every AAD token replica; give it the propagation grace before trying to
+	// authenticate to Key Vault with it.
+	if cci.Status.LastRenewalTime != nil && now.Sub(cci.Status.LastRenewalTime.Time) < propagationGrace {
+		requeueAtMost(result, propagationRequeue)
+		return
+	}
+
+	kvErr := r.syncKeyVault(ctx, cci, secret, tel)
+	if kvErr == nil {
+		return
+	}
+	if isCredentialPropagating(kvErr) {
+		// Transient: the certificate is correct but not yet on the replica we
+		// reached. Retry soon; do not alarm.
+		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
+		requeueAtMost(result, propagationRequeue)
+		return
+	}
+	log.Error(kvErr, "Failed to sync certificate to Key Vault")
+	tel.TrackError(kvErr, "Failed to sync certificate to Key Vault", identityProps(cci))
+	if coreErr == nil {
+		r.setDegraded(cci, "KeyVaultSyncFailed", fmt.Sprintf("Failed to sync certificate to Key Vault: %v", kvErr))
+		requeueAtMost(result, time.Minute)
+	}
+}
+
+// requeueAtMost lowers result.RequeueAfter to d if it is currently unset or
+// longer than d.
+func requeueAtMost(result *ctrl.Result, d time.Duration) {
+	if result.RequeueAfter == 0 || result.RequeueAfter > d {
+		result.RequeueAfter = d
+	}
+}
+
+// isCredentialPropagating reports whether err is the transient Entra ID error
+// returned while a newly added certificate has not yet propagated to the token
+// endpoint replica that served the request.
+func isCredentialPropagating(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "AADSTS700027")
+}
+
+// reconcileCertState runs the renewal/rotation state machine and updates status
+// conditions on cci in place (persisted by the caller).
+func (r *ClusterCertIdentityReconciler) reconcileCertState(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey, now time.Time, tel *telemetry.Telemetry) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	current := chain[0]
 
 	// If a renewed certificate is staged and awaiting propagation in Entra ID,
 	// try to promote it. The active tls.crt/tls.key keep serving the current
 	// (trusted) certificate until the renewed one can authenticate.
-	if hasPendingCert(&secret) {
-		return r.promoteIfReady(ctx, cci, &secret, tel, now)
+	if hasPendingCert(secret) {
+		return r.promoteIfReady(ctx, cci, secret, tel, now)
 	}
 
 	remaining := pki.LifetimeFractionRemaining(current, now)
@@ -234,7 +305,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	// Certificate-only identity: nothing to authenticate against, so promote
 	// the renewed certificate immediately.
 	if !appConfigured(cci) {
-		if err := r.writeActiveSecret(ctx, &secret, newChain, newKey); err != nil {
+		if err := r.writeActiveSecret(ctx, secret, newChain, newKey); err != nil {
 			tel.TrackError(err, "Failed to write renewed certificate Secret", identityProps(cci))
 			r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to write renewed certificate to Secret: %v", err))
 			return ctrl.Result{}, err
@@ -256,7 +327,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 		r.setDegraded(cci, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
 		return ctrl.Result{}, err
 	}
-	if err := r.writePendingSecret(ctx, &secret, newChain, newKey); err != nil {
+	if err := r.writePendingSecret(ctx, secret, newChain, newKey); err != nil {
 		tel.TrackError(err, "Failed to stage renewed certificate Secret", identityProps(cci))
 		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to stage renewed certificate: %v", err))
 		return ctrl.Result{}, err
@@ -482,6 +553,50 @@ func (r *ClusterCertIdentityReconciler) newEntraClient(tenantID, appID string, c
 	return entra.NewClient(tenantID, appID, cl, cert, key)
 }
 
+func (r *ClusterCertIdentityReconciler) newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error) {
+	if r.NewKeyVaultClient != nil {
+		return r.NewKeyVaultClient(vaultName, tenantID, appID, cl, cert, key)
+	}
+	return keyvault.NewClient(vaultName, tenantID, appID, cl, cert, key)
+}
+
+// syncKeyVault ensures the configured Key Vault certificate matches the active
+// Secret certificate, importing the current chain and key when they differ. It
+// authenticates to the vault as the identity's app using that certificate, so
+// keyVault requires the app fields (enforced by CRD validation).
+func (r *ClusterCertIdentityReconciler) syncKeyVault(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, tel *telemetry.Telemetry) error {
+	chain, key, err := parseSecret(secret)
+	if err != nil {
+		return err
+	}
+	leaf := chain[0]
+
+	cl, err := r.newKeyVaultClient(cci.Spec.KeyVault.VaultName, *cci.Spec.TenantID, *cci.Spec.AppID, keyVaultCloudFor(cci.Spec.Cloud), leaf, key)
+	if err != nil {
+		return err
+	}
+	match, err := cl.CertificateMatches(ctx, cci.Spec.KeyVault.CertName, pki.Thumbprint(leaf))
+	if err != nil {
+		return err
+	}
+	if match {
+		return nil
+	}
+
+	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
+	if err != nil {
+		return err
+	}
+	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
+	if err := cl.ImportCertificate(ctx, cci.Spec.KeyVault.CertName, bundle); err != nil {
+		return err
+	}
+	logf.FromContext(ctx).Info("Updated Key Vault certificate",
+		"vault", cci.Spec.KeyVault.VaultName, "certName", cci.Spec.KeyVault.CertName, "thumbprint", pki.Thumbprint(leaf))
+	tel.TrackEvent("KeyVaultCertificateUpdated", identityProps(cci))
+	return nil
+}
+
 func (r *ClusterCertIdentityReconciler) setAvailable(cci *ezcav1.ClusterCertIdentity, reason, message string) {
 	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
 		Type:    typeAvailableClusterCertIdentity,
@@ -599,6 +714,13 @@ func cloudFor(c ezcav1.CloudEnvironment) entra.Cloud {
 		return entra.CloudUSGov
 	}
 	return entra.CloudPublic
+}
+
+func keyVaultCloudFor(c ezcav1.CloudEnvironment) keyvault.Cloud {
+	if c == ezcav1.CloudUSGov {
+		return keyvault.CloudUSGov
+	}
+	return keyvault.CloudPublic
 }
 
 func identityProps(cci *ezcav1.ClusterCertIdentity) map[string]string {

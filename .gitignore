@@ -26,8 +26,7 @@ go.work
 *.swo
 *~
 
-config/samples/simple-app.yaml
-config/samples/simple.yaml
+config/samples/simple*.yaml
 tls.*
 
 # Kubeconfig might contain secrets

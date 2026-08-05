@@ -38,6 +38,7 @@ import (
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
 	"github.com/markeytos/ezca-cert-controller/internal/entra"
+	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
@@ -73,6 +74,21 @@ func (f *fakeEntra) RemoveKey(_ context.Context, _, keyID string) error {
 	return nil
 }
 
+type fakeKeyVault struct {
+	matches  bool
+	matchErr error
+	imported [][]byte
+}
+
+func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool, error) {
+	return f.matches, f.matchErr
+}
+
+func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, bundle []byte) error {
+	f.imported = append(f.imported, bundle)
+	return nil
+}
+
 func genCert(cn string, notBefore, notAfter time.Time) (certPEM, keyPEM []byte, cert *x509.Certificate) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	Expect(err).NotTo(HaveOccurred())
@@ -103,6 +119,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		reconciler  *ClusterCertIdentityReconciler
 		ezcaClient  *fakeEZCA
 		entraClient *fakeEntra
+		kvClient    *fakeKeyVault
 		clockNow    time.Time
 	)
 
@@ -115,6 +132,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			NewEZCAClient:    func(string) (ezcaRenewer, error) { return ezcaClient, nil },
 			NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 				return entraClient, nil
+			},
+			NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
+				return kvClient, nil
 			},
 		}
 	}
@@ -158,6 +178,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		clockNow = now
 		ezcaClient = &fakeEZCA{}
 		entraClient = &fakeEntra{}
+		kvClient = &fakeKeyVault{}
 		reconciler = newReconciler()
 	})
 
@@ -291,6 +312,86 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+	})
+
+	It("imports the certificate into Key Vault when it differs, and skips when it matches", func() {
+		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("kv-secret", certPEM, keyPEM)
+
+		ezcaURL := "https://portal.ezca.io"
+		friendly := "kv-identity"
+		tenant := "00000000-0000-0000-0000-000000000000"
+		app := "11111111-1111-1111-1111-111111111111"
+		objectID := "obj-1"
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				Name:                &friendly,
+				EZCAURL:             &ezcaURL,
+				CertSecretName:      "kv-secret",
+				CertSecretNamespace: namespace,
+				Cloud:               ezcav1.CloudPublic,
+				RenewalThreshold:    20,
+				// keyVault requires the app fields (cert authenticates as the app).
+				TenantID:    &tenant,
+				AppID:       &app,
+				AppObjectID: &objectID,
+				KeyVault:    &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		// Key Vault differs -> import a PEM bundle (cert chain + key).
+		kvClient.matches = false
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.imported).To(HaveLen(1))
+		Expect(string(kvClient.imported[0])).To(ContainSubstring("BEGIN CERTIFICATE"))
+		Expect(string(kvClient.imported[0])).To(ContainSubstring("PRIVATE KEY"))
+
+		// Key Vault already matches -> no further import.
+		kvClient.matches = true
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.imported).To(HaveLen(1))
+	})
+
+	It("defers Key Vault sync (no error) while the certificate is still propagating", func() {
+		certPEM, keyPEM, _ := genCert("kv2.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("kv2-secret", certPEM, keyPEM)
+
+		ezcaURL := "https://portal.ezca.io"
+		friendly := "kv2-identity"
+		tenant := "00000000-0000-0000-0000-000000000000"
+		app := "11111111-1111-1111-1111-111111111111"
+		objectID := "obj-1"
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv2-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				Name:                &friendly,
+				EZCAURL:             &ezcaURL,
+				CertSecretName:      "kv2-secret",
+				CertSecretNamespace: namespace,
+				Cloud:               ezcav1.CloudPublic,
+				RenewalThreshold:    20,
+				TenantID:            &tenant,
+				AppID:               &app,
+				AppObjectID:         &objectID,
+				KeyVault:            &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+
+		// Vault auth fails with the propagation error -> transient, not Degraded.
+		kvClient.matchErr = errors.New("ClientCertificateCredential authentication failed: AADSTS700027: key not found")
+		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically("<=", propagationRequeue))
+		Expect(kvClient.imported).To(BeEmpty())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedClusterCertIdentity)).To(BeFalse())
 	})
 
 	It("degrades when the certificate Secret is missing", func() {

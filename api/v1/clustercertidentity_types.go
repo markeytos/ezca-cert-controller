@@ -45,6 +45,7 @@ const (
 // app is configured, rotates the renewed certificate onto the app registration.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
+// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
 type ClusterCertIdentitySpec struct {
 	// name is a friendly identifier for this certificate identity.
 	// +required
@@ -105,12 +106,36 @@ type ClusterCertIdentitySpec struct {
 	// +kubebuilder:validation:MinLength=1
 	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
 
+	// keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
+	// the Secret. On every reconcile the controller ensures the named vault
+	// certificate matches the Secret, importing the current certificate (and
+	// key) whenever they differ. The controller authenticates to the vault as
+	// the identity's app using its certificate, so this requires the app fields
+	// (tenantID, appID, appObjectID) and the app service principal must have get
+	// and import permission on the vault.
+	// +optional
+	KeyVault *KeyVaultSpec `json:"keyVault,omitempty"`
+
 	// renewalThreshold is the percentage of the certificate's total lifetime
 	// remaining at or below which the certificate is renewed.
 	// +kubebuilder:default:=20
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=99
 	RenewalThreshold int32 `json:"renewalThreshold"`
+}
+
+// KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
+// the controller-managed certificate.
+type KeyVaultSpec struct {
+	// vaultName is the name of the Azure Key Vault (not the full URL).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	VaultName string `json:"vaultName"`
+
+	// certName is the name of the certificate in the vault to keep in sync.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	CertName string `json:"certName"`
 }
 
 // ManagedKeyCredential records a certificate the controller added to an Entra ID
