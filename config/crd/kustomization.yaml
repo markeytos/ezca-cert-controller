@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/ezca.keytos.io_clustercertidentities.yaml
+- bases/ezca.keytos.io_managedcredentials.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

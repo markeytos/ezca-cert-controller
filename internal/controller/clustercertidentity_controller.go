@@ -21,13 +21,10 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -42,67 +39,10 @@ import (
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
 	"github.com/markeytos/ezca-cert-controller/internal/entra"
 	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
-	"github.com/markeytos/ezca-cert-controller/internal/pki"
 	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
 )
 
-// Definitions to manage status conditions
-const (
-	// typeAvailableClusterCertIdentity indicates the certificate is present and valid
-	typeAvailableClusterCertIdentity = "Available"
-	// typeProgressingClusterCertIdentity indicates the certificate is being renewed
-	typeProgressingClusterCertIdentity = "Progressing"
-	// typeDegradedClusterCertIdentity indicates reconciliation encountered an error
-	typeDegradedClusterCertIdentity = "Degraded"
-
-	clusterCertIdentityFinalizer = "ezca.keytos.io/finalizer"
-
-	tlsCertKey = "tls.crt"
-	tlsKeyKey  = "tls.key"
-	// tlsCertPendingKey and tlsKeyPendingKey stage a renewed certificate that
-	// has been added to the app registration but is awaiting Entra ID
-	// propagation. The active tls.crt/tls.key keep serving the current
-	// certificate until the staged one can authenticate.
-	tlsCertPendingKey = "tls.crt.pending"
-	tlsKeyPendingKey  = "tls.key.pending"
-
-	// maxRequeueAfter bounds how long the controller waits before re-checking a
-	// certificate, so managed-credential cleanup also runs at least this often.
-	maxRequeueAfter = 24 * time.Hour
-
-	// propagationRequeue is how often the controller re-checks whether a staged
-	// certificate has become usable in Entra ID.
-	propagationRequeue = 30 * time.Second
-	// propagationGrace is the minimum time to wait after adding a key before
-	// promoting it, even once it authenticates. A single successful token
-	// acquisition only proves one token-endpoint replica has the key; this
-	// window lets it propagate to the rest.
-	propagationGrace = 5 * time.Minute
-	// propagationTimeout is how long propagation may take before the controller
-	// surfaces a Degraded condition (it keeps retrying afterwards).
-	propagationTimeout = 15 * time.Minute
-)
-
-// ezcaRenewer renews a certificate through EZCA. Satisfied by
-// *ezca.CertificateClient; overridable in tests.
-type ezcaRenewer interface {
-	RenewCertificateV3(ctx context.Context, cert *x509.Certificate, key *rsa.PrivateKey, csr []byte, validityDays int) ([]*x509.Certificate, error)
-}
-
-// entraManager manages certificate credentials on an app registration.
-// Satisfied by *entra.Client; overridable in tests.
-type entraManager interface {
-	VerifyCredential(ctx context.Context) error
-	AddKey(ctx context.Context, objectID string, newCertDER []byte) (string, error)
-	RemoveKey(ctx context.Context, objectID, keyID string) error
-}
-
-// keyVaultManager keeps a certificate in Azure Key Vault in sync. Satisfied by
-// *keyvault.Client; overridable in tests.
-type keyVaultManager interface {
-	CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error)
-	ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error
-}
+const clusterCertIdentityFinalizer = "ezca.keytos.io/finalizer"
 
 // ClusterCertIdentityReconciler reconciles a ClusterCertIdentity object
 type ClusterCertIdentityReconciler struct {
@@ -180,7 +120,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 		secretNS = r.DefaultNamespace
 	}
 	if secretNS == "" {
-		r.setDegraded(cci, "NamespaceUnresolved", "Could not resolve the certificate Secret namespace; set spec.certSecretNamespace or POD_NAMESPACE")
+		setDegraded(cci, "NamespaceUnresolved", "Could not resolve the certificate Secret namespace; set spec.certSecretNamespace or POD_NAMESPACE")
 		return ctrl.Result{}, nil
 	}
 
@@ -188,7 +128,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	secretName := types.NamespacedName{Namespace: secretNS, Name: cci.Spec.CertSecretName}
 	if err := r.Get(ctx, secretName, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.setDegraded(cci, "CertificateNotBootstrapped",
+			setDegraded(cci, "CertificateNotBootstrapped",
 				fmt.Sprintf("Certificate Secret %s not found; an administrator must bootstrap it", secretName))
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
@@ -197,339 +137,23 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {
-		r.setDegraded(cci, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
+		setDegraded(cci, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	now := r.now()
 	setObservedCert(cci, chain[0])
 
-	result, coreErr := r.reconcileCertState(ctx, cci, &secret, chain, key, now, tel)
+	result, coreErr := reconcileCertState(ctx, r, cci, &secret, chain, key, now, tel)
 
 	if cci.Spec.KeyVault != nil {
-		r.syncKeyVaultBestEffort(ctx, cci, &secret, now, tel, &result, coreErr)
+		syncKeyVaultBestEffort(ctx, r, cci, &secret, now, tel, &result, coreErr)
 	}
 	return result, coreErr
 }
 
-// syncKeyVaultBestEffort runs the Key Vault sync without letting it override a
-// successful core result. It defers while a freshly changed certificate is
-// still propagating across Entra ID token replicas, and treats the
-// "certificate not yet registered" auth error as a quiet, transient retry
-// rather than a hard failure.
-func (r *ClusterCertIdentityReconciler) syncKeyVaultBestEffort(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, now time.Time, tel *telemetry.Telemetry, result *ctrl.Result, coreErr error) {
-	log := logf.FromContext(ctx)
-
-	// A certificate that was just renewed/promoted may not yet be usable on
-	// every AAD token replica; give it the propagation grace before trying to
-	// authenticate to Key Vault with it.
-	if cci.Status.LastRenewalTime != nil && now.Sub(cci.Status.LastRenewalTime.Time) < propagationGrace {
-		requeueAtMost(result, propagationRequeue)
-		return
-	}
-
-	kvErr := r.syncKeyVault(ctx, cci, secret, tel)
-	if kvErr == nil {
-		return
-	}
-	if isCredentialPropagating(kvErr) {
-		// Transient: the certificate is correct but not yet on the replica we
-		// reached. Retry soon; do not alarm.
-		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
-		requeueAtMost(result, propagationRequeue)
-		return
-	}
-	log.Error(kvErr, "Failed to sync certificate to Key Vault")
-	tel.TrackError(kvErr, "Failed to sync certificate to Key Vault", identityProps(cci))
-	if coreErr == nil {
-		r.setDegraded(cci, "KeyVaultSyncFailed", fmt.Sprintf("Failed to sync certificate to Key Vault: %v", kvErr))
-		requeueAtMost(result, time.Minute)
-	}
-}
-
-// requeueAtMost lowers result.RequeueAfter to d if it is currently unset or
-// longer than d.
-func requeueAtMost(result *ctrl.Result, d time.Duration) {
-	if result.RequeueAfter == 0 || result.RequeueAfter > d {
-		result.RequeueAfter = d
-	}
-}
-
-// isCredentialPropagating reports whether err is the transient Entra ID error
-// returned while a newly added certificate has not yet propagated to the token
-// endpoint replica that served the request.
-func isCredentialPropagating(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "AADSTS700027")
-}
-
-// reconcileCertState runs the renewal/rotation state machine and updates status
-// conditions on cci in place (persisted by the caller).
-func (r *ClusterCertIdentityReconciler) reconcileCertState(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey, now time.Time, tel *telemetry.Telemetry) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-	current := chain[0]
-
-	// If a renewed certificate is staged and awaiting propagation in Entra ID,
-	// try to promote it. The active tls.crt/tls.key keep serving the current
-	// (trusted) certificate until the renewed one can authenticate.
-	if hasPendingCert(secret) {
-		return r.promoteIfReady(ctx, cci, secret, tel, now)
-	}
-
-	remaining := pki.LifetimeFractionRemaining(current, now)
-	if remaining > float64(cci.Spec.RenewalThreshold) {
-		// Not due for renewal. Still clean up any managed credentials that have
-		// expired since the last renewal.
-		if appConfigured(cci) && hasExpiredManagedCredentials(cci, now) {
-			if err := r.manageApp(ctx, cci, current, key, nil, tel, now); err != nil {
-				log.Error(err, "Failed to clean up expired app credentials")
-			}
-		}
-		r.setAvailable(cci, "CertificateValid", "Certificate is valid and not yet due for renewal")
-		return ctrl.Result{RequeueAfter: r.requeueForRenewal(current, cci.Spec.RenewalThreshold, now)}, nil
-	}
-
-	log.Info("Renewing certificate", "thumbprint", pki.Thumbprint(current), "remainingPercent", int(remaining))
-	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-		Type:    typeProgressingClusterCertIdentity,
-		Status:  metav1.ConditionTrue,
-		Reason:  "Renewing",
-		Message: "Certificate crossed the renewal threshold and is being renewed",
-	})
-
-	newChain, newKey, err := r.renew(ctx, cci, current, key, tel)
-	if err != nil {
-		r.setDegraded(cci, "RenewalFailed", fmt.Sprintf("Failed to renew certificate: %v", err))
-		return ctrl.Result{}, err
-	}
-	newLeaf := newChain[0]
-
-	// Certificate-only identity: nothing to authenticate against, so promote
-	// the renewed certificate immediately.
-	if !appConfigured(cci) {
-		if err := r.writeActiveSecret(ctx, secret, newChain, newKey); err != nil {
-			tel.TrackError(err, "Failed to write renewed certificate Secret", identityProps(cci))
-			r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to write renewed certificate to Secret: %v", err))
-			return ctrl.Result{}, err
-		}
-		setObservedCert(cci, newLeaf)
-		cci.Status.LastRenewalTime = &metav1.Time{Time: now}
-		tel.TrackEvent("CertificateRenewed", identityProps(cci))
-		log.Info("Renewed certificate", "thumbprint", pki.Thumbprint(newLeaf), "notAfter", newLeaf.NotAfter)
-		r.setAvailable(cci, "CertificateRenewed", "Certificate renewed successfully")
-		return ctrl.Result{RequeueAfter: r.requeueForRenewal(newLeaf, cci.Spec.RenewalThreshold, now)}, nil
-	}
-
-	// App identity: add the renewed certificate to the app registration using
-	// the current (trusted) certificate, then stage it as pending. It is
-	// promoted into the active Secret only once Entra ID can authenticate with
-	// it (see promoteIfReady), so the Secret never serves an unusable cert to
-	// the controller or to other consumers.
-	if err := r.manageApp(ctx, cci, current, key, newLeaf, tel, now); err != nil {
-		r.setDegraded(cci, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
-		return ctrl.Result{}, err
-	}
-	if err := r.writePendingSecret(ctx, secret, newChain, newKey); err != nil {
-		tel.TrackError(err, "Failed to stage renewed certificate Secret", identityProps(cci))
-		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to stage renewed certificate: %v", err))
-		return ctrl.Result{}, err
-	}
-	cci.Status.PendingThumbprint = pki.Thumbprint(newLeaf)
-	cci.Status.PendingSince = &metav1.Time{Time: now}
-	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-		Type:    typeProgressingClusterCertIdentity,
-		Status:  metav1.ConditionTrue,
-		Reason:  "PendingPropagation",
-		Message: "Renewed certificate added to the app registration; waiting for Entra ID propagation",
-	})
-	log.Info("Staged renewed certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-	return ctrl.Result{RequeueAfter: propagationRequeue}, nil
-}
-
-// promoteIfReady checks whether the staged (pending) certificate can now
-// authenticate to Entra ID and, if so, promotes it into the active Secret.
-// Until then the active certificate is left untouched, so consumers keep using
-// a certificate Entra ID already trusts.
-func (r *ClusterCertIdentityReconciler) promoteIfReady(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, tel *telemetry.Telemetry, now time.Time) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	pendingChain, pendingKey, err := parsePendingSecret(secret)
-	if err != nil {
-		// The staged data is unusable; drop it and renew again next pass.
-		delete(secret.Data, tlsCertPendingKey)
-		delete(secret.Data, tlsKeyPendingKey)
-		if uerr := r.Update(ctx, secret); uerr != nil {
-			return ctrl.Result{}, uerr
-		}
-		cci.Status.PendingThumbprint = ""
-		cci.Status.PendingSince = nil
-		r.setDegraded(cci, "InvalidPendingCertificate", fmt.Sprintf("Staged certificate is invalid: %v", err))
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-	pendingLeaf := pendingChain[0]
-
-	cl, err := r.newEntraClient(*cci.Spec.TenantID, *cci.Spec.AppID, cloudFor(cci.Spec.Cloud), pendingLeaf, pendingKey)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if verr := cl.VerifyCredential(ctx); verr != nil {
-		// Not usable yet. Keep waiting, but surface Degraded if propagation is
-		// taking abnormally long (retries continue regardless).
-		if cci.Status.PendingSince != nil && now.Sub(cci.Status.PendingSince.Time) > propagationTimeout {
-			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(cci))
-			r.setDegraded(cci, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
-		} else {
-			meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-				Type:    typeProgressingClusterCertIdentity,
-				Status:  metav1.ConditionTrue,
-				Reason:  "PendingPropagation",
-				Message: "Waiting for the renewed certificate to propagate in Entra ID",
-			})
-		}
-		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
-	}
-
-	// It authenticated on the replica we hit, but a single success does not mean
-	// every token-endpoint replica has the key yet. Wait out a grace window
-	// since the key was added before promoting, so we don't switch the active
-	// certificate to one other replicas would still reject.
-	if cci.Status.PendingSince != nil && now.Sub(cci.Status.PendingSince.Time) < propagationGrace {
-		meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-			Type:    typeProgressingClusterCertIdentity,
-			Status:  metav1.ConditionTrue,
-			Reason:  "Stabilizing",
-			Message: fmt.Sprintf("Renewed certificate authenticated; waiting %s for Entra ID propagation to stabilize", propagationGrace),
-		})
-		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
-	}
-
-	// Usable and past the grace window: promote the staged certificate.
-	if err := r.promoteSecret(ctx, secret); err != nil {
-		tel.TrackError(err, "Failed to promote renewed certificate Secret", identityProps(cci))
-		r.setDegraded(cci, "SecretWriteFailed", fmt.Sprintf("Failed to promote renewed certificate: %v", err))
-		return ctrl.Result{}, err
-	}
-	setObservedCert(cci, pendingLeaf)
-	cci.Status.LastRenewalTime = &metav1.Time{Time: now}
-	cci.Status.PendingThumbprint = ""
-	cci.Status.PendingSince = nil
-	tel.TrackEvent("CertificateRenewed", identityProps(cci))
-	log.Info("Promoted renewed certificate", "thumbprint", pki.Thumbprint(pendingLeaf), "notAfter", pendingLeaf.NotAfter)
-	r.setAvailable(cci, "CertificateRenewed", "Certificate renewed successfully")
-	return ctrl.Result{RequeueAfter: r.requeueForRenewal(pendingLeaf, cci.Spec.RenewalThreshold, now)}, nil
-}
-
-// renew builds a renewal CSR (with a fresh key) and renews the certificate
-// through EZCA using the current certificate for authentication.
-func (r *ClusterCertIdentityReconciler) renew(ctx context.Context, cci *ezcav1.ClusterCertIdentity, current *x509.Certificate, key *rsa.PrivateKey, tel *telemetry.Telemetry) ([]*x509.Certificate, *rsa.PrivateKey, error) {
-	csrDER, newKey, err := pki.BuildRenewalCSR(current)
-	if err != nil {
-		return nil, nil, err
-	}
-	renewer, err := r.newEZCAClient(*cci.Spec.EZCAURL)
-	if err != nil {
-		return nil, nil, err
-	}
-	newChain, err := renewer.RenewCertificateV3(ctx, current, key, csrDER, pki.ValidityInDays(current))
-	if err != nil {
-		tel.TrackError(err, "Failed to renew certificate via EZCA", identityProps(cci))
-		return nil, nil, err
-	}
-	return newChain, newKey, nil
-}
-
-// manageApp authenticates to Microsoft Graph as the app (using authCert), adds
-// newLeaf when non-nil, and removes any managed credentials that have expired.
-// It targets the app registration by its directory object ID directly, so no
-// directory-read permission is needed: addKey/removeKey succeed with a
-// proof-of-possession signed by the app's current certificate.
-func (r *ClusterCertIdentityReconciler) manageApp(ctx context.Context, cci *ezcav1.ClusterCertIdentity, authCert *x509.Certificate, authKey *rsa.PrivateKey, newLeaf *x509.Certificate, tel *telemetry.Telemetry, now time.Time) error {
-	cl, err := r.newEntraClient(*cci.Spec.TenantID, *cci.Spec.AppID, cloudFor(cci.Spec.Cloud), authCert, authKey)
-	if err != nil {
-		return err
-	}
-	objectID := *cci.Spec.AppObjectID
-
-	if newLeaf != nil {
-		keyID, err := cl.AddKey(ctx, objectID, newLeaf.Raw)
-		if err != nil {
-			tel.TrackError(err, "Failed to add renewed certificate to app registration", identityProps(cci))
-			return err
-		}
-		cci.Status.ManagedKeyCredentials = append(cci.Status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
-			Thumbprint: pki.Thumbprint(newLeaf),
-			KeyID:      keyID,
-			NotAfter:   metav1.Time{Time: newLeaf.NotAfter},
-		})
-		tel.TrackEvent("CertificateAddedToApp", identityProps(cci))
-	}
-
-	var remaining []ezcav1.ManagedKeyCredential
-	for _, mc := range cci.Status.ManagedKeyCredentials {
-		if mc.NotAfter.After(now) {
-			remaining = append(remaining, mc) // still valid
-			continue
-		}
-		if err := cl.RemoveKey(ctx, objectID, mc.KeyID); err != nil {
-			tel.TrackError(err, "Failed to remove expired certificate from app registration", identityProps(cci))
-			remaining = append(remaining, mc) // keep to retry next time
-			continue
-		}
-		tel.TrackEvent("ExpiredCertificateRemoved", identityProps(cci))
-		// Removed from the app: drop from status.
-	}
-	cci.Status.ManagedKeyCredentials = remaining
-	return nil
-}
-
-// writeActiveSecret rewrites the active tls.crt/tls.key with the renewed chain
-// and key.
-func (r *ClusterCertIdentityReconciler) writeActiveSecret(ctx context.Context, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
-	if err := setTLSData(secret, tlsCertKey, tlsKeyKey, chain, key); err != nil {
-		return err
-	}
-	return r.Update(ctx, secret)
-}
-
-// writePendingSecret stages the renewed chain and key under the pending keys,
-// leaving the active certificate untouched.
-func (r *ClusterCertIdentityReconciler) writePendingSecret(ctx context.Context, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
-	if err := setTLSData(secret, tlsCertPendingKey, tlsKeyPendingKey, chain, key); err != nil {
-		return err
-	}
-	return r.Update(ctx, secret)
-}
-
-// promoteSecret moves the staged certificate into the active tls.crt/tls.key
-// and removes the pending keys.
-func (r *ClusterCertIdentityReconciler) promoteSecret(ctx context.Context, secret *corev1.Secret) error {
-	secret.Data[tlsCertKey] = secret.Data[tlsCertPendingKey]
-	secret.Data[tlsKeyKey] = secret.Data[tlsKeyPendingKey]
-	delete(secret.Data, tlsCertPendingKey)
-	delete(secret.Data, tlsKeyPendingKey)
-	return r.Update(ctx, secret)
-}
-
-func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
-	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
-	if err != nil {
-		return err
-	}
-	if secret.Data == nil {
-		secret.Data = map[string][]byte{}
-	}
-	secret.Data[certKey] = pki.EncodeCertChainPEM(chain)
-	secret.Data[keyKey] = keyPEM
-	return nil
-}
-
-func (r *ClusterCertIdentityReconciler) requeueForRenewal(cert *x509.Certificate, thresholdPct int32, now time.Time) time.Duration {
-	d := pki.NextRenewalTime(cert, thresholdPct).Sub(now)
-	if d <= 0 {
-		d = time.Minute
-	}
-	if d > maxRequeueAfter {
-		d = maxRequeueAfter
-	}
-	return d
+// kubeClient returns the controller-runtime client (reconcilerDeps).
+func (r *ClusterCertIdentityReconciler) kubeClient() client.Client {
+	return r.Client
 }
 
 func (r *ClusterCertIdentityReconciler) now() time.Time {
@@ -558,69 +182,6 @@ func (r *ClusterCertIdentityReconciler) newKeyVaultClient(vaultName, tenantID, a
 		return r.NewKeyVaultClient(vaultName, tenantID, appID, cl, cert, key)
 	}
 	return keyvault.NewClient(vaultName, tenantID, appID, cl, cert, key)
-}
-
-// syncKeyVault ensures the configured Key Vault certificate matches the active
-// Secret certificate, importing the current chain and key when they differ. It
-// authenticates to the vault as the identity's app using that certificate, so
-// keyVault requires the app fields (enforced by CRD validation).
-func (r *ClusterCertIdentityReconciler) syncKeyVault(ctx context.Context, cci *ezcav1.ClusterCertIdentity, secret *corev1.Secret, tel *telemetry.Telemetry) error {
-	chain, key, err := parseSecret(secret)
-	if err != nil {
-		return err
-	}
-	leaf := chain[0]
-
-	cl, err := r.newKeyVaultClient(cci.Spec.KeyVault.VaultName, *cci.Spec.TenantID, *cci.Spec.AppID, keyVaultCloudFor(cci.Spec.Cloud), leaf, key)
-	if err != nil {
-		return err
-	}
-	match, err := cl.CertificateMatches(ctx, cci.Spec.KeyVault.CertName, pki.Thumbprint(leaf))
-	if err != nil {
-		return err
-	}
-	if match {
-		return nil
-	}
-
-	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
-	if err != nil {
-		return err
-	}
-	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
-	if err := cl.ImportCertificate(ctx, cci.Spec.KeyVault.CertName, bundle); err != nil {
-		return err
-	}
-	logf.FromContext(ctx).Info("Updated Key Vault certificate",
-		"vault", cci.Spec.KeyVault.VaultName, "certName", cci.Spec.KeyVault.CertName, "thumbprint", pki.Thumbprint(leaf))
-	tel.TrackEvent("KeyVaultCertificateUpdated", identityProps(cci))
-	return nil
-}
-
-func (r *ClusterCertIdentityReconciler) setAvailable(cci *ezcav1.ClusterCertIdentity, reason, message string) {
-	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-		Type:    typeAvailableClusterCertIdentity,
-		Status:  metav1.ConditionTrue,
-		Reason:  reason,
-		Message: message,
-	})
-	meta.RemoveStatusCondition(&cci.Status.Conditions, typeProgressingClusterCertIdentity)
-	meta.RemoveStatusCondition(&cci.Status.Conditions, typeDegradedClusterCertIdentity)
-}
-
-func (r *ClusterCertIdentityReconciler) setDegraded(cci *ezcav1.ClusterCertIdentity, reason, message string) {
-	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-		Type:    typeDegradedClusterCertIdentity,
-		Status:  metav1.ConditionTrue,
-		Reason:  reason,
-		Message: message,
-	})
-	meta.SetStatusCondition(&cci.Status.Conditions, metav1.Condition{
-		Type:    typeAvailableClusterCertIdentity,
-		Status:  metav1.ConditionFalse,
-		Reason:  reason,
-		Message: message,
-	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -656,80 +217,4 @@ func (r *ClusterCertIdentityReconciler) secretToRequests(ctx context.Context, ob
 		}
 	}
 	return reqs
-}
-
-func parseSecret(secret *corev1.Secret) ([]*x509.Certificate, *rsa.PrivateKey, error) {
-	return parseTLS(secret, tlsCertKey, tlsKeyKey)
-}
-
-func parsePendingSecret(secret *corev1.Secret) ([]*x509.Certificate, *rsa.PrivateKey, error) {
-	return parseTLS(secret, tlsCertPendingKey, tlsKeyPendingKey)
-}
-
-func hasPendingCert(secret *corev1.Secret) bool {
-	return len(secret.Data[tlsCertPendingKey]) > 0 && len(secret.Data[tlsKeyPendingKey]) > 0
-}
-
-func parseTLS(secret *corev1.Secret, certKey, keyKey string) ([]*x509.Certificate, *rsa.PrivateKey, error) {
-	certData := secret.Data[certKey]
-	if len(certData) == 0 {
-		return nil, nil, fmt.Errorf("missing %q", certKey)
-	}
-	keyData := secret.Data[keyKey]
-	if len(keyData) == 0 {
-		return nil, nil, fmt.Errorf("missing %q", keyKey)
-	}
-	chain, err := pki.ParseCertChainPEM(certData)
-	if err != nil {
-		return nil, nil, err
-	}
-	key, err := pki.ParseRSAPrivateKey(keyData)
-	if err != nil {
-		return nil, nil, err
-	}
-	return chain, key, nil
-}
-
-func setObservedCert(cci *ezcav1.ClusterCertIdentity, cert *x509.Certificate) {
-	cci.Status.NotBefore = &metav1.Time{Time: cert.NotBefore}
-	cci.Status.NotAfter = &metav1.Time{Time: cert.NotAfter}
-	cci.Status.Thumbprint = pki.Thumbprint(cert)
-}
-
-func appConfigured(cci *ezcav1.ClusterCertIdentity) bool {
-	return cci.Spec.TenantID != nil && cci.Spec.AppID != nil && cci.Spec.AppObjectID != nil
-}
-
-func hasExpiredManagedCredentials(cci *ezcav1.ClusterCertIdentity, now time.Time) bool {
-	for _, mc := range cci.Status.ManagedKeyCredentials {
-		if !mc.NotAfter.After(now) {
-			return true
-		}
-	}
-	return false
-}
-
-func cloudFor(c ezcav1.CloudEnvironment) entra.Cloud {
-	if c == ezcav1.CloudUSGov {
-		return entra.CloudUSGov
-	}
-	return entra.CloudPublic
-}
-
-func keyVaultCloudFor(c ezcav1.CloudEnvironment) keyvault.Cloud {
-	if c == ezcav1.CloudUSGov {
-		return keyvault.CloudUSGov
-	}
-	return keyvault.CloudPublic
-}
-
-func identityProps(cci *ezcav1.ClusterCertIdentity) map[string]string {
-	props := map[string]string{
-		"identity":   cci.Name,
-		"thumbprint": cci.Status.Thumbprint,
-	}
-	if cci.Spec.AppID != nil {
-		props["appID"] = *cci.Spec.AppID
-	}
-	return props
 }

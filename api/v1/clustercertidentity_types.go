@@ -36,133 +36,7 @@ const (
 	CloudUSGov CloudEnvironment = "USGov"
 )
 
-// ClusterCertIdentitySpec defines the desired state of ClusterCertIdentity.
-//
-// A ClusterCertIdentity represents either a bare certificate or an Entra ID app
-// registration paired with a certificate. The certificate and its RSA private
-// key are bootstrapped by an administrator into the referenced Secret; the
-// controller renews the certificate through EZCA before it expires and, when an
-// app is configured, rotates the renewed certificate onto the app registration.
-//
-// +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
-// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
-type ClusterCertIdentitySpec struct {
-	// name is a friendly identifier for this certificate identity.
-	// +required
-	// +kubebuilder:validation:MinLength=1
-	Name *string `json:"name"`
-
-	// ezcaURL is the base URL of the EZCA instance used to renew the
-	// certificate (for example https://portal.ezca.io).
-	// +required
-	// +kubebuilder:validation:MinLength=1
-	EZCAURL *string `json:"ezcaURL"`
-
-	// tenantID is the Entra ID (Azure AD) tenant that owns the app
-	// registration. It must be set together with appID.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	TenantID *string `json:"tenantID,omitempty"`
-
-	// appID is the Entra ID (Azure AD) application (client) ID whose
-	// certificate credentials are rotated. It is used to authenticate as the
-	// app and as the proof-of-possession issuer. It must be set together with
-	// tenantID and appObjectID.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	AppID *string `json:"appID,omitempty"`
-
-	// appObjectID is the Entra ID directory object ID of the app registration
-	// (the "id" of the application object, not the appId). It is required to
-	// call Graph addKey/removeKey directly, avoiding a lookup that needs
-	// directory read permissions. It must be set together with tenantID and
-	// appID.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	AppObjectID *string `json:"appObjectID,omitempty"`
-
-	// cloud selects the Azure sovereign cloud used to reach Entra ID and
-	// Microsoft Graph.
-	// +optional
-	// +kubebuilder:default:=Public
-	Cloud CloudEnvironment `json:"cloud,omitempty"`
-
-	// certSecretName is the name of the kubernetes.io/tls Secret holding the
-	// bootstrapped certificate (tls.crt, leaf plus chain) and its RSA private
-	// key (tls.key). The controller reads and rewrites this Secret.
-	// +kubebuilder:default:="cluster-cert-identity"
-	CertSecretName string `json:"certSecretName"`
-
-	// certSecretNamespace is the namespace of the certificate Secret. When
-	// empty it defaults to the namespace the controller runs in.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	CertSecretNamespace string `json:"certSecretNamespace,omitempty"`
-
-	// appInsightsConnString is an optional Azure Application Insights
-	// connection string. When set, renewals, rotations, and errors are
-	// reported to Application Insights.
-	// +optional
-	// +kubebuilder:validation:MinLength=1
-	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
-
-	// keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
-	// the Secret. On every reconcile the controller ensures the named vault
-	// certificate matches the Secret, importing the current certificate (and
-	// key) whenever they differ. The controller authenticates to the vault as
-	// the identity's app using its certificate, so this requires the app fields
-	// (tenantID, appID, appObjectID) and the app service principal must have get
-	// and import permission on the vault.
-	// +optional
-	KeyVault *KeyVaultSpec `json:"keyVault,omitempty"`
-
-	// renewalThreshold is the percentage of the certificate's total lifetime
-	// remaining at or below which the certificate is renewed.
-	// +kubebuilder:default:=20
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=99
-	RenewalThreshold int32 `json:"renewalThreshold"`
-}
-
-// KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
-// the controller-managed certificate.
-type KeyVaultSpec struct {
-	// vaultName is the name of the Azure Key Vault (not the full URL).
-	// +required
-	// +kubebuilder:validation:MinLength=1
-	VaultName string `json:"vaultName"`
-
-	// certName is the name of the certificate in the vault to keep in sync.
-	// +required
-	// +kubebuilder:validation:MinLength=1
-	CertName string `json:"certName"`
-}
-
-// ManagedKeyCredential records a certificate the controller added to an Entra ID
-// app registration so it can be removed once it expires.
-type ManagedKeyCredential struct {
-	// thumbprint is the SHA-1 thumbprint (hex) of the managed certificate.
-	// +required
-	Thumbprint string `json:"thumbprint"`
-
-	// keyID is the keyCredential identifier assigned by Microsoft Graph.
-	// +required
-	KeyID string `json:"keyID"`
-
-	// notAfter is the managed certificate's expiry. The credential is removed
-	// from the app registration only after this time.
-	// +required
-	NotAfter metav1.Time `json:"notAfter"`
-}
-
-// ClusterCertIdentityStatus defines the observed state of ClusterCertIdentity.
-type ClusterCertIdentityStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
+type CertIdentityStatusBase struct {
 	// conditions represent the current state of the ClusterCertIdentity resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
@@ -212,11 +86,139 @@ type ClusterCertIdentityStatus struct {
 	ManagedKeyCredentials []ManagedKeyCredential `json:"managedKeyCredentials,omitempty"`
 }
 
+type CertIdentitySpecBase struct {
+	// ezcaURL is the base URL of the EZCA instance used to renew the
+	// certificate (for example https://portal.ezca.io).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	EZCAURL *string `json:"ezcaURL"`
+
+	// tenantID is the Entra ID (Azure AD) tenant that owns the app
+	// registration. It must be set together with appID.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	TenantID *string `json:"tenantID,omitempty"`
+
+	// appID is the Entra ID (Azure AD) application (client) ID whose
+	// certificate credentials are rotated. It is used to authenticate as the
+	// app and as the proof-of-possession issuer. It must be set together with
+	// tenantID and appObjectID.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	AppID *string `json:"appID,omitempty"`
+
+	// appObjectID is the Entra ID directory object ID of the app registration
+	// (the "id" of the application object, not the appId). It is required to
+	// call Graph addKey/removeKey directly, avoiding a lookup that needs
+	// directory read permissions. It must be set together with tenantID and
+	// appID.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	AppObjectID *string `json:"appObjectID,omitempty"`
+
+	// cloud selects the Azure sovereign cloud used to reach Entra ID and
+	// Microsoft Graph.
+	// +optional
+	// +kubebuilder:default:=Public
+	Cloud CloudEnvironment `json:"cloud,omitempty"`
+
+	// certSecretName is the name of the kubernetes.io/tls Secret holding the
+	// bootstrapped certificate (tls.crt, leaf plus chain) and its RSA private
+	// key (tls.key). The controller reads and rewrites this Secret.
+	// +kubebuilder:default:="cluster-cert-identity"
+	CertSecretName string `json:"certSecretName"`
+
+	// appInsightsConnString is an optional Azure Application Insights
+	// connection string. When set, renewals, rotations, and errors are
+	// reported to Application Insights.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
+
+	// keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
+	// the Secret. On every reconcile the controller ensures the named vault
+	// certificate matches the Secret, importing the current certificate (and
+	// key) whenever they differ. The controller authenticates to the vault as
+	// the identity's app using its certificate, so this requires the app fields
+	// (tenantID, appID, appObjectID) and the app service principal must have get
+	// and import permission on the vault.
+	// +optional
+	KeyVault *KeyVaultSpec `json:"keyVault,omitempty"`
+
+	// renewalThreshold is the percentage of the certificate's total lifetime
+	// remaining at or below which the certificate is renewed.
+	// +kubebuilder:default:=20
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	RenewalThreshold int32 `json:"renewalThreshold"`
+}
+
+// ClusterCertIdentitySpec defines the desired state of ClusterCertIdentity.
+//
+// A ClusterCertIdentity represents either a bare certificate or an Entra ID app
+// registration paired with a certificate. The certificate and its RSA private
+// key are bootstrapped by an administrator into the referenced Secret; the
+// controller renews the certificate through EZCA before it expires and, when an
+// app is configured, rotates the renewed certificate onto the app registration.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
+// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+type ClusterCertIdentitySpec struct {
+	CertIdentitySpecBase `json:",inline"`
+
+	// certSecretNamespace is the namespace of the certificate Secret. When
+	// empty it defaults to the namespace the controller runs in.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	CertSecretNamespace string `json:"certSecretNamespace,omitempty"`
+}
+
+// KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
+// the controller-managed certificate.
+type KeyVaultSpec struct {
+	// vaultName is the name of the Azure Key Vault (not the full URL).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	VaultName string `json:"vaultName"`
+
+	// certName is the name of the certificate in the vault to keep in sync.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	CertName string `json:"certName"`
+}
+
+// ManagedKeyCredential records a certificate the controller added to an Entra ID
+// app registration so it can be removed once it expires.
+type ManagedKeyCredential struct {
+	// thumbprint is the SHA-1 thumbprint (hex) of the managed certificate.
+	// +required
+	Thumbprint string `json:"thumbprint"`
+
+	// keyID is the keyCredential identifier assigned by Microsoft Graph.
+	// +required
+	KeyID string `json:"keyID"`
+
+	// notAfter is the managed certificate's expiry. The credential is removed
+	// from the app registration only after this time.
+	// +required
+	NotAfter metav1.Time `json:"notAfter"`
+}
+
+// ClusterCertIdentityStatus defines the observed state of ClusterCertIdentity.
+type ClusterCertIdentityStatus struct {
+	// For Kubernetes API conventions, see:
+	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+
+	CertIdentityStatusBase `json:",inline"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=cci
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
-// +kubebuilder:printcolumn:name="NotAfter",type=string,JSONPath=".status.notAfter"
+// +kubebuilder:printcolumn:name="Expiration",type=string,JSONPath=".status.notAfter"
+// +kubebuilder:printcolumn:name="Thumbprint",type=string,JSONPath=".status.thumbprint"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // ClusterCertIdentity is the Schema for the clustercertidentities API
 type ClusterCertIdentity struct {
@@ -242,6 +244,17 @@ type ClusterCertIdentityList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []ClusterCertIdentity `json:"items"`
+}
+
+// SpecBase returns the shared certificate-identity spec fields, letting the
+// controller treat ClusterCertIdentity and ManagedCredential uniformly.
+func (c *ClusterCertIdentity) SpecBase() *CertIdentitySpecBase {
+	return &c.Spec.CertIdentitySpecBase
+}
+
+// StatusBase returns the shared certificate-identity status fields.
+func (c *ClusterCertIdentity) StatusBase() *CertIdentityStatusBase {
+	return &c.Status.CertIdentityStatusBase
 }
 
 func init() {

@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the ezca-cert-controller itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- managedcredential_admin_role.yaml
+- managedcredential_editor_role.yaml
+- managedcredential_viewer_role.yaml
 - clustercertidentity_admin_role.yaml
 - clustercertidentity_editor_role.yaml
 - clustercertidentity_viewer_role.yaml

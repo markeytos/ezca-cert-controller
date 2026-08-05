@@ -42,6 +42,14 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
+// Shared test fixtures used across the controller test suite.
+const (
+	testEZCAURL  = "https://portal.ezca.io"
+	testUUID0    = "00000000-0000-0000-0000-000000000000"
+	testUUID1    = "11111111-1111-1111-1111-111111111111"
+	testObjectID = "obj-1"
+)
+
 type fakeEZCA struct {
 	newChain []*x509.Certificate
 	called   bool
@@ -149,23 +157,23 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	}
 
 	createIdentity := func(name, secretName string, withApp bool) *ezcav1.ClusterCertIdentity {
-		ezcaURL := "https://portal.ezca.io"
-		friendly := name
+		ezcaURL := testEZCAURL
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: ezcav1.ClusterCertIdentitySpec{
-				Name:                &friendly,
-				EZCAURL:             &ezcaURL,
-				CertSecretName:      secretName,
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   secretName,
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+				},
 				CertSecretNamespace: namespace,
-				Cloud:               ezcav1.CloudPublic,
-				RenewalThreshold:    20,
 			},
 		}
 		if withApp {
-			tenant := "00000000-0000-0000-0000-000000000000"
-			app := "11111111-1111-1111-1111-111111111111"
-			objectID := "obj-1"
+			tenant := testUUID0
+			app := testUUID1
+			objectID := testObjectID
 			cci.Spec.TenantID = &tenant
 			cci.Spec.AppID = &app
 			cci.Spec.AppObjectID = &objectID
@@ -193,7 +201,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(ezcaClient.called).To(BeFalse())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
-		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableClusterCertIdentity)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		Expect(cci.Status.NotAfter).NotTo(BeNil())
 	})
 
@@ -286,7 +294,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(cci.Status.PendingThumbprint).To(BeEmpty())
 		Expect(cci.Status.LastRenewalTime).NotTo(BeNil())
 		Expect(cci.Status.Thumbprint).To(Equal(pki.Thumbprint(parsedNew)))
-		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableClusterCertIdentity)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		// addKey happened exactly once across the whole flow.
 		Expect(entraClient.added).To(HaveLen(1))
 	})
@@ -318,25 +326,25 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
 		createSecret("kv-secret", certPEM, keyPEM)
 
-		ezcaURL := "https://portal.ezca.io"
-		friendly := "kv-identity"
-		tenant := "00000000-0000-0000-0000-000000000000"
-		app := "11111111-1111-1111-1111-111111111111"
-		objectID := "obj-1"
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: "kv-identity"},
 			Spec: ezcav1.ClusterCertIdentitySpec{
-				Name:                &friendly,
-				EZCAURL:             &ezcaURL,
-				CertSecretName:      "kv-secret",
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					// keyVault requires the app fields (cert authenticates as the app).
+					TenantID:    &tenant,
+					AppID:       &app,
+					AppObjectID: &objectID,
+					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+				},
 				CertSecretNamespace: namespace,
-				Cloud:               ezcav1.CloudPublic,
-				RenewalThreshold:    20,
-				// keyVault requires the app fields (cert authenticates as the app).
-				TenantID:    &tenant,
-				AppID:       &app,
-				AppObjectID: &objectID,
-				KeyVault:    &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
 			},
 		}
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
@@ -361,24 +369,24 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		certPEM, keyPEM, _ := genCert("kv2.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
 		createSecret("kv2-secret", certPEM, keyPEM)
 
-		ezcaURL := "https://portal.ezca.io"
-		friendly := "kv2-identity"
-		tenant := "00000000-0000-0000-0000-000000000000"
-		app := "11111111-1111-1111-1111-111111111111"
-		objectID := "obj-1"
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: "kv2-identity"},
 			Spec: ezcav1.ClusterCertIdentitySpec{
-				Name:                &friendly,
-				EZCAURL:             &ezcaURL,
-				CertSecretName:      "kv2-secret",
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv2-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+				},
 				CertSecretNamespace: namespace,
-				Cloud:               ezcav1.CloudPublic,
-				RenewalThreshold:    20,
-				TenantID:            &tenant,
-				AppID:               &app,
-				AppObjectID:         &objectID,
-				KeyVault:            &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
 			},
 		}
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
@@ -391,7 +399,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(kvClient.imported).To(BeEmpty())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
-		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedClusterCertIdentity)).To(BeFalse())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
 	})
 
 	It("degrades when the certificate Secret is missing", func() {
@@ -402,6 +410,6 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
-		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedClusterCertIdentity)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
 	})
 })

@@ -186,6 +186,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "clustercertidentity")
 		os.Exit(1)
 	}
+	if err := (&controller.ManagedCredentialReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "managedcredential")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

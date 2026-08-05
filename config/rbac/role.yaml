@@ -19,6 +19,7 @@ rules:
   - ezca.keytos.io
   resources:
   - clustercertidentities
+  - managedcredentials
   verbs:
   - create
   - delete
@@ -31,12 +32,14 @@ rules:
   - ezca.keytos.io
   resources:
   - clustercertidentities/finalizers
+  - managedcredentials/finalizers
   verbs:
   - update
 - apiGroups:
   - ezca.keytos.io
   resources:
   - clustercertidentities/status
+  - managedcredentials/status
   verbs:
   - get
   - patch

@@ -17,4 +17,13 @@ resources:
   kind: ClusterCertIdentity
   path: github.com/markeytos/ezca-cert-controller/api/v1
   version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: keytos.io
+  group: ezca
+  kind: ManagedCredential
+  path: github.com/markeytos/ezca-cert-controller/api/v1
+  version: v1
 version: "3"

@@ -51,6 +51,8 @@ import (
 // sovereign clouds.
 const graphProofAudience = "00000002-0000-0000-c000-000000000000"
 
+const KeyNotFoundOnAppErrorCode = "AADSTS700027"
+
 const (
 	graphEndpointPublic     = "https://graph.microsoft.com"
 	graphEndpointGovernment = "https://graph.microsoft.us"
@@ -97,6 +99,26 @@ type Client struct {
 	now           func() time.Time
 }
 
+// NewTokenCredential builds an Azure token credential that authenticates as the
+// given app registration using a client certificate. It is used both to reach
+// Microsoft Graph and to authenticate certificate issuance requests to EZCA as
+// the app.
+func NewTokenCredential(tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (azcore.TokenCredential, error) {
+	cfg, ok := cloudConfigs[cl]
+	if !ok {
+		return nil, fmt.Errorf("entra: unknown cloud %q", cl)
+	}
+	return azidentity.NewClientCertificateCredential(
+		tenantID,
+		appID,
+		[]*x509.Certificate{cert},
+		crypto.PrivateKey(key),
+		&azidentity.ClientCertificateCredentialOptions{
+			ClientOptions: azcore.ClientOptions{Cloud: cfg.azureCloud},
+		},
+	)
+}
+
 // NewClient builds a Graph client for the given app, authenticating as that app
 // with the provided certificate and RSA private key. The same certificate signs
 // the proof-of-possession token for mutations, so it must be a credential the
@@ -106,15 +128,7 @@ func NewClient(tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rs
 	if !ok {
 		return nil, fmt.Errorf("entra: unknown cloud %q", cl)
 	}
-	cred, err := azidentity.NewClientCertificateCredential(
-		tenantID,
-		appID,
-		[]*x509.Certificate{cert},
-		crypto.PrivateKey(key),
-		&azidentity.ClientCertificateCredentialOptions{
-			ClientOptions: azcore.ClientOptions{Cloud: cfg.azureCloud},
-		},
-	)
+	cred, err := NewTokenCredential(tenantID, appID, cl, cert, key)
 	if err != nil {
 		return nil, err
 	}

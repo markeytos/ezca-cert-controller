@@ -187,6 +187,56 @@ func TestBuildRenewalCSRPreservesIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildIssuanceCSRPreservesFullDN(t *testing.T) {
+	req := CertRequest{
+		SubjectName: "CN=app,OU=team,O=Keytos,C=US",
+		DNSNames:    []string{"app.example.com"},
+	}
+	csrDER, _, err := BuildIssuanceCSR(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if csr.Subject.CommonName != "app" {
+		t.Fatalf("CN: %q", csr.Subject.CommonName)
+	}
+	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != "team" {
+		t.Fatalf("OU not preserved: %v", csr.Subject.OrganizationalUnit)
+	}
+	if len(csr.Subject.Organization) != 1 || csr.Subject.Organization[0] != "Keytos" {
+		t.Fatalf("O not preserved: %v", csr.Subject.Organization)
+	}
+	if len(csr.Subject.Country) != 1 || csr.Subject.Country[0] != "US" {
+		t.Fatalf("C not preserved: %v", csr.Subject.Country)
+	}
+}
+
+func TestBuildIssuanceCSRBareCommonName(t *testing.T) {
+	csrDER, _, err := BuildIssuanceCSR(CertRequest{SubjectName: "app.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if csr.Subject.CommonName != "app.example.com" {
+		t.Fatalf("bare name not used as CN: %q", csr.Subject.CommonName)
+	}
+	if len(csr.Subject.Organization) != 0 {
+		t.Fatalf("unexpected organization for a bare common name: %v", csr.Subject.Organization)
+	}
+}
+
+func TestBuildIssuanceCSRUnsupportedAttribute(t *testing.T) {
+	if _, _, err := BuildIssuanceCSR(CertRequest{SubjectName: "CN=app,XX=nope"}); err == nil {
+		t.Fatalf("expected an error for an unsupported subject attribute")
+	}
+}
+
 func TestThumbprint(t *testing.T) {
 	cert, _ := makeCert(t, time.Now(), time.Now().Add(time.Hour))
 	tp := Thumbprint(cert)
