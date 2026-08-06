@@ -246,3 +246,162 @@ func TestThumbprint(t *testing.T) {
 		t.Fatalf("expected 40 hex chars, got %d (%q)", len(tp), tp)
 	}
 }
+
+// makeLeafCert builds a self-signed certificate from a template so tests can
+// control the subject, SANs, and key usages that LeafMatchesSpec inspects.
+func makeLeafCert(t *testing.T, tmpl *x509.Certificate) *x509.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tmpl.SerialNumber == nil {
+		tmpl.SerialNumber = big.NewInt(1)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
+}
+
+func TestLeafMatchesSpecMatches(t *testing.T) {
+	uri, _ := url.Parse("spiffe://cluster/app")
+	cert := makeLeafCert(t, &x509.Certificate{
+		Subject:        pkix.Name{CommonName: "app", Organization: []string{"Keytos"}, Country: []string{"US"}},
+		DNSNames:       []string{"app.example.com", "alt.example.com"},
+		EmailAddresses: []string{"admin@example.com"},
+		IPAddresses:    []net.IP{net.ParseIP("10.0.0.1")},
+		URIs:           []*url.URL{uri},
+		KeyUsage:       x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	})
+	req := CertRequest{
+		// Type casing and spacing differ from the encoded subject; the
+		// symmetric canonicalization must absorb it.
+		SubjectName:     "cn=app,  o=Keytos , c=US",
+		DNSNames:        []string{"alt.example.com", "app.example.com"}, // reordered
+		EmailAddresses:  []string{"admin@example.com"},
+		IPAddresses:     []net.IP{net.ParseIP("10.0.0.1")},
+		URIs:            []*url.URL{uri},
+		KeyUsage:        x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsageOIDs: []string{"1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.1"}, // reordered
+	}
+	if !LeafMatchesSpec(cert, req) {
+		t.Fatalf("expected match despite cosmetic ordering/spacing differences")
+	}
+}
+
+func TestLeafMatchesSpecBareCommonName(t *testing.T) {
+	cert := makeLeafCert(t, &x509.Certificate{Subject: pkix.Name{CommonName: "app.example.com"}})
+	// A request subject with no "=" is treated as a bare common name.
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "app.example.com"}) {
+		t.Fatalf("expected bare common name to match")
+	}
+}
+
+func TestLeafMatchesSpecDetectsDrift(t *testing.T) {
+	base := &x509.Certificate{
+		Subject:        pkix.Name{CommonName: "app"},
+		DNSNames:       []string{"app.example.com"},
+		EmailAddresses: []string{"admin@example.com"},
+		IPAddresses:    []net.IP{net.ParseIP("10.0.0.1")},
+		KeyUsage:       x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	cert := makeLeafCert(t, base)
+
+	cases := []struct {
+		name string
+		req  CertRequest
+	}{
+		{"subject", CertRequest{SubjectName: "other"}},
+		{"dns", CertRequest{SubjectName: "app", DNSNames: []string{"other.example.com"}}},
+		{"email", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"nope@example.com"}}},
+		{"ip", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.2")}}},
+		{"keyusage", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, KeyUsage: x509.KeyUsageCertSign}},
+		{"eku", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, ExtKeyUsageOIDs: []string{"1.3.6.1.5.5.7.3.2"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if LeafMatchesSpec(cert, tc.req) {
+				t.Fatalf("expected %s drift to be detected", tc.name)
+			}
+		})
+	}
+}
+
+func TestLeafMatchesSpecIgnoresUnsetUsages(t *testing.T) {
+	cert := makeLeafCert(t, &x509.Certificate{
+		Subject:     pkix.Name{CommonName: "app"},
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	// KeyUsage 0 and empty ExtKeyUsageOIDs mean "issuer chose", so a differing
+	// certificate must still match.
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "app"}) {
+		t.Fatalf("unset key usages should not be compared")
+	}
+}
+
+func TestParseIPAddresses(t *testing.T) {
+	ips, err := ParseIPAddresses([]string{"10.0.0.1", "2001:db8::1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ips) != 2 {
+		t.Fatalf("expected 2 IPs, got %d", len(ips))
+	}
+	if got, err := ParseIPAddresses(nil); err != nil || got != nil {
+		t.Fatalf("empty input: got %v, %v", got, err)
+	}
+	if _, err := ParseIPAddresses([]string{"not-an-ip"}); err == nil {
+		t.Fatalf("expected error for malformed IP")
+	}
+}
+
+func TestParseURIs(t *testing.T) {
+	uris, err := ParseURIs([]string{"spiffe://cluster/app", "https://example.com/x"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(uris) != 2 || uris[0].Scheme != "spiffe" {
+		t.Fatalf("unexpected parse result: %v", uris)
+	}
+	if got, err := ParseURIs(nil); err != nil || got != nil {
+		t.Fatalf("empty input: got %v, %v", got, err)
+	}
+	if _, err := ParseURIs([]string{"://bad"}); err == nil {
+		t.Fatalf("expected error for malformed URI")
+	}
+}
+
+func TestSubjectFromNameMultiValuedRDN(t *testing.T) {
+	// A "+"-joined RDN and a DC domain component exercise the escaped-separator
+	// split and the ExtraNames path.
+	csrDER, _, err := BuildIssuanceCSR(CertRequest{SubjectName: "CN=app+OU=team,DC=example"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	csr, err := x509.ParseCertificateRequest(csrDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if csr.Subject.CommonName != "app" {
+		t.Fatalf("CN: %q", csr.Subject.CommonName)
+	}
+	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != "team" {
+		t.Fatalf("multi-valued RDN not parsed: %v", csr.Subject.OrganizationalUnit)
+	}
+}
+
+func TestSubjectFromNameMissingValue(t *testing.T) {
+	// An RDN with no "=" after splitting is malformed.
+	if _, _, err := BuildIssuanceCSR(CertRequest{SubjectName: "CN=app,justtext"}); err == nil {
+		t.Fatalf("expected error for RDN without an assignment")
+	}
+}

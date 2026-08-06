@@ -68,3 +68,21 @@ func TestSignRS256(t *testing.T) {
 		t.Fatalf("signature verify failed: %v", err)
 	}
 }
+
+func TestSignRS256MarshalErrors(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A channel value cannot be JSON-marshalled, so both the header and the
+	// claims marshal paths must surface the error rather than sign garbage.
+	bad := map[string]any{"x": make(chan int)}
+	ok := map[string]any{"alg": "RS256"}
+
+	if _, err := SignRS256(bad, ok, key); err == nil {
+		t.Fatalf("expected error for unmarshalable header")
+	}
+	if _, err := SignRS256(ok, bad, key); err == nil {
+		t.Fatalf("expected error for unmarshalable claims")
+	}
+}

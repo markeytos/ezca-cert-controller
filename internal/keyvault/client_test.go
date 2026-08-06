@@ -98,6 +98,67 @@ func TestCertificateMatches(t *testing.T) {
 			t.Fatalf("expected (false,nil) for missing cert, got ok=%v err=%v", ok, err)
 		}
 	})
+
+	t.Run("other error propagates", func(t *testing.T) {
+		// A non-404 error (e.g. forbidden) must surface, not be swallowed.
+		c := &Client{certs: &fakeCertOps{getErr: &azcore.ResponseError{StatusCode: http.StatusForbidden}}}
+		ok, err := c.CertificateMatches(context.Background(), "cert", thumb)
+		if err == nil || ok {
+			t.Fatalf("expected the error to propagate, got ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("empty cert body", func(t *testing.T) {
+		// A certificate object with no CER content is treated as no match.
+		c := &Client{certs: &fakeCertOps{getCER: nil}}
+		ok, err := c.CertificateMatches(context.Background(), "cert", thumb)
+		if err != nil || ok {
+			t.Fatalf("expected (false,nil) for empty CER, got ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+func TestNewClient(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(testCertDERWithKey(t, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("unknown cloud", func(t *testing.T) {
+		if _, err := NewClient("vault", "tenant", "app", Cloud("Mars"), cert, key); err == nil {
+			t.Fatalf("expected error for unknown cloud")
+		}
+	})
+
+	for _, cl := range []Cloud{CloudPublic, CloudUSGov} {
+		t.Run(string(cl), func(t *testing.T) {
+			// Credential and client construction are offline, so this must
+			// succeed without contacting Azure.
+			c, err := NewClient("vault", "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000", cl, cert, key)
+			if err != nil {
+				t.Fatalf("NewClient(%s): %v", cl, err)
+			}
+			if c == nil || c.certs == nil {
+				t.Fatalf("NewClient(%s) returned an incomplete client", cl)
+			}
+		})
+	}
+}
+
+// testCertDERWithKey builds a self-signed certificate DER for the given key, so
+// the certificate and key form a matching pair for credential construction.
+func testCertDERWithKey(t *testing.T, key *rsa.PrivateKey) []byte {
+	t.Helper()
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "kv"}, NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
 }
 
 func TestImportCertificate(t *testing.T) {
