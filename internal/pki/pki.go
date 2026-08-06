@@ -403,10 +403,12 @@ func subjectFromName(subjectName string) (pkix.Name, error) {
 }
 
 // canonicalDN normalizes a distinguished name string into a comparable form:
-// attribute types upper-cased, whitespace trimmed, and multi-valued RDN parts
-// sorted. It is intentionally lightweight and is applied symmetrically to both
-// compared DNs, so equal DNs written with minor formatting differences normalize
-// identically.
+// attribute types upper-cased, whitespace trimmed, multi-valued RDN parts
+// sorted, and the relative distinguished names themselves sorted so their order
+// does not matter (for example "O=corp,OU=team" compares equal to
+// "OU=team,O=corp"). It is intentionally lightweight and is applied
+// symmetrically to both compared DNs, so equal DNs written with minor
+// formatting or ordering differences normalize identically.
 func canonicalDN(dn string) string {
 	rdns := splitUnescaped(dn, ',')
 	for i, rdn := range rdns {
@@ -421,6 +423,7 @@ func canonicalDN(dn string) string {
 		slices.Sort(parts)
 		rdns[i] = strings.Join(parts, "+")
 	}
+	slices.Sort(rdns)
 	return strings.Join(rdns, ",")
 }
 

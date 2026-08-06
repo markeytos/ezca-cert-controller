@@ -145,6 +145,16 @@ func TestAddKey(t *testing.T) {
 	if claims["iss"] != "app-guid" {
 		t.Fatalf("proof iss = %v", claims["iss"])
 	}
+	// nbf is backdated for clock-skew leeway, so the window spans the full
+	// leeway (5m) plus the token lifetime (10m) = 15m regardless of wall clock.
+	nbf, okNbf := claims["nbf"].(float64)
+	exp, okExp := claims["exp"].(float64)
+	if !okNbf || !okExp {
+		t.Fatalf("proof nbf/exp missing or not numeric: %v", claims)
+	}
+	if exp-nbf != float64(15*60) {
+		t.Fatalf("proof window exp-nbf = %v seconds, want 900", exp-nbf)
+	}
 }
 
 func TestRemoveKey(t *testing.T) {

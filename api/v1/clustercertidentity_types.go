@@ -171,6 +171,18 @@ type ClusterCertIdentitySpec struct {
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	CertSecretNamespace string `json:"certSecretNamespace,omitempty"`
+
+	// allowedNamespaces is the set of namespaces whose ManagedCredentials may
+	// reference this ClusterCertIdentity (via spec.identityRef) to bootstrap
+	// their certificate. Because a ClusterCertIdentity is cluster-scoped, a
+	// reference lets the referencing ManagedCredential issue certificates as
+	// this identity's Entra app; this allowlist bounds which namespaces may do
+	// so. It is required and must be non-empty: a ClusterCertIdentity that lists
+	// no namespaces can be referenced by no one.
+	// +required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:MinLength=1
+	AllowedNamespaces []string `json:"allowedNamespaces"`
 }
 
 // KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with

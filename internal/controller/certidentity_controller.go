@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -78,15 +79,26 @@ func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	tel := telemetry.New(ci.Spec.AppInsightsConnString)
 	defer tel.Flush(10 * time.Second)
 
+	originalStatus := ci.Status.DeepCopy()
 	result, reconcileErr := r.reconcile(ctx, &ci, tel)
 
-	if err := r.Status().Update(ctx, &ci); err != nil {
-		log.Error(err, "Failed to update CertIdentity status")
-		if reconcileErr == nil {
-			reconcileErr = err
+	// Only write status when it actually changed, so a steady-state reconcile
+	// does not trigger itself through the CertIdentity watch.
+	if !equality.Semantic.DeepEqual(originalStatus, &ci.Status) {
+		if err := r.Status().Update(ctx, &ci); err != nil {
+			log.Error(err, "Failed to update CertIdentity status")
+			if reconcileErr == nil {
+				reconcileErr = err
+			}
 		}
 	}
-	return result, reconcileErr
+	// Never return both a non-zero result and a non-nil error: controller-runtime
+	// ignores the result when the error is non-nil (requeuing with backoff) and
+	// warns when both are set.
+	if reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
+	}
+	return result, nil
 }
 
 // reconcile loads the certificate Secret, runs the certificate state machine,

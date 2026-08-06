@@ -196,6 +196,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 					AppObjectID:      &obj,
 				},
 				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
 			},
 		}
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
@@ -600,5 +601,62 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-appboot-sec"}, &secret)).To(Succeed())
 		Expect(secret.Data).To(HaveKey("tls.crt"))
 		Expect(secret.Data).NotTo(HaveKey("tls.crt.pending"))
+	})
+
+	It("refuses to bootstrap from a ClusterCertIdentity that does not allow its namespace", func() {
+		// The parent allows only some other namespace, not the credential's.
+		certPEM, keyPEM, _ := genCert("parent.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
+		createSecret("mcp-deny-sec", certPEM, keyPEM)
+		ezcaURL := testEZCAURL
+		tnt, app, obj := parentTntID, parentAppID, "parent-obj"
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "mcp-deny"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "mcp-deny-sec",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tnt,
+					AppID:            &app,
+					AppObjectID:      &obj,
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{"some-other-namespace"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+
+		_, _, issued := genCertSANs("deny.ezca.io", []string{"deny.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+
+		mc := newManagedCredential("mc-deny", "mc-deny-sec", "mcp-deny", "CN=deny.ezca.io", []string{"deny.ezca.io"})
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-deny")
+
+		// Nothing is issued; the credential is Degraded because the referenced
+		// ClusterCertIdentity does not allow this namespace to reference it.
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-deny"}, mc)).To(Succeed())
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("IssuanceCredentialUnavailable"))
+		// No Secret was written on the credential's behalf.
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-deny-sec"}, &secret)).ShouldNot(Succeed())
+	})
+
+	It("maps a Secret change only to ManagedCredentials in the same namespace", func() {
+		mc := newManagedCredential("mc-map", "mc-shared-sec", "", "CN=map.ezca.io", []string{"map.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		want := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mc-map"}}
+
+		same := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "mc-shared-sec"}})
+		Expect(same).To(ContainElement(want))
+
+		other := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "mc-other-ns", Name: "mc-shared-sec"}})
+		Expect(other).NotTo(ContainElement(want))
 	})
 })

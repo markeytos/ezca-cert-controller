@@ -170,6 +170,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					RenewalThreshold: 20,
 				},
 				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
 			},
 		}
 		if withApp {
@@ -347,6 +348,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
 				},
 				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
 			},
 		}
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
@@ -389,6 +391,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
 				},
 				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
 			},
 		}
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
@@ -413,5 +416,65 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+	})
+
+	It("does not rewrite status on a steady-state reconcile", func() {
+		certPEM, keyPEM, _ := genCert("noop.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("noop-secret", certPEM, keyPEM)
+		cci := createIdentity("noop", "noop-secret", false)
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		rv := cci.ResourceVersion
+
+		// A second reconcile of an unchanged, healthy certificate must not write
+		// status again — otherwise it would re-trigger itself through its own watch.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(cci.ResourceVersion).To(Equal(rv), "steady-state reconcile must not bump the object")
+	})
+
+	It("does not re-charge the Key Vault propagation grace after a promotion", func() {
+		// A cert whose NotBefore is well in the past has already propagated, even
+		// if it was only just promoted (recent LastRenewalTime). The grace is keyed
+		// off NotBefore, so Key Vault sync must proceed rather than defer.
+		certPEM, keyPEM, _ := genCert("kv3.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("kv3-secret", certPEM, keyPEM)
+
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv3-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv3-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+
+		// Simulate a just-promoted certificate: LastRenewalTime is now.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		cci.Status.LastRenewalTime = &metav1.Time{Time: now}
+		Expect(k8sClient.Status().Update(ctx, cci)).To(Succeed())
+
+		kvClient.matches = false
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.imported).To(HaveLen(1), "must sync to Key Vault immediately, not defer on a recent LastRenewalTime")
 	})
 })

@@ -53,6 +53,11 @@ const graphProofAudience = "00000002-0000-0000-c000-000000000000"
 
 const KeyNotFoundOnAppErrorCode = "AADSTS700027"
 
+// proofClockSkewLeeway backdates the proof-of-possession token's nbf so a
+// controller clock running slightly ahead of Entra ID does not produce a token
+// that is briefly rejected as not-yet-valid.
+const proofClockSkewLeeway = 5 * time.Minute
+
 const (
 	graphEndpointPublic     = "https://graph.microsoft.com"
 	graphEndpointGovernment = "https://graph.microsoft.us"
@@ -212,7 +217,7 @@ func (c *Client) newProof() (string, error) {
 	claims := map[string]any{
 		"aud": graphProofAudience,
 		"iss": c.appID,
-		"nbf": now.Unix(),
+		"nbf": now.Add(-proofClockSkewLeeway).Unix(),
 		"exp": now.Add(10 * time.Minute).Unix(),
 	}
 	return jwt.SignRS256(header, claims, c.key)

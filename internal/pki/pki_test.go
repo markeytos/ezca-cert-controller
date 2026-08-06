@@ -335,6 +335,19 @@ func TestLeafMatchesSpecDetectsDrift(t *testing.T) {
 	}
 }
 
+func TestLeafMatchesSpecIgnoresRDNOrder(t *testing.T) {
+	cert := makeLeafCert(t, &x509.Certificate{
+		Subject: pkix.Name{CommonName: "app", Organization: []string{"corp"}, OrganizationalUnit: []string{"team"}},
+	})
+	// The request lists the same RDNs in a different order; order must not matter.
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "O=corp,OU=team,CN=app"}) {
+		t.Fatalf("expected match regardless of RDN order")
+	}
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "OU=team,CN=app,O=corp"}) {
+		t.Fatalf("expected match regardless of RDN order")
+	}
+}
+
 func TestLeafMatchesSpecIgnoresUnsetUsages(t *testing.T) {
 	cert := makeLeafCert(t, &x509.Certificate{
 		Subject:     pkix.Name{CommonName: "app"},

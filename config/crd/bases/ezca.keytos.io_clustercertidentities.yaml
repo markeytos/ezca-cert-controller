@@ -55,6 +55,20 @@ spec:
           spec:
             description: spec defines the desired state of ClusterCertIdentity
             properties:
+              allowedNamespaces:
+                description: |-
+                  allowedNamespaces is the set of namespaces whose ManagedCredentials may
+                  reference this ClusterCertIdentity (via spec.identityRef) to bootstrap
+                  their certificate. Because a ClusterCertIdentity is cluster-scoped, a
+                  reference lets the referencing ManagedCredential issue certificates as
+                  this identity's Entra app; this allowlist bounds which namespaces may do
+                  so. It is required and must be non-empty: a ClusterCertIdentity that lists
+                  no namespaces can be referenced by no one.
+                items:
+                  minLength: 1
+                  type: string
+                minItems: 1
+                type: array
               appID:
                 description: |-
                   appID is the Entra ID (Azure AD) application (client) ID whose
@@ -147,6 +161,7 @@ spec:
                 minLength: 1
                 type: string
             required:
+            - allowedNamespaces
             - certSecretName
             - ezcaURL
             - renewalThreshold

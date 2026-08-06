@@ -27,13 +27,17 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	ezca "github.com/markeytos/ezca-go"
 
@@ -109,16 +113,26 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	tel := telemetry.New(mc.Spec.AppInsightsConnString)
 	defer tel.Flush(10 * time.Second)
 
+	originalStatus := mc.Status.DeepCopy()
 	result, reconcileErr := r.reconcile(ctx, &mc, tel)
-	// todo: fail here if reconcileErr is not nil?
 
-	if err := r.Status().Update(ctx, &mc); err != nil {
-		log.Error(err, "Failed to update ManagedCredential status")
-		if reconcileErr == nil {
-			reconcileErr = err
+	// Only write status when it actually changed, so a steady-state reconcile
+	// does not trigger itself through the ManagedCredential watch.
+	if !equality.Semantic.DeepEqual(originalStatus, &mc.Status) {
+		if err := r.Status().Update(ctx, &mc); err != nil {
+			log.Error(err, "Failed to update ManagedCredential status")
+			if reconcileErr == nil {
+				reconcileErr = err
+			}
 		}
 	}
-	return result, reconcileErr
+	// Never return both a non-zero result and a non-nil error: controller-runtime
+	// ignores the result when the error is non-nil (requeuing with backoff) and
+	// warns when both are set.
+	if reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
+	}
+	return result, nil
 }
 
 // reconcile bootstraps or re-issues the certificate as needed, then runs the
@@ -430,6 +444,12 @@ func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc
 		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name}, &cci); err != nil {
 			return nil, nil, nil, fmt.Errorf("getting referenced ClusterCertIdentity %q: %w", ref.Name, err)
 		}
+		// A ClusterCertIdentity is cluster-scoped, so a reference lets this
+		// ManagedCredential issue certificates as the identity's Entra app.
+		// Only namespaces the identity explicitly allows may do so.
+		if !namespaceAllowed(mc.Namespace, cci.Spec.AllowedNamespaces) {
+			return nil, nil, nil, fmt.Errorf("ClusterCertIdentity %q does not allow namespace %q to reference it (spec.allowedNamespaces)", ref.Name, mc.Namespace)
+		}
 		base = &cci.Spec.CertIdentitySpecBase
 		secretNS = cci.Spec.CertSecretNamespace
 		if secretNS == "" {
@@ -461,6 +481,16 @@ func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc
 		return nil, nil, nil, fmt.Errorf("parsing referenced identity's certificate: %w", err)
 	}
 	return chain[0], key, base, nil
+}
+
+// namespaceAllowed reports whether ns is in the allowlist.
+func namespaceAllowed(ns string, allowed []string) bool {
+	for _, a := range allowed {
+		if a == ns {
+			return true
+		}
+	}
+	return false
 }
 
 // leafRegisteredInEntra reports whether the given certificate has been recorded
@@ -631,7 +661,31 @@ func (r *ManagedCredentialReconciler) newTokenCredential(tenantID, appID string,
 func (r *ManagedCredentialReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ezcav1.ManagedCredential{}).
-		Owns(&corev1.Secret{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("managedcredential").
 		Complete(r)
+}
+
+// secretToRequests maps a changed Secret to the ManagedCredentials in the same
+// namespace that reference it, so external edits to the certificate (including
+// an administrator provisioning the bootstrap Secret) trigger a reconcile. A
+// ManagedCredential's Secret always lives in the ManagedCredential's own
+// namespace.
+func (r *ManagedCredentialReconciler) secretToRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	var list ezcav1.ManagedCredentialList
+	if err := r.List(ctx, &list, client.InNamespace(secret.Namespace)); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		mc := &list.Items[i]
+		if mc.Spec.CertSecretName == secret.Name {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: mc.Namespace, Name: mc.Name}})
+		}
+	}
+	return reqs
 }

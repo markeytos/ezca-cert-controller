@@ -355,6 +355,16 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 		// Removed from the app: drop from status.
 	}
 	status.ManagedKeyCredentials = remaining
+
+	// When a key was just added, persist the tracking immediately. The caller
+	// still has to stage/promote the certificate and write the Secret; if any of
+	// that fails, this ensures the added credential is already recorded so it is
+	// cleaned up on expiry instead of being orphaned on the app registration.
+	if newLeaf != nil {
+		if err := d.kubeClient().Status().Update(ctx, obj); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -408,10 +418,13 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	log := logf.FromContext(ctx)
 	status := obj.StatusBase()
 
-	// A certificate that was just renewed/promoted may not yet be usable on
-	// every AAD token replica; give it the propagation grace before trying to
-	// authenticate to Key Vault with it.
-	if status.LastRenewalTime != nil && now.Sub(status.LastRenewalTime.Time) < propagationGrace {
+	// A freshly issued active certificate may not yet be usable on every AAD
+	// token replica; give it the propagation grace before authenticating to Key
+	// Vault with it. This is measured from the certificate's own NotBefore
+	// rather than the last renewal time, so a certificate promoted only after it
+	// already authenticated (and waited out the grace since being staged) is not
+	// charged the grace a second time — it syncs right away.
+	if status.NotBefore != nil && now.Sub(status.NotBefore.Time) < propagationGrace {
 		requeueAtMost(result, propagationRequeue)
 		return
 	}
