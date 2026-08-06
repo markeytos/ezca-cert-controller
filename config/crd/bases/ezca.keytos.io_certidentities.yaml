@@ -11,6 +11,8 @@ spec:
     kind: CertIdentity
     listKind: CertIdentityList
     plural: certidentities
+    shortNames:
+    - ci
     singular: certidentity
   scope: Namespaced
   versions:

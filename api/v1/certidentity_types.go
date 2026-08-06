@@ -44,6 +44,7 @@ type CertIdentityStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=ci
 
 // CertIdentity is the Schema for the certidentities API
 type CertIdentity struct {
