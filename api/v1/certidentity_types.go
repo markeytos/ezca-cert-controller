@@ -45,6 +45,10 @@ type CertIdentityStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ci
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
+// +kubebuilder:printcolumn:name="Expiration",type=string,JSONPath=".status.notAfter"
+// +kubebuilder:printcolumn:name="Thumbprint",type=string,JSONPath=".status.thumbprint"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // CertIdentity is the Schema for the certidentities API
 type CertIdentity struct {
@@ -64,11 +68,6 @@ type CertIdentity struct {
 }
 
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:shortName=ci
-// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
-// +kubebuilder:printcolumn:name="Expiration",type=string,JSONPath=".status.notAfter"
-// +kubebuilder:printcolumn:name="Thumbprint",type=string,JSONPath=".status.thumbprint"
-// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // CertIdentityList contains a list of CertIdentity
 type CertIdentityList struct {

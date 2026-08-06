@@ -16,7 +16,20 @@ spec:
     singular: certidentity
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Available')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.notAfter
+      name: Expiration
+      type: string
+    - jsonPath: .status.thumbprint
+      name: Thumbprint
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
     schema:
       openAPIV3Schema:
         description: CertIdentity is the Schema for the certidentities API
