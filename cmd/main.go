@@ -179,24 +179,30 @@ func main() {
 	}
 
 	if err := (&controller.ClusterCertIdentityReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
+		ReconcilerBase: controller.ReconcilerBase{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		},
 		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "clustercertidentity")
 		os.Exit(1)
 	}
 	if err := (&controller.ManagedCredentialReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
+		ReconcilerBase: controller.ReconcilerBase{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		},
 		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "managedcredential")
 		os.Exit(1)
 	}
 	if err := (&controller.CertIdentityReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		ReconcilerBase: controller.ReconcilerBase{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "certidentity")
 		os.Exit(1)

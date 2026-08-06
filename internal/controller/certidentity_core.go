@@ -99,9 +99,9 @@ type keyVaultManager interface {
 }
 
 // certIdentity is the shared behavior of the certificate-identity kinds
-// (ClusterCertIdentity and ManagedCredential). Exposing the embedded base spec
-// and status lets the renewal/rotation/Key Vault state machine operate on both
-// kinds uniformly.
+// (ClusterCertIdentity, CertIdentity, and ManagedCredential). Exposing the
+// embedded base spec and status lets the renewal/rotation/Key Vault state
+// machine operate on all kinds uniformly.
 type certIdentity interface {
 	client.Object
 	SpecBase() *ezcav1.CertIdentitySpecBase
@@ -109,8 +109,8 @@ type certIdentity interface {
 }
 
 // reconcilerDeps provides the shared state machine with the Kubernetes client,
-// a clock, and the (test-overridable) Azure/EZCA client factories. Both
-// reconcilers satisfy it.
+// a clock, and the (test-overridable) Azure/EZCA client factories. Every
+// reconciler satisfies it by embedding reconcilerBase.
 type reconcilerDeps interface {
 	kubeClient() client.Client
 	now() time.Time
@@ -122,7 +122,8 @@ type reconcilerDeps interface {
 // renewFallback lets a kind (ManagedCredential) recover from a renewal failure
 // by re-issuing a fresh certificate. reissueOnRenewFailure returns handled=true
 // when it took over, along with the result to return. Kinds that do not
-// implement it (ClusterCertIdentity) simply surface the renewal error.
+// implement it (ClusterCertIdentity and CertIdentity) simply surface the
+// renewal error.
 type renewFallback interface {
 	reissueOnRenewFailure(ctx context.Context, obj certIdentity, secret *corev1.Secret, current *x509.Certificate, key *rsa.PrivateKey, now time.Time, tel *telemetry.Telemetry, renewErr error) (bool, ctrl.Result, error)
 }

@@ -52,15 +52,17 @@ var _ = Describe("CertIdentity Controller", func() {
 
 	newReconciler := func() *CertIdentityReconciler {
 		return &CertIdentityReconciler{
-			Client:        k8sClient,
-			Scheme:        k8sClient.Scheme(),
-			Now:           func() time.Time { return clockNow },
-			NewEZCAClient: func(string) (ezcaRenewer, error) { return ezcaClient, nil },
-			NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
-				return entraClient, nil
-			},
-			NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-				return kvClient, nil
+			ReconcilerBase: ReconcilerBase{
+				Client:        k8sClient,
+				Scheme:        k8sClient.Scheme(),
+				Now:           func() time.Time { return clockNow },
+				NewEZCAClient: func(string) (ezcaRenewer, error) { return ezcaClient, nil },
+				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+					return entraClient, nil
+				},
+				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
+					return kvClient, nil
+				},
 			},
 		}
 	}

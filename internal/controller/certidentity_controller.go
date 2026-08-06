@@ -18,14 +18,11 @@ package controller
 
 import (
 	"context"
-	"crypto/rsa"
-	"crypto/x509"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,28 +32,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
-	"github.com/markeytos/ezca-cert-controller/internal/entra"
-	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
 	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
-	ezca "github.com/markeytos/ezca-go"
 )
 
 // CertIdentityReconciler reconciles a CertIdentity object
 type CertIdentityReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-
-	// Now, NewEZCAClient, NewEntraClient, and NewKeyVaultClient are injection
-	// points for tests. When nil, real implementations are used.
-	Now               func() time.Time
-	NewEZCAClient     func(ezcaURL string) (ezcaRenewer, error)
-	NewEntraClient    func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
-	NewKeyVaultClient func(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
+	ReconcilerBase
 }
 
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=certidentities,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=certidentities/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=certidentities/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
 func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -130,39 +117,6 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 		syncKeyVaultBestEffort(ctx, r, ci, &secret, now, tel, &result, coreErr)
 	}
 	return result, coreErr
-}
-
-// kubeClient returns the controller-runtime client (reconcilerDeps).
-func (r *CertIdentityReconciler) kubeClient() client.Client {
-	return r.Client
-}
-
-func (r *CertIdentityReconciler) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
-	}
-	return time.Now()
-}
-
-func (r *CertIdentityReconciler) newEZCAClient(ezcaURL string) (ezcaRenewer, error) {
-	if r.NewEZCAClient != nil {
-		return r.NewEZCAClient(ezcaURL)
-	}
-	return ezca.NewCertificateClient(ezcaURL)
-}
-
-func (r *CertIdentityReconciler) newEntraClient(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error) {
-	if r.NewEntraClient != nil {
-		return r.NewEntraClient(tenantID, appID, cl, cert, key)
-	}
-	return entra.NewClient(tenantID, appID, cl, cert, key)
-}
-
-func (r *CertIdentityReconciler) newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error) {
-	if r.NewKeyVaultClient != nil {
-		return r.NewKeyVaultClient(vaultName, tenantID, appID, cl, cert, key)
-	}
-	return keyvault.NewClient(vaultName, tenantID, appID, cl, cert, key)
 }
 
 // SetupWithManager sets up the controller with the Manager.

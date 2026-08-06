@@ -143,23 +143,25 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 	newReconciler := func() *ManagedCredentialReconciler {
 		return &ManagedCredentialReconciler{
-			Client:           k8sClient,
-			Scheme:           k8sClient.Scheme(),
+			ReconcilerBase: ReconcilerBase{
+				Client:        k8sClient,
+				Scheme:        k8sClient.Scheme(),
+				Now:           func() time.Time { return clockNow },
+				NewEZCAClient: func(string) (ezcaRenewer, error) { return ezcaClient, nil },
+				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+					return entraClient, nil
+				},
+				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
+					return kvClient, nil
+				},
+			},
 			DefaultNamespace: namespace,
-			Now:              func() time.Time { return clockNow },
-			NewEZCAClient:    func(string) (ezcaRenewer, error) { return ezcaClient, nil },
 			NewEZCAIssuer: func(_ context.Context, _ string, _ azcore.TokenCredential, _, _ uuid.UUID) (ezcaIssuer, error) {
 				return issuerClient, nil
 			},
 			NewTokenCredential: func(tenantID, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (azcore.TokenCredential, error) {
 				credTenant = tenantID
 				return nil, nil
-			},
-			NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
-				return entraClient, nil
-			},
-			NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-				return kvClient, nil
 			},
 		}
 	}

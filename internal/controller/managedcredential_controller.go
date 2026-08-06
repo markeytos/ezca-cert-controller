@@ -30,10 +30,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -41,7 +39,6 @@ import (
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
 	"github.com/markeytos/ezca-cert-controller/internal/entra"
-	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
 )
@@ -55,21 +52,17 @@ type ezcaIssuer interface {
 
 // ManagedCredentialReconciler reconciles a ManagedCredential object
 type ManagedCredentialReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
+	ReconcilerBase
 
 	// DefaultNamespace is the namespace used to resolve the referenced
 	// identity's Secret when its spec does not set one (the namespace the
 	// controller runs in).
 	DefaultNamespace string
 
-	// Injection points for tests. When nil, real implementations are used.
-	Now                func() time.Time
-	NewEZCAClient      func(ezcaURL string) (ezcaRenewer, error)
+	// Injection points for issuing brand-new certificates (beyond the shared
+	// factories in ReconcilerBase). When nil, real implementations are used.
 	NewEZCAIssuer      func(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, caID, templateID uuid.UUID) (ezcaIssuer, error)
 	NewTokenCredential func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (azcore.TokenCredential, error)
-	NewEntraClient     func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
-	NewKeyVaultClient  func(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
 }
 
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities,verbs=get;list;watch
@@ -584,25 +577,6 @@ func signOptions(mc *ezcav1.ManagedCredential, req pki.CertRequest) (*ezca.SignO
 	return opts, nil
 }
 
-// kubeClient returns the controller-runtime client (reconcilerDeps).
-func (r *ManagedCredentialReconciler) kubeClient() client.Client {
-	return r.Client
-}
-
-func (r *ManagedCredentialReconciler) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
-	}
-	return time.Now()
-}
-
-func (r *ManagedCredentialReconciler) newEZCAClient(ezcaURL string) (ezcaRenewer, error) {
-	if r.NewEZCAClient != nil {
-		return r.NewEZCAClient(ezcaURL)
-	}
-	return ezca.NewCertificateClient(ezcaURL)
-}
-
 func (r *ManagedCredentialReconciler) newEZCAIssuer(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, caID, templateID uuid.UUID) (ezcaIssuer, error) {
 	if r.NewEZCAIssuer != nil {
 		return r.NewEZCAIssuer(ctx, ezcaURL, cred, caID, templateID)
@@ -619,20 +593,6 @@ func (r *ManagedCredentialReconciler) newTokenCredential(tenantID, appID string,
 		return r.NewTokenCredential(tenantID, appID, cl, cert, key)
 	}
 	return entra.NewTokenCredential(tenantID, appID, cl, cert, key)
-}
-
-func (r *ManagedCredentialReconciler) newEntraClient(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error) {
-	if r.NewEntraClient != nil {
-		return r.NewEntraClient(tenantID, appID, cl, cert, key)
-	}
-	return entra.NewClient(tenantID, appID, cl, cert, key)
-}
-
-func (r *ManagedCredentialReconciler) newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error) {
-	if r.NewKeyVaultClient != nil {
-		return r.NewKeyVaultClient(vaultName, tenantID, appID, cl, cert, key)
-	}
-	return keyvault.NewClient(vaultName, tenantID, appID, cl, cert, key)
 }
 
 // SetupWithManager sets up the controller with the Manager.
