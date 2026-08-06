@@ -42,7 +42,7 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
 )
 
-const clusterCertIdentityFinalizer = "ezca.keytos.io/finalizer"
+const ezcaGroupFinalizer = "ezca.keytos.io/finalizer"
 
 // ClusterCertIdentityReconciler reconciles a ClusterCertIdentity object
 type ClusterCertIdentityReconciler struct {
@@ -84,7 +84,7 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 	// Handle deletion: release the finalizer, leaving any managed app
 	// certificates in place (they expire on their own).
 	if !cci.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(&cci, clusterCertIdentityFinalizer) {
+		if controllerutil.RemoveFinalizer(&cci, ezcaGroupFinalizer) {
 			if err := r.Update(ctx, &cci); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -92,7 +92,7 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, nil
 	}
 
-	if controllerutil.AddFinalizer(&cci, clusterCertIdentityFinalizer) {
+	if controllerutil.AddFinalizer(&cci, ezcaGroupFinalizer) {
 		if err := r.Update(ctx, &cci); err != nil {
 			return ctrl.Result{}, err
 		}

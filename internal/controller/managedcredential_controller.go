@@ -74,6 +74,8 @@ type ManagedCredentialReconciler struct {
 
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities/status,verbs=get
+// +kubebuilder:rbac:groups=ezca.keytos.io,resources=certidentities,verbs=get;list;watch
+// +kubebuilder:rbac:groups=ezca.keytos.io,resources=certidentities/status,verbs=get
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=managedcredentials,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=managedcredentials/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=managedcredentials/finalizers,verbs=update
@@ -97,7 +99,7 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Handle deletion: release the finalizer, leaving any managed app
 	// certificates in place (they expire on their own).
 	if !mc.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(&mc, clusterCertIdentityFinalizer) {
+		if controllerutil.RemoveFinalizer(&mc, ezcaGroupFinalizer) {
 			if err := r.Update(ctx, &mc); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -105,7 +107,7 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
-	if controllerutil.AddFinalizer(&mc, clusterCertIdentityFinalizer) {
+	if controllerutil.AddFinalizer(&mc, ezcaGroupFinalizer) {
 		if err := r.Update(ctx, &mc); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -115,6 +117,7 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	defer tel.Flush(10 * time.Second)
 
 	result, reconcileErr := r.reconcile(ctx, &mc, tel)
+	// todo: fail here if reconcileErr is not nil?
 
 	if err := r.Status().Update(ctx, &mc); err != nil {
 		log.Error(err, "Failed to update ManagedCredential status")
@@ -379,48 +382,64 @@ func (r *ManagedCredentialReconciler) issuanceCredential(ctx context.Context, mc
 // that authenticates as the referenced master identity's app using its
 // certificate.
 func (r *ManagedCredentialReconciler) identityRefCredential(ctx context.Context, mc *ezcav1.ManagedCredential) (azcore.TokenCredential, error) {
-	cert, key, cci, err := r.identityRefCertKey(ctx, mc)
+	cert, key, base, err := r.identityRefCertKey(ctx, mc)
 	if err != nil {
 		return nil, err
 	}
-	return r.newTokenCredential(*cci.Spec.TenantID, *cci.Spec.AppID, cloudFor(cci.Spec.Cloud), cert, key)
+	return r.newTokenCredential(*base.TenantID, *base.AppID, cloudFor(base.Cloud), cert, key)
 }
 
-// identityRefCertKey resolves the referenced master identity's certificate and
-// key, along with the identity itself, from its bootstrapped Secret.
-func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc *ezcav1.ManagedCredential) (*x509.Certificate, *rsa.PrivateKey, *ezcav1.ClusterCertIdentity, error) {
+// identityRefCertKey resolves the referenced identity's certificate, key, and
+// shared spec from its bootstrapped Secret. A ClusterCertIdentity is
+// cluster-scoped and its Secret may live in any namespace; a CertIdentity is
+// namespaced, so it is only ever resolved in the credential's own namespace and
+// its Secret is read there too — the credential can never reach across
+// namespaces to it.
+func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc *ezcav1.ManagedCredential) (*x509.Certificate, *rsa.PrivateKey, *ezcav1.CertIdentitySpecBase, error) {
 	ref := mc.Spec.IdentityRef
 	if ref.Name == "" {
 		return nil, nil, nil, errors.New("spec.identityRef is required to bootstrap the certificate")
 	}
-	if ref.Kind != ezcav1.IdentityKindClusterCertIdentity {
-		return nil, nil, nil, fmt.Errorf("unsupported identityRef kind %q (only ClusterCertIdentity is supported)", ref.Kind)
+
+	var base *ezcav1.CertIdentitySpecBase
+	var secretNS string
+	switch ref.Kind {
+	case ezcav1.IdentityKindClusterCertIdentity:
+		var cci ezcav1.ClusterCertIdentity
+		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name}, &cci); err != nil {
+			return nil, nil, nil, fmt.Errorf("getting referenced ClusterCertIdentity %q: %w", ref.Name, err)
+		}
+		base = &cci.Spec.CertIdentitySpecBase
+		secretNS = cci.Spec.CertSecretNamespace
+		if secretNS == "" {
+			secretNS = r.DefaultNamespace
+		}
+	case ezcav1.IdentityKindCertIdentity:
+		var ci ezcav1.CertIdentity
+		if err := r.Get(ctx, types.NamespacedName{Namespace: mc.Namespace, Name: ref.Name}, &ci); err != nil {
+			return nil, nil, nil, fmt.Errorf("getting referenced CertIdentity %q: %w", ref.Name, err)
+		}
+		base = &ci.Spec.CertIdentitySpecBase
+		secretNS = mc.Namespace
+	default:
+		return nil, nil, nil, fmt.Errorf("unsupported identityRef kind %q", ref.Kind)
 	}
 
-	var cci ezcav1.ClusterCertIdentity
-	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name}, &cci); err != nil {
-		return nil, nil, nil, fmt.Errorf("getting referenced ClusterCertIdentity %q: %w", ref.Name, err)
+	if base.TenantID == nil || base.AppID == nil || base.AppObjectID == nil {
+		return nil, nil, nil, fmt.Errorf("referenced identity %q has no Entra app to authenticate as", ref.Name)
 	}
-	if !appConfigured(&cci) {
-		return nil, nil, nil, fmt.Errorf("referenced ClusterCertIdentity %q has no Entra app to authenticate as", ref.Name)
-	}
-
-	ns := cci.Spec.CertSecretNamespace
-	if ns == "" {
-		ns = r.DefaultNamespace
-	}
-	if ns == "" {
+	if secretNS == "" {
 		return nil, nil, nil, errors.New("could not resolve the referenced identity's Secret namespace")
 	}
 	var s corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: cci.Spec.CertSecretName}, &s); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: secretNS, Name: base.CertSecretName}, &s); err != nil {
 		return nil, nil, nil, fmt.Errorf("getting referenced identity's Secret: %w", err)
 	}
 	chain, key, err := parseSecret(&s)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("parsing referenced identity's certificate: %w", err)
 	}
-	return chain[0], key, &cci, nil
+	return chain[0], key, base, nil
 }
 
 // leafRegisteredInEntra reports whether the given certificate has been recorded

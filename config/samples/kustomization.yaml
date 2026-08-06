@@ -2,4 +2,5 @@
 resources:
 - ezca_v1_clustercertidentity.yaml
 - ezca_v1_managedcredential.yaml
+- ezca_v1_certidentity.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

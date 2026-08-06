@@ -18,6 +18,7 @@ rules:
 - apiGroups:
   - ezca.keytos.io
   resources:
+  - certidentities
   - clustercertidentities
   - managedcredentials
   verbs:
@@ -31,6 +32,7 @@ rules:
 - apiGroups:
   - ezca.keytos.io
   resources:
+  - certidentities/finalizers
   - clustercertidentities/finalizers
   - managedcredentials/finalizers
   verbs:
@@ -38,6 +40,7 @@ rules:
 - apiGroups:
   - ezca.keytos.io
   resources:
+  - certidentities/status
   - clustercertidentities/status
   - managedcredentials/status
   verbs:

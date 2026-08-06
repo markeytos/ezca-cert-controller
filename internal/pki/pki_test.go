@@ -187,10 +187,12 @@ func TestBuildRenewalCSRPreservesIdentity(t *testing.T) {
 	}
 }
 
+const testDNSName = "app.example.com"
+
 func TestBuildIssuanceCSRPreservesFullDN(t *testing.T) {
 	req := CertRequest{
 		SubjectName: "CN=app,OU=team,O=Keytos,C=US",
-		DNSNames:    []string{"app.example.com"},
+		DNSNames:    []string{testDNSName},
 	}
 	csrDER, _, err := BuildIssuanceCSR(req)
 	if err != nil {
@@ -215,7 +217,7 @@ func TestBuildIssuanceCSRPreservesFullDN(t *testing.T) {
 }
 
 func TestBuildIssuanceCSRBareCommonName(t *testing.T) {
-	csrDER, _, err := BuildIssuanceCSR(CertRequest{SubjectName: "app.example.com"})
+	csrDER, _, err := BuildIssuanceCSR(CertRequest{SubjectName: testDNSName})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,7 @@ func TestBuildIssuanceCSRBareCommonName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if csr.Subject.CommonName != "app.example.com" {
+	if csr.Subject.CommonName != testDNSName {
 		t.Fatalf("bare name not used as CN: %q", csr.Subject.CommonName)
 	}
 	if len(csr.Subject.Organization) != 0 {

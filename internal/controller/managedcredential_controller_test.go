@@ -199,6 +199,30 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
 	}
 
+	// createParentCertIdentity creates a namespaced CertIdentity (with an Entra
+	// app and a bootstrapped Secret) in the credential's namespace.
+	createParentCertIdentity := func(name, secretName string) {
+		certPEM, keyPEM, _ := genCert("parent.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
+		createSecret(secretName, certPEM, keyPEM)
+		ezcaURL := testEZCAURL
+		tnt, app, obj := parentTntID, parentAppID, "parent-obj"
+		ci := &ezcav1.CertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: ezcav1.CertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   secretName,
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tnt,
+					AppID:            &app,
+					AppObjectID:      &obj,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ci)).To(Succeed())
+	}
+
 	newManagedCredential := func(name, secretName, parentName, subjectName string, domains []string) *ezcav1.ManagedCredential {
 		ezcaURL := testEZCAURL
 		return &ezcav1.ManagedCredential{
@@ -262,6 +286,28 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-boot"}, mc)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		Expect(mc.Status.NotAfter).NotTo(BeNil())
+	})
+
+	It("bootstraps from a namespaced CertIdentity in the same namespace", func() {
+		createParentCertIdentity("ci-parent", "ci-parent-sec")
+		_, _, issued := genCertSANs("cisub.ezca.io", []string{"cisub.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+
+		mc := newManagedCredential("mc-ci", "mc-ci-sec", "ci-parent", "CN=cisub.ezca.io", []string{"cisub.ezca.io"})
+		mc.Spec.IdentityRef.Kind = ezcav1.IdentityKindCertIdentity
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-ci")
+
+		Expect(issuerClient.called).To(BeTrue())
+		// Authenticated as the CertIdentity's app, resolved in the MC's namespace.
+		Expect(credTenant).To(Equal(parentTntID))
+
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-ci-sec"}, &secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKey("tls.crt"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-ci"}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 	})
 
 	It("passes typed SANs, key usages, and validity to the issuer", func() {

@@ -4,6 +4,7 @@
 resources:
 - bases/ezca.keytos.io_clustercertidentities.yaml
 - bases/ezca.keytos.io_managedcredentials.yaml
+- bases/ezca.keytos.io_certidentities.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
