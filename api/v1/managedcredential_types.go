@@ -134,9 +134,11 @@ type ManagedCredentialSpec struct {
 
 	// identityRef points to the identity whose certificate bootstraps this
 	// credential. It is required on first issuance (when the Secret is empty),
-	// where its certificate authenticates the issuance request to EZCA.
+	// where its certificate authenticates the issuance request to EZCA. When it
+	// is omitted, the certificate must be provisioned into the Secret externally
+	// and the controller only renews and rotates it thereafter.
 	// +optional
-	IdentityRef IdentityRefSpec `json:"identityRef,omitempty"`
+	IdentityRef *IdentityRefSpec `json:"identityRef,omitempty"`
 }
 
 type IdentityRefSpec struct {

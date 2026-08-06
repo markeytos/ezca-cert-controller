@@ -137,6 +137,9 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	secretName := types.NamespacedName{Namespace: mc.Namespace, Name: mc.Spec.CertSecretName}
 	if err := r.Get(ctx, secretName, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
+			if !canSelfBootstrap(mc) {
+				return r.requireBootstrap(mc, secretName), nil
+			}
 			// No Secret yet: bootstrap by issuing the first certificate.
 			return r.issueAndStore(ctx, mc, nil, nil, nil, req, now, tel, "Bootstrapped")
 		}
@@ -146,6 +149,9 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	// Tolerate an empty Secret (present but without certificate material) as a
 	// bootstrap trigger, unless a rotation is already staged in it.
 	if isEmptyTLSSecret(&secret) && !hasPendingCert(&secret) {
+		if !canSelfBootstrap(mc) {
+			return r.requireBootstrap(mc, secretName), nil
+		}
 		return r.issueAndStore(ctx, mc, &secret, nil, nil, req, now, tel, "Bootstrapped")
 	}
 
@@ -158,8 +164,10 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 
 	// Re-issue when the certificate has drifted from the desired subject or SANs,
 	// unless a rotation is mid-flight (the pending cert is handled by the shared
-	// state machine).
-	if !hasPendingCert(&secret) && !pki.LeafMatchesSpec(chain[0], req) {
+	// state machine). Re-issuance needs an issuance credential, so a credential
+	// with no spec.identityRef only renews the externally provisioned certificate
+	// and ignores drift.
+	if canSelfBootstrap(mc) && !hasPendingCert(&secret) && !pki.LeafMatchesSpec(chain[0], req) {
 		logf.FromContext(ctx).Info("Certificate no longer matches spec; re-issuing",
 			"subjectName", mc.Spec.SubjectName)
 		return r.issueAndStore(ctx, mc, &secret, chain[0], key, req, now, tel, "Reissued")
@@ -382,6 +390,26 @@ func (r *ManagedCredentialReconciler) identityRefCredential(ctx context.Context,
 	return r.newTokenCredential(*base.TenantID, *base.AppID, cloudFor(base.Cloud), cert, key)
 }
 
+// canSelfBootstrap reports whether the credential can issue its own first
+// certificate. Issuance must be authenticated as an Entra app, and before the
+// credential has any certificate of its own the only identity available for
+// that is the referenced one (spec.identityRef). Without it, the first
+// certificate must be provisioned into the Secret externally; the controller
+// then only renews and rotates it.
+func canSelfBootstrap(mc *ezcav1.ManagedCredential) bool {
+	return mc.Spec.IdentityRef != nil && mc.Spec.IdentityRef.Name != ""
+}
+
+// requireBootstrap marks the credential Degraded because it has no certificate
+// and no identityRef to issue one, so an administrator must provision the
+// Secret. It mirrors how ClusterCertIdentity/CertIdentity treat a missing
+// certificate.
+func (r *ManagedCredentialReconciler) requireBootstrap(mc *ezcav1.ManagedCredential, secretName types.NamespacedName) ctrl.Result {
+	setDegraded(mc, "CertificateNotBootstrapped",
+		fmt.Sprintf("Certificate Secret %s has no certificate and spec.identityRef is not set to bootstrap one; an administrator must provision it", secretName))
+	return ctrl.Result{RequeueAfter: time.Minute}
+}
+
 // identityRefCertKey resolves the referenced identity's certificate, key, and
 // shared spec from its bootstrapped Secret. A ClusterCertIdentity is
 // cluster-scoped and its Secret may live in any namespace; a CertIdentity is
@@ -389,10 +417,10 @@ func (r *ManagedCredentialReconciler) identityRefCredential(ctx context.Context,
 // its Secret is read there too — the credential can never reach across
 // namespaces to it.
 func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc *ezcav1.ManagedCredential) (*x509.Certificate, *rsa.PrivateKey, *ezcav1.CertIdentitySpecBase, error) {
-	ref := mc.Spec.IdentityRef
-	if ref.Name == "" {
+	if mc.Spec.IdentityRef == nil || mc.Spec.IdentityRef.Name == "" {
 		return nil, nil, nil, errors.New("spec.identityRef is required to bootstrap the certificate")
 	}
+	ref := mc.Spec.IdentityRef
 
 	var base *ezcav1.CertIdentitySpecBase
 	var secretNS string
@@ -449,10 +477,14 @@ func leafRegisteredInEntra(mc *ezcav1.ManagedCredential, leaf *x509.Certificate)
 
 // reissueOnRenewFailure implements renewFallback: when renewal fails (for
 // example because EZCA no longer has the domains), fall back to issuing a fresh
-// certificate.
+// certificate. A credential with no spec.identityRef has no way to issue, so it
+// declines the fallback and lets the renewal error surface.
 func (r *ManagedCredentialReconciler) reissueOnRenewFailure(ctx context.Context, obj certIdentity, secret *corev1.Secret, current *x509.Certificate, key *rsa.PrivateKey, now time.Time, tel *telemetry.Telemetry, renewErr error) (bool, ctrl.Result, error) {
 	mc, ok := obj.(*ezcav1.ManagedCredential)
 	if !ok {
+		return false, ctrl.Result{}, nil
+	}
+	if !canSelfBootstrap(mc) {
 		return false, ctrl.Result{}, nil
 	}
 	req, err := certRequestFromSpec(mc)

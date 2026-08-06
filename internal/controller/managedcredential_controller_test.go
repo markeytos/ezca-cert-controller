@@ -240,7 +240,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 				DNSNames:    domains,
 				CAID:        caID,
 				TemplateID:  templateID,
-				IdentityRef: ezcav1.IdentityRefSpec{
+				IdentityRef: &ezcav1.IdentityRefSpec{
 					Name: parentName,
 					Kind: ezcav1.IdentityKindClusterCertIdentity,
 				},
@@ -415,6 +415,92 @@ var _ = Describe("ManagedCredential Controller", func() {
 		chain, _, err := parseSecret(&secret)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(chain[0].NotAfter).To(BeTemporally("==", renewed.NotAfter))
+	})
+
+	It("renews an externally provisioned certificate with no identityRef", func() {
+		// The Secret is bootstrapped by an administrator; with no identityRef the
+		// controller renews it (the certificate authenticates its own renewal to
+		// EZCA) and never issues.
+		certPEM, keyPEM, _ := genCertSANs("noref.ezca.io", []string{"noref.ezca.io"}, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		createSecret("mc-noref-sec", certPEM, keyPEM)
+		_, _, renewed := genCertSANs("noref.ezca.io", []string{"noref.ezca.io"}, now, now.Add(365*24*time.Hour))
+		ezcaClient.newChain = []*x509.Certificate{renewed}
+
+		mc := newManagedCredential("mc-noref", "mc-noref-sec", "", "CN=noref.ezca.io", []string{"noref.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-noref")
+
+		Expect(ezcaClient.called).To(BeTrue())
+		Expect(issuerClient.called).To(BeFalse())
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-noref-sec"}, &secret)).To(Succeed())
+		chain, _, err := parseSecret(&secret)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain[0].NotAfter).To(BeTemporally("==", renewed.NotAfter))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-noref"}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+	})
+
+	It("ignores drift and just renews when no identityRef is set", func() {
+		// The bootstrapped certificate's SANs do not match the spec, but with no
+		// identityRef there is no way to re-issue, so it is renewed as-is rather
+		// than treated as drift.
+		certPEM, keyPEM, _ := genCertSANs("stale.ezca.io", []string{"stale.ezca.io"}, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		createSecret("mc-norefdrift-sec", certPEM, keyPEM)
+		_, _, renewed := genCertSANs("stale.ezca.io", []string{"stale.ezca.io"}, now, now.Add(365*24*time.Hour))
+		ezcaClient.newChain = []*x509.Certificate{renewed}
+
+		mc := newManagedCredential("mc-norefdrift", "mc-norefdrift-sec", "", "CN=desired.ezca.io", []string{"desired.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-norefdrift")
+
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeTrue())
+	})
+
+	It("degrades as not-bootstrapped when the Secret is missing and no identityRef is set", func() {
+		mc := newManagedCredential("mc-noboot", "mc-noboot-sec", "", "CN=noboot.ezca.io", []string{"noboot.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		res := reconcileMC("mc-noboot")
+
+		// Nothing is issued or renewed; the admin must provision the certificate.
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeFalse())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-noboot"}, mc)).To(Succeed())
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("CertificateNotBootstrapped"))
+		// No Secret was created on the credential's behalf.
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-noboot-sec"}, &secret)).ShouldNot(Succeed())
+	})
+
+	It("degrades as not-bootstrapped when the Secret is empty and no identityRef is set", func() {
+		empty := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "mc-empty-sec", Namespace: namespace},
+			Type:       corev1.SecretTypeTLS,
+			Data:       map[string][]byte{"tls.crt": {}, "tls.key": {}},
+		}
+		Expect(k8sClient.Create(ctx, empty)).To(Succeed())
+
+		mc := newManagedCredential("mc-empty", "mc-empty-sec", "", "CN=empty.ezca.io", []string{"empty.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-empty")
+
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-empty"}, mc)).To(Succeed())
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("CertificateNotBootstrapped"))
 	})
 
 	It("falls back to issuance when renewal fails", func() {
