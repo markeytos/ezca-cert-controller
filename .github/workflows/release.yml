@@ -68,7 +68,9 @@ jobs:
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Log in to ACR for Helm (OCI)
-        run: helm registry login "$REGISTRY" -u "$ACR_USERNAME" -p "$ACR_PASSWORD"
+        # Pass the password via stdin, not argv, so it never lands in the process
+        # arg list (and helm's insecure-CLI-password warning is avoided).
+        run: printf '%s' "$ACR_PASSWORD" | helm registry login "$REGISTRY" -u "$ACR_USERNAME" --password-stdin
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
