@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -66,7 +67,7 @@ type ManagedCredentialReconciler struct {
 
 	// Injection points for issuing brand-new certificates (beyond the shared
 	// factories in ReconcilerBase). When nil, real implementations are used.
-	NewEZCAIssuer      func(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, caID, templateID uuid.UUID) (ezcaIssuer, error)
+	NewEZCAIssuer      func(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, azCloud cloud.Configuration, caID, templateID uuid.UUID) (ezcaIssuer, error)
 	NewTokenCredential func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (azcore.TokenCredential, error)
 }
 
@@ -228,7 +229,7 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	issuer, err := r.newEZCAIssuer(ctx, *mc.Spec.EZCAURL, cred, caID, templateID)
+	issuer, err := r.newEZCAIssuer(ctx, *mc.Spec.EZCAURL, cred, azureCloudFor(mc.Spec.Cloud), caID, templateID)
 	if err != nil {
 		setDegraded(mc, "IssuerUnavailable", fmt.Sprintf("Could not create EZCA issuer: %v", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -635,11 +636,11 @@ func signOptions(mc *ezcav1.ManagedCredential, req pki.CertRequest) (*ezca.SignO
 	return opts, nil
 }
 
-func (r *ManagedCredentialReconciler) newEZCAIssuer(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, caID, templateID uuid.UUID) (ezcaIssuer, error) {
+func (r *ManagedCredentialReconciler) newEZCAIssuer(ctx context.Context, ezcaURL string, cred azcore.TokenCredential, azCloud cloud.Configuration, caID, templateID uuid.UUID) (ezcaIssuer, error) {
 	if r.NewEZCAIssuer != nil {
-		return r.NewEZCAIssuer(ctx, ezcaURL, cred, caID, templateID)
+		return r.NewEZCAIssuer(ctx, ezcaURL, cred, azCloud, caID, templateID)
 	}
-	c, err := ezca.NewClient(ezcaURL, cred)
+	c, err := ezca.NewClient(ezcaURL, cred, ezca.WithCloud(azCloud))
 	if err != nil {
 		return nil, err
 	}

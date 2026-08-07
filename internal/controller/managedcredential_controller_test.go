@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -156,7 +157,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 				},
 			},
 			DefaultNamespace: namespace,
-			NewEZCAIssuer: func(_ context.Context, _ string, _ azcore.TokenCredential, _, _ uuid.UUID) (ezcaIssuer, error) {
+			NewEZCAIssuer: func(_ context.Context, _ string, _ azcore.TokenCredential, _ cloud.Configuration, _, _ uuid.UUID) (ezcaIssuer, error) {
 				return issuerClient, nil
 			},
 			NewTokenCredential: func(tenantID, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (azcore.TokenCredential, error) {

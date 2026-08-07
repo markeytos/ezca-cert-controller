@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -611,6 +612,17 @@ func keyVaultCloudFor(c ezcav1.CloudEnvironment) keyvault.Cloud {
 		return keyvault.CloudUSGov
 	}
 	return keyvault.CloudPublic
+}
+
+// azureCloudFor maps the CRD cloud selection to the azcore cloud configuration
+// used to reach EZCA. It sets the Azure Resource Manager token scope the EZCA
+// client requests, so certificate issuance authenticates against the right
+// sovereign cloud (the public management endpoint is rejected in Government).
+func azureCloudFor(c ezcav1.CloudEnvironment) cloud.Configuration {
+	if c == ezcav1.CloudUSGov {
+		return cloud.AzureGovernment
+	}
+	return cloud.AzurePublic
 }
 
 func identityProps(obj certIdentity) map[string]string {
