@@ -117,10 +117,17 @@ jobs:
         #   gpg --dearmor < keytos-helm-pubkey.asc > pubring.gpg
         #   helm verify --keyring pubring.gpg ezca-cert-controller-<V>.tgz
         run: |
+          # --target pins the tag to the ref this run built (the workflow can be
+          # dispatched from a non-default branch); without it the tag would be cut
+          # from the default branch and diverge from the published image/chart.
+          # If the release already exists (a re-run after the image/chart were
+          # already pushed), fall back to uploading/replacing the assets so the
+          # run is idempotent instead of failing after publishing.
           gh release create "v$V" \
             "dist/ezca-cert-controller-$V.tgz" \
             "dist/ezca-cert-controller-$V.tgz.prov" \
             "$RUNNER_TEMP/keytos-helm-pubkey.asc" \
+            --target "$GITHUB_SHA" \
             --title "v$V" \
             --notes "ezca-cert-controller chart and controller image \`$V\`.
 
@@ -132,7 +139,12 @@ jobs:
           \`\`\`
           gpg --dearmor < keytos-helm-pubkey.asc > pubring.gpg
           helm verify --keyring pubring.gpg ezca-cert-controller-$V.tgz
-          \`\`\`"
+          \`\`\`" \
+          || gh release upload "v$V" \
+            "dist/ezca-cert-controller-$V.tgz" \
+            "dist/ezca-cert-controller-$V.tgz.prov" \
+            "$RUNNER_TEMP/keytos-helm-pubkey.asc" \
+            --clobber
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.ver.outputs.version }}

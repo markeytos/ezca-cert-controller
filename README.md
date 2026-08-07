@@ -18,12 +18,17 @@ A Helm chart for the **ezca-cert-controller** — a Kubernetes operator that kee
 To create the bootstrap certificate for your `certIdentity`, create a domain in EZCA and a certificate for that domain. 
 Download the certificate in PEM format and save the private key in unencrypted PEM format.
 
-Import the certificate into your cluster as a tls secret:
+Create the release namespace (the install step below reuses it), then import the
+certificate into it as a tls secret:
 
 ```bash
+kubectl create namespace ezca-cert-controller-system
 kubectl -n ezca-cert-controller-system create secret tls cluster-cert-identity \
   --cert=tls.crt --key=tls.key
 ```
+
+> The `helm install` command below uses `--create-namespace`, which is a no-op
+> when the namespace already exists — so creating it here first is safe.
 
 ### Create your values.yaml file
 To configure the Helm chart, you will need to create a `values.yaml` file. Here is an example:
@@ -58,15 +63,35 @@ appCerts:
       name: master-cert-identity-1
       kind: ClusterCertIdentity
   - name: web-backend-cert
-  ...
+    namespace: team-web
+    subjectName: backend.example.com
+    dnsNames: [backend.example.com]
+    extendedKeyUsages: [ClientAuth]
+    caID: "33333333-3333-3333-3333-333333333333"
+    templateID: "44444444-4444-4444-4444-444444444444"
+    identityRef:
+      name: master-cert-identity-1
+      kind: ClusterCertIdentity
 ```
 
-This example consists of a single `clusterIdentity` to bootstrap multiple other identities.
+This example uses a single `clusterIdentity` to bootstrap the `appCerts` below it,
+but every part is optional — you configure only the behavior you need:
 
-todo: explain in elegant language the functionality. How, if they include an app id, we install the renewed
-certificates on the app, and if they specify keyvault, we keep a keyvault certificate in sync. But if they just 
-want to do certificates, we just do certificates. And if they don't want a cluster wide cert identity, they don't
-need to create one.
+- **Certificates only.** Give an entry a `subjectName`, `caID`, and `templateID`
+  and the controller issues and renews that certificate into a Secret. Nothing
+  else is required.
+- **Entra credential rotation.** Add `appID` / `appObjectID` (with the top-level
+  `tenantID`) and the controller also installs each renewed certificate onto that
+  Entra app registration, removing the old credential once it expires.
+- **Key Vault sync.** Add `keyVault` and the controller keeps the named Key Vault
+  certificate in step with the Secret, re-importing whenever they diverge. This
+  builds on the Entra fields, since the controller authenticates to the vault as
+  that app.
+- **No cluster identity.** The `ClusterCertIdentity` is opt-in: it is rendered
+  only when you set `clusterIdentity.name`. Omit the `clusterIdentity` block (or
+  leave `name` blank) and no `ClusterCertIdentity` is created — for when your
+  `appCerts` bootstrap from an identity created elsewhere, or you only need
+  namespaced `ManagedCredential`s.
 
 ### Install the Helm Chart
 
@@ -138,12 +163,14 @@ The chart renders **one** `ClusterCertIdentity` (from `clusterIdentity`) and **o
 
 ### `clusterIdentity` — the ClusterCertIdentity
 
-Set `clusterIdentity.name` to `""` (or `null`) to skip rendering it (e.g. when your
-`appCerts` reference an identity created elsewhere).
+The `ClusterCertIdentity` is **opt-in**: it is rendered only when you set
+`clusterIdentity.name`. Omit the block, or leave `name` blank/`null`, and no
+`ClusterCertIdentity` is created (e.g. when your `appCerts` reference an identity
+created elsewhere).
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `name` | `master-cert-identity-1` | `metadata.name` of the ClusterCertIdentity. |
+| `name` | `""` | `metadata.name` of the ClusterCertIdentity. Blank → not created. |
 | `appID` / `appObjectID` | `""` | Entra app (client) ID and directory object ID. Set both to enable Entra rotation + Key Vault sync; leave blank for a certificate-only identity. |
 | `certSecretName` | `cluster-cert-identity` | Name of the pre-existing `kubernetes.io/tls` Secret with the bootstrap cert. |
 | `certSecretNamespace` | `""` | Namespace of that Secret. Blank → the release namespace. |
@@ -189,7 +216,7 @@ kubectl get managedcredential -A       # short name: mc
 ## Verifying the chart signature (optional)
 
 Released charts are PGP-signed (a `.prov` provenance file is published alongside the
-chart). Each [GitHub release](https://github.com/keytos/ezca-cert-controller/releases)
+chart). Each [GitHub release](https://github.com/markeytos/ezca-cert-controller/releases)
 attaches the packaged chart, its `.prov` signature, and the public signing key
 (`keytos-helm-pubkey.asc`) so the release can be verified independently.
 
@@ -204,8 +231,8 @@ checking them locally:
 
 ```bash
 helm verify --keyring ~/.gnupg/ezca-pubring.gpg ezca-cert-controller-<version>.tgz
-helm install my-release ./ezca-cert-controller-<version>.tgz \
-  --namespace ezca-cert-controller-system --create-namespace -f my-values.yaml
+helm install ezca-cert-controller-system ./ezca-cert-controller-<version>.tgz \
+  --namespace ezca-cert-controller-system --create-namespace -f values.yaml
 ```
 
 **Or verify at install time** straight from the registry with `--verify`:

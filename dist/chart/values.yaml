@@ -216,11 +216,13 @@ tenantID: ""
 ## renewals/rotations/errors are reported to Application Insights for every CR.
 appInsightsConnString: ""
 
-## One cluster-scoped ClusterCertIdentity. Set clusterIdentity.name to "" (or null)
-## to skip rendering it (e.g. when appCerts reference an identity created elsewhere).
+## Optional cluster-scoped ClusterCertIdentity. It is rendered ONLY when you set
+## clusterIdentity.name; the default is blank, so no ClusterCertIdentity is created
+## unless you ask for one (e.g. when your appCerts reference an identity created
+## elsewhere, or you only need namespaced ManagedCredentials).
 clusterIdentity:
-  ## metadata.name of the ClusterCertIdentity.
-  name: master-cert-identity-1
+  ## metadata.name of the ClusterCertIdentity. Blank (the default) -> not created.
+  name: ""
   ## Entra app (client) ID and directory object ID. Set together to enable Entra
   ## app rotation + Key Vault sync; leave both blank for a certificate-only identity.
   appID: ""
