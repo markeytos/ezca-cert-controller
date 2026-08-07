@@ -28,6 +28,7 @@ jobs:
   release:
     name: Build & publish image + chart
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: write
     steps:
