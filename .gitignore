@@ -31,3 +31,14 @@ tls.*
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# Build artifacts under dist/ (the chart source under dist/chart is committed)
+dist/install.yaml
+dist/*.tgz
+dist/*.tgz.prov
+
+# scripts that are developer specific
+secret-scripts
+
+# test scripts that are Keytos specific
+config/samples/test
