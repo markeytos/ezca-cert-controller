@@ -41,12 +41,13 @@ func warnError(err error) {
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
-	dir, _ := GetProjectDir()
-	cmd.Dir = dir
-
-	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
+	dir, err := GetProjectDir()
+	if err != nil {
+		return "", err
 	}
+	// Set the working directory on the command only. os.Chdir would move the
+	// whole test process, which races with any spec running concurrently.
+	cmd.Dir = dir
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
