@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -485,12 +486,7 @@ func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc
 
 // namespaceAllowed reports whether ns is in the allowlist.
 func namespaceAllowed(ns string, allowed []string) bool {
-	for _, a := range allowed {
-		if a == ns {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, ns)
 }
 
 // leafRegisteredInEntra reports whether the given certificate has been recorded
