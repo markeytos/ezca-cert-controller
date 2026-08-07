@@ -1,0 +1,17 @@
+{{- with .Values.clusterIdentity }}
+{{- if .name }}
+apiVersion: ezca.keytos.io/v1
+kind: ClusterCertIdentity
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "ezca.labels" $ | nindent 4 }}
+spec:
+  {{- include "ezca.baseSpec" (dict "item" . "root" $.Values) | nindent 2 }}
+  certSecretNamespace: {{ .certSecretNamespace | default $.Release.Namespace | quote }}
+  {{- /* allowedNamespaces is required (MinItems=1); default to the release namespace. */}}
+  allowedNamespaces:
+    {{- $allowed := .allowedNamespaces | default (list $.Release.Namespace) }}
+    {{- toYaml $allowed | nindent 4 }}
+{{- end }}
+{{- end }}

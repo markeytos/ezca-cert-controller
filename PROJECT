@@ -6,6 +6,10 @@ cliVersion: 4.15.0
 domain: keytos.io
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: dist
 projectName: ezca-cert-controller
 repo: github.com/markeytos/ezca-cert-controller
 resources:

@@ -132,17 +132,15 @@ docker-push: ## Push docker image with the manager.
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
 # - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 # - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
-# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+# The Dockerfile pins its builder stage to --platform=${BUILDPLATFORM} and cross-compiles
+# (CGO disabled), so buildx can target every platform below from one native builder.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name ezca-cert-controller-builder
 	$(CONTAINER_TOOL) buildx use ezca-cert-controller-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile .
 	- $(CONTAINER_TOOL) buildx rm ezca-cert-controller-builder
-	rm Dockerfile.cross
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
@@ -257,3 +255,96 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Helm Deployment
+
+## Helm binary to use for deploying the chart
+HELM ?= helm
+## Namespace to deploy the Helm release
+HELM_NAMESPACE ?= ezca-cert-controller-system
+## Name of the Helm release
+HELM_RELEASE ?= ezca-cert-controller
+## Path to the Helm chart directory
+HELM_CHART_DIR ?= dist/chart
+## Additional arguments to pass to helm commands
+HELM_EXTRA_ARGS ?=
+
+.PHONY: install-helm
+install-helm: ## Install the latest version of Helm.
+	@command -v $(HELM) >/dev/null 2>&1 || { \
+		echo "Installing Helm..." && \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; \
+	}
+
+.PHONY: helm-deploy
+helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--set manager.image.repository=$${IMG%:*} \
+		--set manager.image.tag=$${IMG##*:} \
+		--wait \
+		--timeout 5m \
+		$(HELM_EXTRA_ARGS)
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall the Helm release from the K8s cluster.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-status
+helm-status: ## Show Helm release status.
+	$(HELM) status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-history
+helm-history: ## Show Helm release history.
+	$(HELM) history $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-rollback
+helm-rollback: ## Rollback to previous Helm release.
+	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+##@ Release (publish image + chart to ACR)
+
+## Public Azure Container Registry login server.
+REGISTRY        ?= keytos-eqgzasb8bufxa0cd.azurecr.io
+## Fully qualified image repository (no tag).
+IMAGE_REPO      ?= $(REGISTRY)/ezca/cert-controller
+## OCI repository the Helm chart is pushed to (chart name is appended by helm).
+CHART_OCI_REPO  ?= oci://$(REGISTRY)/ezca/helm
+## Version stamped onto the image tag and the chart version/appVersion.
+RELEASE_VERSION ?= $(shell $(HELM) show chart $(HELM_CHART_DIR) 2>/dev/null | awk '/^version:/{print $$2}')
+## Platforms for the multi-arch image.
+RELEASE_PLATFORMS ?= linux/amd64,linux/arm64
+
+## PGP provenance signing for the chart. Set HELM_SIGN_KEY to produce a .tgz.prov so
+## consumers can `helm install --verify`. HELM_SIGN_KEY must be a substring of the
+## signing key's UID (its name or email, e.g. release@keytos.io) — Helm matches on the
+## UID, NOT the fingerprint. Leave it empty to package unsigned (fine for local dev).
+## HELM_KEYRING must be a legacy GnuPG keyring (e.g. `gpg --export-secret-keys >
+## secring.gpg`), NOT the modern pubring.kbx. HELM_PASSPHRASE_FILE is required for a
+## passphrase-protected key.
+HELM_SIGN_KEY ?=
+HELM_KEYRING ?= $(HOME)/.gnupg/secring.gpg
+HELM_PASSPHRASE_FILE ?=
+
+.PHONY: release-image
+release-image: ## Build & push the multi-arch manager image to ACR. Run `docker login $(REGISTRY)` first.
+	$(MAKE) docker-buildx IMG=$(IMAGE_REPO):$(RELEASE_VERSION) PLATFORMS=$(RELEASE_PLATFORMS)
+
+.PHONY: helm-package
+helm-package: ## Package the chart into dist/, stamping version + appVersion. Signs when HELM_SIGN_KEY is set.
+	@set -e; \
+	args=(package "$(HELM_CHART_DIR)" --version "$(RELEASE_VERSION)" --app-version "$(RELEASE_VERSION)" --destination dist/); \
+	if [ -n "$(HELM_SIGN_KEY)" ]; then \
+		echo "Signing chart provenance with key $(HELM_SIGN_KEY)"; \
+		args+=(--sign --key "$(HELM_SIGN_KEY)" --keyring "$(HELM_KEYRING)"); \
+		[ -n "$(HELM_PASSPHRASE_FILE)" ] && args+=(--passphrase-file "$(HELM_PASSPHRASE_FILE)"); \
+	fi; \
+	$(HELM) "$${args[@]}"
+
+.PHONY: helm-push
+helm-push: helm-package ## Push the packaged chart to ACR as an OCI artifact. Run `helm registry login $(REGISTRY)` first.
+	$(HELM) push dist/ezca-cert-controller-$(RELEASE_VERSION).tgz $(CHART_OCI_REPO)
+
+.PHONY: release
+release: release-image helm-push ## Publish both the image and the chart to ACR.
