@@ -316,7 +316,7 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 			Message: "Issued certificate added to the app registration; waiting for Entra ID propagation",
 		})
 		log.Info("Staged issued certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, mc.Status.PendingSince)}, nil
 	}
 
 	// First issuance: nothing to keep serving, so write the certificate active. It
@@ -339,9 +339,10 @@ func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredentia
 	mc.Status.PendingSince = nil
 	setAvailable(mc, successReason, "Certificate issued successfully")
 	if mc.Spec.KeyVault != nil {
-		// Hand off to the steady-state path soon so the new certificate syncs to
-		// Key Vault once it is usable.
-		return ctrl.Result{RequeueAfter: propagationRequeue}
+		// Hand off to the steady-state path so the new certificate syncs to Key
+		// Vault once it is usable — that is, after its propagation grace, which
+		// the Key Vault sync measures from the certificate's own NotBefore.
+		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, mc.Status.NotBefore)}
 	}
 	return ctrl.Result{RequeueAfter: requeueForRenewal(newLeaf, mc.Spec.RenewalThreshold, now)}
 }

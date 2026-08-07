@@ -70,6 +70,15 @@ func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	// this was written by a human and not claude so please read it.
+	// the finalizer is used for cleaning up external resources
+	// kubernetes, after a resource was requested to be deleted,
+	// will wait for our controller to remove the finalizer to
+	// fully delete it.
+	// we could, in the future, use the finalizer for deleting
+	// certificates off the entra app or deleting the certificate in
+	// keyvault, but to avoid being destructive, it does nothing (see above, we just remove
+	// it when the resource is deleted)
 	if controllerutil.AddFinalizer(&ci, ezcaGroupFinalizer) {
 		if err := r.Update(ctx, &ci); err != nil {
 			return ctrl.Result{}, err
@@ -108,6 +117,9 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 	secretName := types.NamespacedName{Namespace: ci.Namespace, Name: ci.Spec.CertSecretName}
 	if err := r.Get(ctx, secretName, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
+			// for certIdentity and clusterCertIdentity, we require a certificate
+			// so we can authenticate as the app, without a certificate given to use
+			// by the cluster operator, we cannot do anything
 			setDegraded(ci, "CertificateNotBootstrapped",
 				fmt.Sprintf("Certificate Secret %s not found; an administrator must bootstrap it", secretName))
 			return ctrl.Result{RequeueAfter: time.Minute}, nil

@@ -66,12 +66,13 @@ const (
 	maxRequeueAfter = 24 * time.Hour
 
 	// propagationRequeue is how often the controller re-checks whether a staged
-	// certificate has become usable in Entra ID.
+	// certificate has become usable, once the propagation grace has elapsed and
+	// there is a point in trying to authenticate with it.
 	propagationRequeue = 30 * time.Second
 	// propagationGrace is the minimum time to wait after adding a key before
-	// promoting it, even once it authenticates. A single successful token
-	// acquisition only proves one token-endpoint replica has the key; this
-	// window lets it propagate to the rest.
+	// using it at all. A newly added key is not immediately present on every
+	// token-endpoint replica, so the controller does not authenticate with the
+	// certificate until this window has passed.
 	propagationGrace = 5 * time.Minute
 	// propagationTimeout is how long propagation may take before the controller
 	// surfaces a Degraded condition (it keeps retrying afterwards).
@@ -216,7 +217,7 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		Message: "Renewed certificate added to the app registration; waiting for Entra ID propagation",
 	})
 	log.Info("Staged renewed certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-	return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+	return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, status.PendingSince)}, nil
 }
 
 // promoteIfReady checks whether the staged (pending) certificate can now
@@ -243,37 +244,34 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	}
 	pendingLeaf := pendingChain[0]
 
-	cl, err := d.newEntraClient(*spec.TenantID, *spec.AppID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if verr := cl.VerifyCredential(ctx); verr != nil {
-		// Not usable yet. Keep waiting, but surface Degraded if propagation is
-		// taking abnormally long (retries continue regardless).
-		if status.PendingSince != nil && now.Sub(status.PendingSince.Time) > propagationTimeout {
-			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(obj))
-			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
-		} else {
-			meta.SetStatusCondition(&status.Conditions, metav1.Condition{
-				Type:    typeProgressingCertIdentity,
-				Status:  metav1.ConditionTrue,
-				Reason:  reasonPendingPropagation,
-				Message: "Waiting for the renewed certificate to propagate in Entra ID",
-			})
-		}
-		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
-	}
-
-	// It authenticated on the replica we hit, but a single success does not mean
-	// every token-endpoint replica has the key yet. Wait out a grace window
-	// since the key was added before promoting, so we don't switch the active
-	// certificate to one other replicas would still reject.
 	if status.PendingSince != nil && now.Sub(status.PendingSince.Time) < propagationGrace {
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
 			Status:  metav1.ConditionTrue,
 			Reason:  "Stabilizing",
 			Message: fmt.Sprintf("Renewed certificate authenticated; waiting %s for Entra ID propagation to stabilize", propagationGrace),
+		})
+		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, status.PendingSince)}, nil
+	}
+
+	cl, err := d.newEntraClient(*spec.TenantID, *spec.AppID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if verr := cl.VerifyCredential(ctx); verr != nil {
+		// Past the grace window and still not usable. Poll until the propagation
+		// timeout; beyond it, fail loudly (retries continue, more slowly, so the
+		// certificate can still self-heal).
+		if status.PendingSince != nil && now.Sub(status.PendingSince.Time) > propagationTimeout {
+			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(obj))
+			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type:    typeProgressingCertIdentity,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonPendingPropagation,
+			Message: "Waiting for the renewed certificate to propagate in Entra ID",
 		})
 		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
 	}
@@ -397,6 +395,19 @@ func promoteSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Secret)
 	return d.kubeClient().Update(ctx, secret)
 }
 
+// propagationRequeueAfter returns how long to wait before next acting on a
+// certificate that became current at since (staged at PendingSince, or issued
+// at NotBefore).
+func propagationRequeueAfter(now time.Time, since *metav1.Time) time.Duration {
+	if since == nil {
+		return propagationRequeue
+	}
+	if remaining := propagationGrace - now.Sub(since.Time); remaining > 0 {
+		return remaining
+	}
+	return propagationRequeue
+}
+
 func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
 	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
 	if err != nil {
@@ -426,7 +437,7 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	// already authenticated (and waited out the grace since being staged) is not
 	// charged the grace a second time — it syncs right away.
 	if status.NotBefore != nil && now.Sub(status.NotBefore.Time) < propagationGrace {
-		requeueAtMost(result, propagationRequeue)
+		requeueAtMost(result, propagationRequeueAfter(now, status.NotBefore))
 		return
 	}
 
@@ -434,9 +445,11 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	if kvErr == nil {
 		return
 	}
-	if isCredentialPropagating(kvErr) {
-		// Transient: the certificate is correct but not yet on the replica we
-		// reached. Retry soon; do not alarm.
+	// Transient: the certificate is correct but not yet on the replica we
+	// reached. Poll quietly until the propagation timeout; past that it is no
+	// longer plausibly propagation, so fall through and report it as a failure.
+	if isCredentialPropagating(kvErr) &&
+		(status.NotBefore == nil || now.Sub(status.NotBefore.Time) <= propagationTimeout) {
 		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
 		requeueAtMost(result, propagationRequeue)
 		return

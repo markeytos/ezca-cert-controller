@@ -48,6 +48,7 @@ const (
 	testUUID0    = "00000000-0000-0000-0000-000000000000"
 	testUUID1    = "11111111-1111-1111-1111-111111111111"
 	testObjectID = "obj-1"
+	day          = 24 * time.Hour
 )
 
 type fakeEZCA struct {
@@ -65,34 +66,52 @@ func (f *fakeEZCA) RenewCertificateV3(_ context.Context, _ *x509.Certificate, _ 
 }
 
 type fakeEntra struct {
-	verifyErr error
-	added     [][]byte
-	removed   []string
+	verifyErr   error
+	verifyCalls int
+	added       [][]byte
+	addErr      error
+	removed     []string
+	removeErr   error
 }
 
-func (f *fakeEntra) VerifyCredential(_ context.Context) error { return f.verifyErr }
+func (f *fakeEntra) VerifyCredential(_ context.Context) error {
+	f.verifyCalls++
+	return f.verifyErr
+}
 
 func (f *fakeEntra) AddKey(_ context.Context, _ string, der []byte) (string, error) {
+	if len(der) <= 0 {
+		return "", f.addErr
+	}
 	f.added = append(f.added, der)
 	return "new-key-id", nil
 }
 
 func (f *fakeEntra) RemoveKey(_ context.Context, _, keyID string) error {
+	if len(keyID) <= 0 {
+		return f.removeErr
+	}
 	f.removed = append(f.removed, keyID)
 	return nil
 }
 
 type fakeKeyVault struct {
-	matches  bool
-	matchErr error
-	imported [][]byte
+	matches    bool
+	matchErr   error
+	matchCalls int
+	imported   [][]byte
+	importErr  error
 }
 
 func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool, error) {
+	f.matchCalls++
 	return f.matches, f.matchErr
 }
 
 func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, bundle []byte) error {
+	if len(bundle) <= 0 {
+		return f.importErr
+	}
 	f.imported = append(f.imported, bundle)
 	return nil
 }
@@ -158,7 +177,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 	}
 
-	createIdentity := func(name, secretName string, withApp bool) *ezcav1.ClusterCertIdentity {
+	createIdentity := func(name, secretName string, cloud ezcav1.CloudEnvironment, withApp bool) *ezcav1.ClusterCertIdentity {
 		ezcaURL := testEZCAURL
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -166,7 +185,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
 					EZCAURL:          &ezcaURL,
 					CertSecretName:   secretName,
-					Cloud:            ezcav1.CloudPublic,
+					Cloud:            cloud,
 					RenewalThreshold: 20,
 				},
 				CertSecretNamespace: namespace,
@@ -194,9 +213,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("does not renew a healthy certificate", func() {
-		certPEM, keyPEM, _ := genCert("healthy.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("healthy.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("healthy-secret", certPEM, keyPEM)
-		cci := createIdentity("healthy", "healthy-secret", false)
+		cci := createIdentity("healthy", "healthy-secret", ezcav1.CloudPublic, false)
 
 		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		Expect(err).NotTo(HaveOccurred())
@@ -209,11 +228,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("renews a certificate past the threshold", func() {
-		certPEM, keyPEM, _ := genCert("renew.ezca.io", now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("renew.ezca.io", now.Add(-90*day), now.Add(10*day))
 		createSecret("renew-secret", certPEM, keyPEM)
-		cci := createIdentity("renew", "renew-secret", false)
+		cci := createIdentity("renew", "renew-secret", ezcav1.CloudPublic, false)
 
-		_, _, parsedNew := genCert("renew.ezca.io", now, now.Add(100*24*time.Hour))
+		_, _, parsedNew := genCert("renew.ezca.io", now, now.Add(100*day))
 		ezcaClient.newChain = []*x509.Certificate{parsedNew}
 
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
@@ -233,11 +252,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("adds the renewed cert to the app, waits for propagation, then promotes it", func() {
-		certPEM, keyPEM, oldCert := genCert("app.ezca.io", now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		certPEM, keyPEM, oldCert := genCert("app.ezca.io", now.Add(-90*day), now.Add(10*day))
 		createSecret("app-secret", certPEM, keyPEM)
-		cci := createIdentity("app-identity", "app-secret", true)
+		cci := createIdentity("app-identity", "app-secret", ezcav1.CloudPublic, true)
 
-		_, _, parsedNew := genCert("app.ezca.io", now, now.Add(100*24*time.Hour))
+		_, _, parsedNew := genCert("app.ezca.io", now, now.Add(100*day))
 		ezcaClient.newChain = []*x509.Certificate{parsedNew}
 
 		secretName := types.NamespacedName{Name: "app-secret", Namespace: namespace}
@@ -267,28 +286,40 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
 		Expect(cci.Status.ManagedKeyCredentials[0].KeyID).To(Equal("new-key-id"))
 
-		reconcileNow := func() {
-			_, e := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		reconcileNow := func() reconcile.Result {
+			res, e := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 			Expect(e).NotTo(HaveOccurred())
+			return res
 		}
 
-		// Reconcile #2: auth still failing (even past the grace window) -> staged.
-		clockNow = now.Add(6 * time.Minute)
-		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
-		reconcileNow()
+		// Reconcile #2: inside the grace window -> the controller must not even
+		// try to authenticate with the staged certificate, and must wait out the
+		// remainder of the grace in one go rather than polling.
+		clockNow = now.Add(2 * time.Minute)
+		entraClient.verifyCalls = 0
+		res := reconcileNow()
+		Expect(entraClient.verifyCalls).To(Equal(0), "must not authenticate with the staged cert during the grace window")
+		Expect(res.RequeueAfter).To(Equal(propagationGrace - 2*time.Minute))
 		Expect(hasPending()).To(BeTrue())
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
 
-		// Reconcile #3: auth succeeds but grace window has NOT elapsed -> still
-		// staged (guards against a false positive from one propagated replica).
-		clockNow = now
-		entraClient.verifyErr = nil
-		reconcileNow()
-		Expect(hasPending()).To(BeTrue(), "must not promote before the grace window even if auth succeeds")
+		// Reconcile #3: past the grace window, auth still failing -> now it does
+		// check, stays staged, and polls at propagationRequeue until the timeout.
+		clockNow = now.Add(6 * time.Minute)
+		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
+		entraClient.verifyCalls = 0
+		res = reconcileNow()
+		Expect(entraClient.verifyCalls).To(Equal(1), "must check the staged cert once the grace window has elapsed")
+		Expect(res.RequeueAfter).To(Equal(propagationRequeue))
+		Expect(hasPending()).To(BeTrue())
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
 
 		// Reconcile #4: auth succeeds and grace window elapsed -> promote.
 		clockNow = now.Add(6 * time.Minute)
+		entraClient.verifyErr = nil
 		reconcileNow()
 		Expect(hasPending()).To(BeFalse())
 		Expect(activeLeaf().Equal(parsedNew)).To(BeTrue(), "renewed cert must be promoted after propagation")
@@ -302,10 +333,49 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(entraClient.added).To(HaveLen(1))
 	})
 
+	It("degrades once a staged certificate has not propagated by the timeout", func() {
+		certPEM, keyPEM, oldCert := genCert("timeout.ezca.io", now.Add(-90*day), now.Add(10*day))
+		createSecret("timeout-secret", certPEM, keyPEM)
+		cci := createIdentity("timeout-identity", "timeout-secret", ezcav1.CloudPublic, true)
+
+		_, _, parsedNew := genCert("timeout.ezca.io", now, now.Add(100*day))
+		ezcaClient.newChain = []*x509.Certificate{parsedNew}
+
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+		secretName := types.NamespacedName{Name: "timeout-secret", Namespace: namespace}
+		activeLeaf := func() *x509.Certificate {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			chain, err := pki.ParseCertChainPEM(s.Data["tls.crt"])
+			Expect(err).NotTo(HaveOccurred())
+			return chain[0]
+		}
+
+		// Stage the renewed certificate.
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Still not authenticating well past the propagation timeout.
+		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
+		clockNow = now.Add(propagationTimeout + time.Minute)
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+		cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond.Reason).To(Equal("PropagationTimeout"))
+
+		// It keeps retrying (so it can still self-heal) but backs off past the
+		// propagation poll interval, and the old certificate keeps serving.
+		Expect(res.RequeueAfter).To(Equal(time.Minute))
+		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+	})
+
 	It("removes expired managed credentials from the app", func() {
-		certPEM, keyPEM, _ := genCert("cleanup.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("cleanup.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("cleanup-secret", certPEM, keyPEM)
-		cci := createIdentity("cleanup", "cleanup-secret", true)
+		cci := createIdentity("cleanup", "cleanup-secret", ezcav1.CloudPublic, true)
 
 		// Seed an expired managed credential that still exists on the app.
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
@@ -326,7 +396,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("imports the certificate into Key Vault when it differs, and skips when it matches", func() {
-		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("kv-secret", certPEM, keyPEM)
 
 		ezcaURL := testEZCAURL
@@ -370,7 +440,10 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("defers Key Vault sync (no error) while the certificate is still propagating", func() {
-		certPEM, keyPEM, _ := genCert("kv2.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		// NotBefore sits past the grace window but inside the propagation
+		// timeout, so a "key not found" from the vault is still plausibly
+		// propagation and must be retried quietly rather than reported.
+		certPEM, keyPEM, _ := genCert("kv2.ezca.io", now.Add(-10*time.Minute), now.Add(90*day))
 		createSecret("kv2-secret", certPEM, keyPEM)
 
 		ezcaURL := testEZCAURL
@@ -400,15 +473,71 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		kvClient.matchErr = errors.New("ClientCertificateCredential authentication failed: AADSTS700027: key not found")
 		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeNumerically("<=", propagationRequeue))
+		Expect(res.RequeueAfter).To(Equal(propagationRequeue))
 		Expect(kvClient.imported).To(BeEmpty())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+
+		// Past the propagation timeout the same error is no longer plausibly
+		// propagation, so it is reported instead of retried quietly.
+		clockNow = now.Add(20 * time.Minute)
+		res, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(time.Minute))
+		Expect(kvClient.imported).To(BeEmpty())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+	})
+
+	It("does not touch Key Vault until the propagation grace has elapsed", func() {
+		// A certificate that has only just become valid must not be used to
+		// authenticate to Key Vault at all; the sync waits out the remainder of
+		// the grace window in one go.
+		certPEM, keyPEM, _ := genCert("kv4.ezca.io", now.Add(-1*time.Minute), now.Add(90*day))
+		createSecret("kv4-secret", certPEM, keyPEM)
+
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv4-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv4-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+
+		kvClient.matchCalls = 0
+		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.matchCalls).To(Equal(0), "must not authenticate to Key Vault during the grace window")
+		Expect(kvClient.imported).To(BeEmpty())
+		Expect(res.RequeueAfter).To(Equal(propagationGrace - time.Minute))
+
+		// Once the grace has elapsed the sync proceeds.
+		clockNow = now.Add(6 * time.Minute)
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.matchCalls).To(Equal(1))
+		Expect(kvClient.imported).To(HaveLen(1))
 	})
 
 	It("degrades when the certificate Secret is missing", func() {
-		cci := createIdentity("missing", "nonexistent-secret", false)
+		cci := createIdentity("missing", "nonexistent-secret", ezcav1.CloudPublic, false)
 
 		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		Expect(err).NotTo(HaveOccurred())
@@ -419,9 +548,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("does not rewrite status on a steady-state reconcile", func() {
-		certPEM, keyPEM, _ := genCert("noop.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("noop.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("noop-secret", certPEM, keyPEM)
-		cci := createIdentity("noop", "noop-secret", false)
+		cci := createIdentity("noop", "noop-secret", ezcav1.CloudPublic, false)
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
 
 		_, err := reconciler.Reconcile(ctx, req)
@@ -441,7 +570,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		// A cert whose NotBefore is well in the past has already propagated, even
 		// if it was only just promoted (recent LastRenewalTime). The grace is keyed
 		// off NotBefore, so Key Vault sync must proceed rather than defer.
-		certPEM, keyPEM, _ := genCert("kv3.ezca.io", now.Add(-10*24*time.Hour), now.Add(90*24*time.Hour))
+		certPEM, keyPEM, _ := genCert("kv3.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("kv3-secret", certPEM, keyPEM)
 
 		ezcaURL := testEZCAURL
