@@ -440,8 +440,8 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		numExpired := randv2.IntN(6) + 5
 
-		var managedKeys []ezcav1.ManagedKeyCredential
-		var keyIDs []string
+		managedKeys := make([]ezcav1.ManagedKeyCredential, 0, numExpired)
+		keyIDs := make([]string, 0, numExpired)
 		for i := range numExpired {
 			amountExpired := time.Duration(i+1) * day
 			keyID := "expired-key-" + fmt.Sprint(i)
