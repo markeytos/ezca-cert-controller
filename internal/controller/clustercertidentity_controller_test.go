@@ -45,15 +45,6 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
-// behavior to test:
-// certificate only does not touch app registration and key vault
-// without key vault, does not touch key vault
-// pending certificate waits propagationGrace before being promoted
-// pending certificate waits propagationGrace before being added to keyvault (because we need to authenticate as the app)
-// expired certificates are removed from the app
-// certificate is updated in keyvault
-// if secret cannot be found at first, running reconcile again after it has been added heals properly
-
 // Shared test fixtures used across the controller test suite.
 const (
 	testEZCAURL  = "https://portal.ezca.io"
@@ -266,6 +257,35 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(cci.Status.Thumbprint).To(Equal(pki.Thumbprint(parsedNew)))
 	})
 
+	It("does not touch the app registration or Key Vault for a certificate-only identity", func() {
+		certPEM, keyPEM, _ := genCert("certonly.ezca.io", now.Add(-90*day), now.Add(10*day))
+		createSecret("certonly-secret", certPEM, keyPEM)
+		cci := createIdentity("certonly", "certonly-secret", ezcav1.CloudPublic, false)
+
+		_, _, parsedNew := genCert("certonly.ezca.io", now, now.Add(100*day))
+		ezcaClient.newChain = []*x509.Certificate{parsedNew}
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ezcaClient.called).To(BeTrue())
+
+		// No app registration configured: it must never be touched.
+		Expect(entraClient.added).To(BeEmpty())
+		Expect(entraClient.removed).To(BeEmpty())
+		Expect(entraClient.verifyCalls).To(Equal(0))
+
+		// No Key Vault configured: it must never be touched either.
+		Expect(kvClient.matchCalls).To(Equal(0))
+		Expect(kvClient.imported).To(BeEmpty())
+
+		// The renewed certificate is still promoted straight into the Secret.
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "certonly-secret", Namespace: namespace}, &secret)).To(Succeed())
+		chain, err := pki.ParseCertChainPEM(secret.Data[tlsCertKey])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain[0].Equal(parsedNew)).To(BeTrue())
+	})
+
 	It("adds the renewed cert to the app, waits for propagation, then promotes it", func() {
 		certPEM, keyPEM, oldCert := genCert("app.ezca.io", now.Add(-90*day), now.Add(10*day))
 		createSecret("app-secret", certPEM, keyPEM)
@@ -442,6 +462,38 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+	})
+
+	It("does not touch Key Vault when it is not configured", func() {
+		certPEM, keyPEM, _ := genCert("noapp-kv.ezca.io", now.Add(-90*day), now.Add(10*day))
+		createSecret("noapp-kv-secret", certPEM, keyPEM)
+		// App is configured, but KeyVault is left unset.
+		cci := createIdentity("noapp-kv", "noapp-kv-secret", ezcav1.CloudPublic, true)
+
+		_, _, parsedNew := genCert("noapp-kv.ezca.io", now, now.Add(100*day))
+		ezcaClient.newChain = []*x509.Certificate{parsedNew}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		// Reconcile #1: stage the renewed cert against the app registration.
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(entraClient.added).To(HaveLen(1), "app registration is configured, so it must be used")
+
+		// Reconcile #2: past the grace window and authenticating -> promote.
+		clockNow = now.Add(propagationGrace)
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "noapp-kv-secret", Namespace: namespace}, &secret)).To(Succeed())
+		chain, err := pki.ParseCertChainPEM(secret.Data[tlsCertKey])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain[0].Equal(parsedNew)).To(BeTrue())
+
+		// Key Vault was never configured, so it must never be touched even though
+		// the app-registration flow ran to completion.
+		Expect(kvClient.matchCalls).To(Equal(0))
+		Expect(kvClient.imported).To(BeEmpty())
 	})
 
 	It("imports the certificate into Key Vault when it differs, and skips when it matches", func() {
