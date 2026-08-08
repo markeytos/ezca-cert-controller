@@ -42,6 +42,15 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
+// behavior to test:
+// certificate only does not touch app registration and key vault
+// without key vault, does not touch key vault
+// pending certificate waits propagationGrace before being promoted
+// pending certificate waits propagationGrace before being added to keyvault (because we need to authenticate as the app)
+// expired certificates are removed from the app
+// certificate is updated in keyvault
+// if secret cannot be found at first, running reconcile again after it has been added heals properly
+
 // Shared test fixtures used across the controller test suite.
 const (
 	testEZCAURL  = "https://portal.ezca.io"

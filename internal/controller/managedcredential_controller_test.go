@@ -48,6 +48,9 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
+// behavior to test:
+// if secret cannot be found at first, running reconcile again after it has been added heals properly
+
 type fakeIssuer struct {
 	chain  []*x509.Certificate
 	called bool
@@ -659,5 +662,49 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		other := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "mc-other-ns", Name: "mc-shared-sec"}})
 		Expect(other).NotTo(ContainElement(want))
+	})
+
+	It("heals when a Secret is not found at first and no identityRef is set", func() {
+		mcName := "mc-heals"
+		mc := newManagedCredential(mcName, "mc-shared-sec", "", "CN=map.ezca.io", []string{"map.ezca.io"})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// First pass: the Secret is missing and the credential cannot
+		// self-bootstrap (no identityRef), so it takes the requireBootstrap
+		// branch: nothing is issued, it requeues, and it goes Degraded.
+		res := reconcileMC(mcName)
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeFalse())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		// The controller must not create the Secret on the credential's behalf.
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-shared-sec"}, &secret)).ShouldNot(Succeed())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("CertificateNotBootstrapped"))
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeFalse())
+		Expect(mc.Status.Thumbprint).To(BeEmpty())
+
+		// An administrator provisions the certificate into the Secret.
+		certPEM, keyPEM, issued := genCert("CN=map.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
+		createSecret("mc-shared-sec", certPEM, keyPEM)
+
+		// Second pass: the Secret now exists with a valid certificate. Because the
+		// credential still has no identityRef it does not re-issue; it adopts the
+		// externally provisioned certificate and goes Available.
+		reconcileMC(mcName)
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeFalse())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+		// The observed certificate is the one the administrator provisioned.
+		Expect(mc.Status.Thumbprint).To(Equal(pki.Thumbprint(issued)))
+		Expect(mc.Status.PendingThumbprint).To(BeEmpty())
 	})
 })
