@@ -261,12 +261,16 @@ func LeafMatchesSpec(cert *x509.Certificate, req CertRequest) bool {
 	return true
 }
 
+// oidExtKeyUsageClientAuth is the dotted OID for the TLS client-authentication
+// extended key usage, shared between the lookup table and the tests.
+const oidExtKeyUsageClientAuth = "1.3.6.1.5.5.7.3.2"
+
 // extKeyUsageOID maps the parsed x509 extended key usages back to their dotted
 // OID strings, so a certificate's EKUs can be compared against a request.
 var extKeyUsageOID = map[x509.ExtKeyUsage]string{
 	x509.ExtKeyUsageAny:                            "2.5.29.37.0",
 	x509.ExtKeyUsageServerAuth:                     "1.3.6.1.5.5.7.3.1",
-	x509.ExtKeyUsageClientAuth:                     "1.3.6.1.5.5.7.3.2",
+	x509.ExtKeyUsageClientAuth:                     oidExtKeyUsageClientAuth,
 	x509.ExtKeyUsageCodeSigning:                    "1.3.6.1.5.5.7.3.3",
 	x509.ExtKeyUsageEmailProtection:                "1.3.6.1.5.5.7.3.4",
 	x509.ExtKeyUsageIPSECEndSystem:                 "1.3.6.1.5.5.7.3.5",

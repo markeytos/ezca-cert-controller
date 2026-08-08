@@ -58,6 +58,8 @@ const (
 	testUUID1    = "11111111-1111-1111-1111-111111111111"
 	testObjectID = "obj-1"
 	day          = 24 * time.Hour
+	certName     = "mycert"
+	vaultName    = "myvault"
 )
 
 type fakeEZCA struct {
@@ -181,7 +183,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			Type:       corev1.SecretTypeTLS,
-			Data:       map[string][]byte{"tls.crt": certPEM, "tls.key": keyPEM},
+			Data:       map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 	}
@@ -251,7 +253,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		// Secret was rewritten with the renewed certificate.
 		var secret corev1.Secret
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "renew-secret", Namespace: namespace}, &secret)).To(Succeed())
-		chain, err := pki.ParseCertChainPEM(secret.Data["tls.crt"])
+		chain, err := pki.ParseCertChainPEM(secret.Data[tlsCertKey])
 		Expect(err).NotTo(HaveOccurred())
 		Expect(chain[0].Equal(parsedNew)).To(BeTrue())
 
@@ -272,7 +274,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		activeLeaf := func() *x509.Certificate {
 			var s corev1.Secret
 			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
-			chain, err := pki.ParseCertChainPEM(s.Data["tls.crt"])
+			chain, err := pki.ParseCertChainPEM(s.Data[tlsCertKey])
 			Expect(err).NotTo(HaveOccurred())
 			return chain[0]
 		}
@@ -355,7 +357,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		activeLeaf := func() *x509.Certificate {
 			var s corev1.Secret
 			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
-			chain, err := pki.ParseCertChainPEM(s.Data["tls.crt"])
+			chain, err := pki.ParseCertChainPEM(s.Data[tlsCertKey])
 			Expect(err).NotTo(HaveOccurred())
 			return chain[0]
 		}
@@ -424,7 +426,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:    &tenant,
 					AppID:       &app,
 					AppObjectID: &objectID,
-					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -470,7 +472,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -522,7 +524,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -597,7 +599,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: "myvault", CertName: "mycert"},
+					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},

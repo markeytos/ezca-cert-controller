@@ -25,6 +25,11 @@ import (
 	"github.com/microsoft/ApplicationInsights-Go/appinsights/contracts"
 )
 
+const (
+	propIdentity = "identity"
+	identityApp  = "app"
+)
+
 // fakeClient captures tracked telemetry without contacting Application
 // Insights. The embedded interface is nil; only Track is ever called by the
 // code under test, so the other methods are never reached.
@@ -51,7 +56,7 @@ func TestNewNoopWhenEmpty(t *testing.T) {
 			t.Fatalf("expected disabled telemetry for %v", cs)
 		}
 		// All methods must be safe no-ops.
-		tel.TrackEvent("CertificateRenewed", map[string]string{"identity": "x"})
+		tel.TrackEvent("CertificateRenewed", map[string]string{propIdentity: "x"})
 		tel.TrackError(errors.New("boom"), "failed", nil)
 		tel.Flush(time.Second)
 		if tel.client != nil {
@@ -99,7 +104,7 @@ func TestNewEnabled(t *testing.T) {
 
 func TestTrackEventForwardsNameAndProps(t *testing.T) {
 	tel, fake := enabledWithFake()
-	tel.TrackEvent("CertificateRenewed", map[string]string{"identity": "app"})
+	tel.TrackEvent("CertificateRenewed", map[string]string{propIdentity: identityApp})
 
 	if len(fake.tracked) != 1 {
 		t.Fatalf("expected 1 tracked item, got %d", len(fake.tracked))
@@ -111,14 +116,14 @@ func TestTrackEventForwardsNameAndProps(t *testing.T) {
 	if ev.Name != "CertificateRenewed" {
 		t.Fatalf("event name = %q", ev.Name)
 	}
-	if ev.Properties["identity"] != "app" {
+	if ev.Properties[propIdentity] != identityApp {
 		t.Fatalf("event properties not copied: %v", ev.Properties)
 	}
 }
 
 func TestTrackErrorTracksTraceAndException(t *testing.T) {
 	tel, fake := enabledWithFake()
-	tel.TrackError(errors.New("boom"), "renewal failed", map[string]string{"identity": "app"})
+	tel.TrackError(errors.New("boom"), "renewal failed", map[string]string{propIdentity: identityApp})
 
 	// An error produces both an error-severity trace and an exception.
 	if len(fake.tracked) != 2 {
@@ -131,7 +136,7 @@ func TestTrackErrorTracksTraceAndException(t *testing.T) {
 	if trace.Message != "renewal failed" || trace.SeverityLevel != contracts.Error {
 		t.Fatalf("trace = %q sev=%v", trace.Message, trace.SeverityLevel)
 	}
-	if trace.Properties["error"] != "boom" || trace.Properties["identity"] != "app" {
+	if trace.Properties["error"] != "boom" || trace.Properties[propIdentity] != identityApp {
 		t.Fatalf("trace properties: %v", trace.Properties)
 	}
 	if _, ok := fake.tracked[1].(*appinsights.ExceptionTelemetry); !ok {

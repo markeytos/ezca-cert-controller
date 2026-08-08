@@ -41,7 +41,7 @@ func makeCert(t *testing.T, notBefore, notAfter time.Time) (*x509.Certificate, *
 	uri, _ := url.Parse("spiffe://cluster/app")
 	tmpl := &x509.Certificate{
 		SerialNumber:   big.NewInt(1),
-		Subject:        pkix.Name{CommonName: cn, Organization: []string{"Keytos"}},
+		Subject:        pkix.Name{CommonName: cn, Organization: []string{testOrg}},
 		NotBefore:      notBefore,
 		NotAfter:       notAfter,
 		DNSNames:       []string{cn, "alt." + cn},
@@ -187,7 +187,13 @@ func TestBuildRenewalCSRPreservesIdentity(t *testing.T) {
 	}
 }
 
-const testDNSName = "app.example.com"
+const (
+	testDNSName = "app.example.com"
+	testCN      = "app"
+	testOU      = "team"
+	testOrg     = "Keytos"
+	testEmail   = "admin@example.com"
+)
 
 func TestBuildIssuanceCSRPreservesFullDN(t *testing.T) {
 	req := CertRequest{
@@ -202,13 +208,13 @@ func TestBuildIssuanceCSRPreservesFullDN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if csr.Subject.CommonName != "app" {
+	if csr.Subject.CommonName != testCN {
 		t.Fatalf("CN: %q", csr.Subject.CommonName)
 	}
-	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != "team" {
+	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != testOU {
 		t.Fatalf("OU not preserved: %v", csr.Subject.OrganizationalUnit)
 	}
-	if len(csr.Subject.Organization) != 1 || csr.Subject.Organization[0] != "Keytos" {
+	if len(csr.Subject.Organization) != 1 || csr.Subject.Organization[0] != testOrg {
 		t.Fatalf("O not preserved: %v", csr.Subject.Organization)
 	}
 	if len(csr.Subject.Country) != 1 || csr.Subject.Country[0] != "US" {
@@ -272,9 +278,9 @@ func makeLeafCert(t *testing.T, tmpl *x509.Certificate) *x509.Certificate {
 func TestLeafMatchesSpecMatches(t *testing.T) {
 	uri, _ := url.Parse("spiffe://cluster/app")
 	cert := makeLeafCert(t, &x509.Certificate{
-		Subject:        pkix.Name{CommonName: "app", Organization: []string{"Keytos"}, Country: []string{"US"}},
-		DNSNames:       []string{"app.example.com", "alt.example.com"},
-		EmailAddresses: []string{"admin@example.com"},
+		Subject:        pkix.Name{CommonName: testCN, Organization: []string{testOrg}, Country: []string{"US"}},
+		DNSNames:       []string{testDNSName, "alt.example.com"},
+		EmailAddresses: []string{testEmail},
 		IPAddresses:    []net.IP{net.ParseIP("10.0.0.1")},
 		URIs:           []*url.URL{uri},
 		KeyUsage:       x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -284,12 +290,12 @@ func TestLeafMatchesSpecMatches(t *testing.T) {
 		// Type casing and spacing differ from the encoded subject; the
 		// symmetric canonicalization must absorb it.
 		SubjectName:     "cn=app,  o=Keytos , c=US",
-		DNSNames:        []string{"alt.example.com", "app.example.com"}, // reordered
-		EmailAddresses:  []string{"admin@example.com"},
+		DNSNames:        []string{"alt.example.com", testDNSName}, // reordered
+		EmailAddresses:  []string{testEmail},
 		IPAddresses:     []net.IP{net.ParseIP("10.0.0.1")},
 		URIs:            []*url.URL{uri},
 		KeyUsage:        x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsageOIDs: []string{"1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.1"}, // reordered
+		ExtKeyUsageOIDs: []string{oidExtKeyUsageClientAuth, "1.3.6.1.5.5.7.3.1"}, // reordered
 	}
 	if !LeafMatchesSpec(cert, req) {
 		t.Fatalf("expected match despite cosmetic ordering/spacing differences")
@@ -297,18 +303,18 @@ func TestLeafMatchesSpecMatches(t *testing.T) {
 }
 
 func TestLeafMatchesSpecBareCommonName(t *testing.T) {
-	cert := makeLeafCert(t, &x509.Certificate{Subject: pkix.Name{CommonName: "app.example.com"}})
+	cert := makeLeafCert(t, &x509.Certificate{Subject: pkix.Name{CommonName: testDNSName}})
 	// A request subject with no "=" is treated as a bare common name.
-	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "app.example.com"}) {
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: testDNSName}) {
 		t.Fatalf("expected bare common name to match")
 	}
 }
 
 func TestLeafMatchesSpecDetectsDrift(t *testing.T) {
 	base := &x509.Certificate{
-		Subject:        pkix.Name{CommonName: "app"},
-		DNSNames:       []string{"app.example.com"},
-		EmailAddresses: []string{"admin@example.com"},
+		Subject:        pkix.Name{CommonName: testCN},
+		DNSNames:       []string{testDNSName},
+		EmailAddresses: []string{testEmail},
 		IPAddresses:    []net.IP{net.ParseIP("10.0.0.1")},
 		KeyUsage:       x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -320,11 +326,11 @@ func TestLeafMatchesSpecDetectsDrift(t *testing.T) {
 		req  CertRequest
 	}{
 		{"subject", CertRequest{SubjectName: "other"}},
-		{"dns", CertRequest{SubjectName: "app", DNSNames: []string{"other.example.com"}}},
-		{"email", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"nope@example.com"}}},
-		{"ip", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.2")}}},
-		{"keyusage", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, KeyUsage: x509.KeyUsageCertSign}},
-		{"eku", CertRequest{SubjectName: "app", DNSNames: []string{"app.example.com"}, EmailAddresses: []string{"admin@example.com"}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, ExtKeyUsageOIDs: []string{"1.3.6.1.5.5.7.3.2"}}},
+		{"dns", CertRequest{SubjectName: testCN, DNSNames: []string{"other.example.com"}}},
+		{"email", CertRequest{SubjectName: testCN, DNSNames: []string{testDNSName}, EmailAddresses: []string{"nope@example.com"}}},
+		{"ip", CertRequest{SubjectName: testCN, DNSNames: []string{testDNSName}, EmailAddresses: []string{testEmail}, IPAddresses: []net.IP{net.ParseIP("10.0.0.2")}}},
+		{"keyusage", CertRequest{SubjectName: testCN, DNSNames: []string{testDNSName}, EmailAddresses: []string{testEmail}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, KeyUsage: x509.KeyUsageCertSign}},
+		{"eku", CertRequest{SubjectName: testCN, DNSNames: []string{testDNSName}, EmailAddresses: []string{testEmail}, IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}, ExtKeyUsageOIDs: []string{oidExtKeyUsageClientAuth}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -337,7 +343,7 @@ func TestLeafMatchesSpecDetectsDrift(t *testing.T) {
 
 func TestLeafMatchesSpecIgnoresRDNOrder(t *testing.T) {
 	cert := makeLeafCert(t, &x509.Certificate{
-		Subject: pkix.Name{CommonName: "app", Organization: []string{"corp"}, OrganizationalUnit: []string{"team"}},
+		Subject: pkix.Name{CommonName: testCN, Organization: []string{"corp"}, OrganizationalUnit: []string{testOU}},
 	})
 	// The request lists the same RDNs in a different order; order must not matter.
 	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "O=corp,OU=team,CN=app"}) {
@@ -350,13 +356,13 @@ func TestLeafMatchesSpecIgnoresRDNOrder(t *testing.T) {
 
 func TestLeafMatchesSpecIgnoresUnsetUsages(t *testing.T) {
 	cert := makeLeafCert(t, &x509.Certificate{
-		Subject:     pkix.Name{CommonName: "app"},
+		Subject:     pkix.Name{CommonName: testCN},
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
 	// KeyUsage 0 and empty ExtKeyUsageOIDs mean "issuer chose", so a differing
 	// certificate must still match.
-	if !LeafMatchesSpec(cert, CertRequest{SubjectName: "app"}) {
+	if !LeafMatchesSpec(cert, CertRequest{SubjectName: testCN}) {
 		t.Fatalf("unset key usages should not be compared")
 	}
 }
@@ -404,10 +410,10 @@ func TestSubjectFromNameMultiValuedRDN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if csr.Subject.CommonName != "app" {
+	if csr.Subject.CommonName != testCN {
 		t.Fatalf("CN: %q", csr.Subject.CommonName)
 	}
-	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != "team" {
+	if len(csr.Subject.OrganizationalUnit) != 1 || csr.Subject.OrganizationalUnit[0] != testOU {
 		t.Fatalf("multi-valued RDN not parsed: %v", csr.Subject.OrganizationalUnit)
 	}
 }

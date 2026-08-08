@@ -119,18 +119,21 @@ func genCertRich(cn string, dns []string, ips []net.IP, uris []*url.URL, emails 
 
 var _ = Describe("ManagedCredential Controller", func() {
 	const (
-		namespace   = "default"
-		caID        = testUUID0
-		templateID  = testUUID1
-		parentTntID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-		parentAppID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-		ownTntID    = "cccccccc-cccc-cccc-cccc-cccccccccccc"
-		ownAppID    = "dddddddd-dddd-dddd-dddd-dddddddddddd"
-		dnOld       = "old.ezca.io"
-		dnNew       = "new.ezca.io"
-		dnRenew     = "renew.ezca.io"
-		dnFB        = "fb.ezca.io"
-		dnKU        = "ku.ezca.io"
+		namespace    = "default"
+		caID         = testUUID0
+		templateID   = testUUID1
+		parentTntID  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+		parentAppID  = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+		parentObjID  = "parent-obj"
+		noRefDomain  = "noref.ezca.io"
+		sharedSecret = "mc-shared-sec"
+		ownTntID     = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		ownAppID     = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		dnOld        = "old.ezca.io"
+		dnNew        = "new.ezca.io"
+		dnRenew      = "renew.ezca.io"
+		dnFB         = "fb.ezca.io"
+		dnKU         = "ku.ezca.io"
 	)
 	now := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -174,7 +177,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			Type:       corev1.SecretTypeTLS,
-			Data:       map[string][]byte{"tls.crt": certPEM, "tls.key": keyPEM},
+			Data:       map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM},
 		}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 	}
@@ -186,7 +189,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		certPEM, keyPEM, _ := genCert("parent.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
 		createSecret(secretName, certPEM, keyPEM)
 		ezcaURL := testEZCAURL
-		tnt, app, obj := parentTntID, parentAppID, "parent-obj"
+		tnt, app, obj := parentTntID, parentAppID, parentObjID
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: ezcav1.ClusterCertIdentitySpec{
@@ -212,7 +215,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		certPEM, keyPEM, _ := genCert("parent.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
 		createSecret(secretName, certPEM, keyPEM)
 		ezcaURL := testEZCAURL
-		tnt, app, obj := parentTntID, parentAppID, "parent-obj"
+		tnt, app, obj := parentTntID, parentAppID, parentObjID
 		ci := &ezcav1.CertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			Spec: ezcav1.CertIdentitySpec{
@@ -287,8 +290,8 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		var secret corev1.Secret
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-boot-sec"}, &secret)).To(Succeed())
-		Expect(secret.Data).To(HaveKey("tls.crt"))
-		Expect(secret.Data).To(HaveKey("tls.key"))
+		Expect(secret.Data).To(HaveKey(tlsCertKey))
+		Expect(secret.Data).To(HaveKey(tlsKeyKey))
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-boot"}, mc)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
@@ -312,7 +315,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		var secret corev1.Secret
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-ci-sec"}, &secret)).To(Succeed())
-		Expect(secret.Data).To(HaveKey("tls.crt"))
+		Expect(secret.Data).To(HaveKey(tlsCertKey))
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-ci"}, mc)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 	})
@@ -426,12 +429,12 @@ var _ = Describe("ManagedCredential Controller", func() {
 		// The Secret is bootstrapped by an administrator; with no identityRef the
 		// controller renews it (the certificate authenticates its own renewal to
 		// EZCA) and never issues.
-		certPEM, keyPEM, _ := genCertSANs("noref.ezca.io", []string{"noref.ezca.io"}, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		certPEM, keyPEM, _ := genCertSANs(noRefDomain, []string{noRefDomain}, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
 		createSecret("mc-noref-sec", certPEM, keyPEM)
-		_, _, renewed := genCertSANs("noref.ezca.io", []string{"noref.ezca.io"}, now, now.Add(365*24*time.Hour))
+		_, _, renewed := genCertSANs(noRefDomain, []string{noRefDomain}, now, now.Add(365*24*time.Hour))
 		ezcaClient.newChain = []*x509.Certificate{renewed}
 
-		mc := newManagedCredential("mc-noref", "mc-noref-sec", "", "CN=noref.ezca.io", []string{"noref.ezca.io"})
+		mc := newManagedCredential("mc-noref", "mc-noref-sec", "", "CN=noref.ezca.io", []string{noRefDomain})
 		mc.Spec.IdentityRef = nil
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 
@@ -491,7 +494,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		empty := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc-empty-sec", Namespace: namespace},
 			Type:       corev1.SecretTypeTLS,
-			Data:       map[string][]byte{"tls.crt": {}, "tls.key": {}},
+			Data:       map[string][]byte{tlsCertKey: {}, tlsKeyKey: {}},
 		}
 		Expect(k8sClient.Create(ctx, empty)).To(Succeed())
 
@@ -603,7 +606,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		// No prior serving cert, so the bootstrapped cert is written active.
 		var secret corev1.Secret
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-appboot-sec"}, &secret)).To(Succeed())
-		Expect(secret.Data).To(HaveKey("tls.crt"))
+		Expect(secret.Data).To(HaveKey(tlsCertKey))
 		Expect(secret.Data).NotTo(HaveKey("tls.crt.pending"))
 	})
 
@@ -612,7 +615,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		certPEM, keyPEM, _ := genCert("parent.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
 		createSecret("mcp-deny-sec", certPEM, keyPEM)
 		ezcaURL := testEZCAURL
-		tnt, app, obj := parentTntID, parentAppID, "parent-obj"
+		tnt, app, obj := parentTntID, parentAppID, parentObjID
 		cci := &ezcav1.ClusterCertIdentity{
 			ObjectMeta: metav1.ObjectMeta{Name: "mcp-deny"},
 			Spec: ezcav1.ClusterCertIdentitySpec{
@@ -652,21 +655,21 @@ var _ = Describe("ManagedCredential Controller", func() {
 	})
 
 	It("maps a Secret change only to ManagedCredentials in the same namespace", func() {
-		mc := newManagedCredential("mc-map", "mc-shared-sec", "", "CN=map.ezca.io", []string{"map.ezca.io"})
+		mc := newManagedCredential("mc-map", sharedSecret, "", "CN=map.ezca.io", []string{"map.ezca.io"})
 		mc.Spec.IdentityRef = nil
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 		want := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mc-map"}}
 
-		same := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "mc-shared-sec"}})
+		same := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: sharedSecret}})
 		Expect(same).To(ContainElement(want))
 
-		other := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "mc-other-ns", Name: "mc-shared-sec"}})
+		other := reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "mc-other-ns", Name: sharedSecret}})
 		Expect(other).NotTo(ContainElement(want))
 	})
 
 	It("heals when a Secret is not found at first and no identityRef is set", func() {
 		mcName := "mc-heals"
-		mc := newManagedCredential(mcName, "mc-shared-sec", "", "CN=map.ezca.io", []string{"map.ezca.io"})
+		mc := newManagedCredential(mcName, sharedSecret, "", "CN=map.ezca.io", []string{"map.ezca.io"})
 		mc.Spec.IdentityRef = nil
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 
@@ -679,7 +682,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 		// The controller must not create the Secret on the credential's behalf.
 		var secret corev1.Secret
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-shared-sec"}, &secret)).ShouldNot(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: sharedSecret}, &secret)).ShouldNot(Succeed())
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
 		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
@@ -691,7 +694,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		// An administrator provisions the certificate into the Secret.
 		certPEM, keyPEM, issued := genCert("CN=map.ezca.io", now.Add(-24*time.Hour), now.Add(365*24*time.Hour))
-		createSecret("mc-shared-sec", certPEM, keyPEM)
+		createSecret(sharedSecret, certPEM, keyPEM)
 
 		// Second pass: the Secret now exists with a valid certificate. Because the
 		// credential still has no identityRef it does not re-issue; it adopts the
