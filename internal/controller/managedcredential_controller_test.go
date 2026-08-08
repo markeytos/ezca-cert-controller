@@ -48,9 +48,6 @@ import (
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
 )
 
-// behavior to test:
-// if secret cannot be found at first, running reconcile again after it has been added heals properly
-
 type fakeIssuer struct {
 	chain  []*x509.Certificate
 	called bool
@@ -709,5 +706,60 @@ var _ = Describe("ManagedCredential Controller", func() {
 		// The observed certificate is the one the administrator provisioned.
 		Expect(mc.Status.Thumbprint).To(Equal(pki.Thumbprint(issued)))
 		Expect(mc.Status.PendingThumbprint).To(BeEmpty())
+	})
+
+	It("does not renew when we have not hit the renewal threshold but does when we have", func() {
+		mcName := "mc-hits"
+		domain := "hits.ezca.io"
+		secretName := "mc-secret-hits"
+		cn := "CN=" + domain
+		mc := newManagedCredential(mcName, secretName, "", cn, []string{domain})
+		mc.Spec.IdentityRef = nil
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		certPEM, keyPEM, issued := genCert(cn, now.Add(-day), now.Add(year))
+		createSecret(secretName, certPEM, keyPEM)
+
+		res := reconcileMC(mcName)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeFalse())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+		// the certificate has not been renewed, no pending
+		Expect(mc.Status.Thumbprint).To(Equal(pki.Thumbprint(issued)))
+		Expect(mc.Status.PendingThumbprint).To(BeEmpty())
+
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+
+		// jump forward 364 days
+		clockNow = clockNow.Add(364 * day)
+
+		_, _, renewed := genCert(cn, clockNow.Add(-day), clockNow.Add(year))
+		ezcaClient.newChain = []*x509.Certificate{renewed}
+
+		reconcileMC(mcName)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(ezcaClient.called).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+		Expect(mc.Status.Thumbprint).To(Equal(pki.Thumbprint(renewed)))
+		Expect(mc.Status.PendingThumbprint).To(BeEmpty())
+
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretName}, &secret)).Should(Succeed())
+		Expect(secret.Data).To(HaveKey(tlsCertKey))
+		Expect(secret.Data).To(HaveKey(tlsKeyKey))
+
+		secretPEM := secret.Data[tlsCertKey]
+		certs, err := pki.ParseCertChainPEM(secretPEM)
+		thumbInSecret := pki.Thumbprint(certs[0])
+		renewedThumb := pki.Thumbprint(renewed)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(thumbInSecret).To(Equal(renewedThumb))
+
+		Expect(secret.Data).NotTo(HaveKey(tlsCertPendingKey))
+		Expect(secret.Data).NotTo(HaveKey(tlsKeyPendingKey))
 	})
 })

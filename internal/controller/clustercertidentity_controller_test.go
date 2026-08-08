@@ -24,8 +24,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"time"
+
+	randv2 "math/rand/v2"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -58,6 +61,7 @@ const (
 	testUUID1    = "11111111-1111-1111-1111-111111111111"
 	testObjectID = "obj-1"
 	day          = 24 * time.Hour
+	year         = 365 * day
 	certName     = "mycert"
 	vaultName    = "myvault"
 )
@@ -401,6 +405,40 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ezcaClient.called).To(BeFalse()) // healthy cert, not renewed
 		Expect(entraClient.removed).To(ConsistOf("expired-key"))
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+	})
+
+	It("removes many expired managed credentials from the app", func() {
+		secretName := "cleanup-many-secret"
+		certPEM, keyPEM, _ := genCert("cleanup.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret(secretName, certPEM, keyPEM)
+		cci := createIdentity(secretName, secretName, ezcav1.CloudPublic, true)
+
+		// Seed an expired managed credential that still exists on the app.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		numExpired := randv2.IntN(6) + 5
+
+		var managedKeys []ezcav1.ManagedKeyCredential
+		var keyIDs []string
+		for i := range numExpired {
+			amountExpired := time.Duration(i+1) * day
+			keyID := "expired-key-" + fmt.Sprint(i)
+			managedKeys = append(managedKeys, ezcav1.ManagedKeyCredential{
+				Thumbprint: "OLD-" + fmt.Sprint(i),
+				KeyID:      keyID,
+				NotAfter:   metav1.Time{Time: now.Add(-amountExpired)},
+			})
+			keyIDs = append(keyIDs, keyID)
+		}
+		cci.Status.ManagedKeyCredentials = managedKeys
+		Expect(k8sClient.Status().Update(ctx, cci)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ezcaClient.called).To(BeFalse()) // healthy cert, not renewed
+		Expect(entraClient.removed).To(ConsistOf(keyIDs))
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 		Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
