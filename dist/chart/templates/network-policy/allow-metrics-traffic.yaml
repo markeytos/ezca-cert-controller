@@ -1,4 +1,4 @@
-{{- if .Values.networkPolicy.enabled }}
+{{- if .Values.controller.networkPolicy.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -20,6 +20,6 @@ spec:
           matchLabels:
             metrics: enabled
       ports:
-        - port: {{ .Values.metrics.port }}
+        - port: {{ .Values.controller.metrics.port }}
           protocol: TCP
 {{- end }}

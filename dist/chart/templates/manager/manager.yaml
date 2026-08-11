@@ -1,4 +1,4 @@
-{{- if or (not (hasKey .Values.manager "enabled")) (.Values.manager.enabled) }}
+{{- if or (not (hasKey .Values.controller.manager "enabled")) (.Values.controller.manager.enabled) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,22 +8,22 @@ metadata:
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     control-plane: controller-manager
-    {{- with .Values.manager.labels }}
+    {{- with .Values.controller.manager.labels }}
     {{- with omit . "app.kubernetes.io/managed-by" "app.kubernetes.io/name" "helm.sh/chart" "app.kubernetes.io/instance" "control-plane" }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
     {{- end }}
   name: {{ include "ezca-cert-controller.resourceName" (dict "suffix" "controller-manager" "context" $) }}
   namespace: {{ .Release.Namespace }}
-  {{- if .Values.manager.annotations }}
+  {{- if .Values.controller.manager.annotations }}
   annotations:
-    {{- toYaml .Values.manager.annotations | nindent 4 }}
+    {{- toYaml .Values.controller.manager.annotations | nindent 4 }}
   {{- end }}
 spec:
-  {{- with .Values.manager.strategy }}
+  {{- with .Values.controller.manager.strategy }}
   strategy: {{ toYaml . | nindent 6 }}
   {{- end }}
-  replicas: {{ .Values.manager.replicas }}
+  replicas: {{ .Values.controller.manager.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "ezca-cert-controller.name" . }}
@@ -32,7 +32,7 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
-        {{- with .Values.manager.pod }}
+        {{- with .Values.controller.manager.pod }}
         {{- with .annotations }}
         {{- with omit . "kubectl.kubernetes.io/default-container" }}
         {{- toYaml . | nindent 8 }}
@@ -45,7 +45,7 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/managed-by: {{ .Release.Service }}
         control-plane: controller-manager
-        {{- with .Values.manager.pod }}
+        {{- with .Values.controller.manager.pod }}
         {{- with .labels }}
         {{- with omit . "app.kubernetes.io/name" "helm.sh/chart" "app.kubernetes.io/instance" "app.kubernetes.io/managed-by" "control-plane" }}
         {{- toYaml . | nindent 8 }}
@@ -53,30 +53,30 @@ spec:
         {{- end }}
         {{- end }}
     spec:
-      {{- with .Values.manager.topologySpreadConstraints }}
+      {{- with .Values.controller.manager.topologySpreadConstraints }}
       topologySpreadConstraints: {{ toYaml . | nindent 10 }}
       {{- end }}
-      {{- with .Values.manager.priorityClassName }}
+      {{- with .Values.controller.manager.priorityClassName }}
       priorityClassName: {{ . | quote }}
       {{- end }}
-      {{- with .Values.manager.tolerations }}
+      {{- with .Values.controller.manager.tolerations }}
       tolerations: {{ toYaml . | nindent 10 }}
       {{- end }}
-      {{- with .Values.manager.affinity }}
+      {{- with .Values.controller.manager.affinity }}
       affinity: {{ toYaml . | nindent 10 }}
       {{- end }}
-      {{- with .Values.manager.nodeSelector }}
+      {{- with .Values.controller.manager.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 10 }}
       {{- end }}
-      {{- with .Values.manager.imagePullSecrets }}
+      {{- with .Values.controller.manager.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
       - args:
-        {{- if .Values.metrics.enabled }}
-        - --metrics-bind-address=:{{ .Values.metrics.port }}
-        {{- if not .Values.metrics.secure }}
+        {{- if .Values.controller.metrics.enabled }}
+        - --metrics-bind-address=:{{ .Values.controller.metrics.port }}
+        {{- if not .Values.controller.metrics.secure }}
         - --metrics-secure=false
         {{- end }}
         {{- else }}
@@ -84,18 +84,18 @@ spec:
         - --metrics-bind-address=0
         {{- end }}
         - --health-probe-bind-address=:8081
-        {{- range .Values.manager.args }}
+        {{- range .Values.controller.manager.args }}
         - {{ . }}
         {{- end }}
         command:
         - /manager
         env:
-{{- if or .Values.manager.env (and (kindIs "map" .Values.manager.envOverrides) (not (empty .Values.manager.envOverrides))) }}
-          {{- if .Values.manager.env }}
-          {{- toYaml .Values.manager.env | nindent 10 }}
+{{- if or .Values.controller.manager.env (and (kindIs "map" .Values.controller.manager.envOverrides) (not (empty .Values.controller.manager.envOverrides))) }}
+          {{- if .Values.controller.manager.env }}
+          {{- toYaml .Values.controller.manager.env | nindent 10 }}
           {{- end }}
-          {{- if kindIs "map" .Values.manager.envOverrides }}
-          {{- range $k, $v := .Values.manager.envOverrides }}
+          {{- if kindIs "map" .Values.controller.manager.envOverrides }}
+          {{- range $k, $v := .Values.controller.manager.envOverrides }}
           - name: {{ $k }}
             value: {{ $v | quote }}
           {{ end }}
@@ -103,8 +103,8 @@ spec:
           {{- else }}
           []
           {{- end }}
-        image: "{{ .Values.manager.image.repository }}{{- if not (contains "@" .Values.manager.image.repository) }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }}{{- end }}"
-        {{- with .Values.manager.image.pullPolicy }}
+        image: "{{ .Values.controller.manager.image.repository }}{{- if not (contains "@" .Values.controller.manager.image.repository) }}:{{ .Values.controller.manager.image.tag | default .Chart.AppVersion }}{{- end }}"
+        {{- with .Values.controller.manager.image.pullPolicy }}
         imagePullPolicy: {{ . }}
         {{- end }}
         livenessProbe:
@@ -125,36 +125,36 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 10
         resources:
-          {{- if .Values.manager.resources }}
-          {{- toYaml .Values.manager.resources | nindent 10 }}
+          {{- if .Values.controller.manager.resources }}
+          {{- toYaml .Values.controller.manager.resources | nindent 10 }}
           {{- else }}
           {}
           {{- end }}
         securityContext:
-          {{- if .Values.manager.securityContext }}
-          {{- toYaml .Values.manager.securityContext | nindent 10 }}
+          {{- if .Values.controller.manager.securityContext }}
+          {{- toYaml .Values.controller.manager.securityContext | nindent 10 }}
           {{- else }}
           {}
           {{- end }}
         volumeMounts:
-          {{- if .Values.manager.extraVolumeMounts }}
-          {{- toYaml .Values.manager.extraVolumeMounts | nindent 10 }}
+          {{- if .Values.controller.manager.extraVolumeMounts }}
+          {{- toYaml .Values.controller.manager.extraVolumeMounts | nindent 10 }}
           {{- else }}
           []
           {{- end }}
       securityContext:
-        {{- if .Values.manager.podSecurityContext }}
-        {{- toYaml .Values.manager.podSecurityContext | nindent 8 }}
+        {{- if .Values.controller.manager.podSecurityContext }}
+        {{- toYaml .Values.controller.manager.podSecurityContext | nindent 8 }}
         {{- else }}
         {}
         {{- end }}
       serviceAccountName: {{ include "ezca-cert-controller.serviceAccountName" . }}
-      {{- if and (hasKey .Values.manager "terminationGracePeriodSeconds") (ne .Values.manager.terminationGracePeriodSeconds nil) }}
-      terminationGracePeriodSeconds: {{ .Values.manager.terminationGracePeriodSeconds }}
+      {{- if and (hasKey .Values.controller.manager "terminationGracePeriodSeconds") (ne .Values.controller.manager.terminationGracePeriodSeconds nil) }}
+      terminationGracePeriodSeconds: {{ .Values.controller.manager.terminationGracePeriodSeconds }}
       {{- end }}
       volumes:
-        {{- if .Values.manager.extraVolumes }}
-        {{- toYaml .Values.manager.extraVolumes | nindent 8 }}
+        {{- if .Values.controller.manager.extraVolumes }}
+        {{- toYaml .Values.controller.manager.extraVolumes | nindent 8 }}
         {{- else }}
         []
         {{- end }}

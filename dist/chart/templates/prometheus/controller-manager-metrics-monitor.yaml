@@ -1,4 +1,4 @@
-{{- if .Values.prometheus.enabled }}
+{{- if .Values.controller.prometheus.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -12,16 +12,16 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   endpoints:
-  - {{- if .Values.metrics.secure }}
+  - {{- if .Values.controller.metrics.secure }}
     bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     {{- end }}
     path: /metrics
-    port: {{ if .Values.metrics.secure }}https{{ else }}http{{ end }}
-    scheme: {{ if .Values.metrics.secure }}https{{ else }}http{{ end }}
-    {{- if .Values.metrics.secure }}
+    port: {{ if .Values.controller.metrics.secure }}https{{ else }}http{{ end }}
+    scheme: {{ if .Values.controller.metrics.secure }}https{{ else }}http{{ end }}
+    {{- if .Values.controller.metrics.secure }}
     tlsConfig:
       serverName: {{ include "ezca-cert-controller.resourceName" (dict "suffix" "controller-manager-metrics-service" "context" $) }}.{{ .Release.Namespace }}.svc
-      {{- if .Values.certManager.enabled }}
+      {{- if .Values.controller.certManager.enabled }}
       ca:
         secret:
           name: metrics-server-cert

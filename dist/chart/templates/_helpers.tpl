@@ -2,7 +2,7 @@
 Expand the name of the chart.
 */}}
 {{- define "ezca-cert-controller.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- default .Chart.Name .Values.controller.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
@@ -11,10 +11,10 @@ We truncate at 63 chars because some Kubernetes name fields are limited to this 
 If release name contains chart name it will be used as a full name.
 */}}
 {{- define "ezca-cert-controller.fullname" -}}
-{{- if .Values.fullnameOverride }}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- if .Values.controller.fullnameOverride }}
+{{- .Values.controller.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
-{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- $name := default .Chart.Name .Values.controller.nameOverride }}
 {{- if contains $name .Release.Name }}
 {{- .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -55,8 +55,8 @@ If serviceAccount.enabled is false and serviceAccount.name is set, use that name
 Otherwise, use the standard resourceName helper with "controller-manager" suffix.
 */}}
 {{- define "ezca-cert-controller.serviceAccountName" -}}
-{{- if and (not (.Values.serviceAccount.enabled | default true)) .Values.serviceAccount.name }}
-{{- .Values.serviceAccount.name }}
+{{- if and (not (.Values.controller.serviceAccount.enabled | default true)) .Values.controller.serviceAccount.name }}
+{{- .Values.controller.serviceAccount.name }}
 {{- else }}
 {{- include "ezca-cert-controller.resourceName" (dict "suffix" "controller-manager" "context" .) }}
 {{- end }}

@@ -20,23 +20,23 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
 {{/*
 ezca.baseSpec — renders the shared CertIdentitySpecBase fields for one CR.
 
-Call: {{ include "ezca.baseSpec" (dict "item" <perCRmap> "root" .Values) }}
+Call: {{ include "ezca.baseSpec" (dict "item" <perCRmap> "root" .Values.global) }}
 
 Field ownership:
-  - ROOT-ONLY (from $root, never overridable per item): ezcaURL, cloud, tenantID,
-    appInsightsConnString.
+  - GLOBAL (from $root = .Values.global, never overridable per item): ezcaURL,
+    cloud, tenantID, appInsightsConnString.
   - PER-ITEM (from $item): appID, appObjectID, certSecretName, renewalThreshold,
     keyVault.
 
 The CRD CEL rules require tenantID+appID+appObjectID to be set together, and
-keyVault requires the app fields. The root tenantID pairs with each item's own
+keyVault requires the app fields. The global tenantID pairs with each item's own
 appID/appObjectID; the trio is emitted only when all three resolve, so the CEL
 constraint is always satisfied.
 */}}
 {{- define "ezca.baseSpec" -}}
 {{- $item := .item -}}
 {{- $root := .root -}}
-ezcaURL: {{ required "ezcaURL must be set at the top level of values.yaml" $root.ezcaURL | quote }}
+ezcaURL: {{ required "global.ezcaURL must be set in values.yaml" $root.ezcaURL | quote }}
 {{- if $root.cloud }}
 cloud: {{ $root.cloud }}
 {{- end }}
@@ -45,7 +45,7 @@ tenantID: {{ $root.tenantID | quote }}
 appID: {{ $item.appID | quote }}
 appObjectID: {{ $item.appObjectID | quote }}
 {{- else if or $item.appID $item.appObjectID }}
-{{- fail "appID and appObjectID must be set together with a top-level tenantID (CRD CEL: tenantID/appID/appObjectID are all-or-nothing)" }}
+{{- fail "appID and appObjectID must be set together with global.tenantID (CRD CEL: tenantID/appID/appObjectID are all-or-nothing)" }}
 {{- end }}
 {{- if $root.appInsightsConnString }}
 appInsightsConnString: {{ $root.appInsightsConnString | quote }}
@@ -55,9 +55,12 @@ certSecretName: {{ $item.certSecretName | quote }}
 {{- end }}
 renewalThreshold: {{ default 20 $item.renewalThreshold }}
 {{- if $item.keyVault }}
+{{- if and (or $item.keyVault.vaultName $item.keyVault.certName) (not (and $item.keyVault.vaultName $item.keyVault.certName)) }}
+{{- fail "keyVault needs both vaultName and certName; set both to enable Key Vault sync, or neither to disable it" }}
+{{- end }}
 {{- if and $item.keyVault.vaultName $item.keyVault.certName }}
 {{- if not (and $root.tenantID $item.appID $item.appObjectID) }}
-{{- fail "keyVault requires the Entra app fields (top-level tenantID plus this item's appID/appObjectID); the certificate authenticates to Key Vault as that app" }}
+{{- fail "keyVault requires the Entra app fields (global.tenantID plus this item's appID/appObjectID); the certificate authenticates to Key Vault as that app" }}
 {{- end }}
 keyVault:
   vaultName: {{ $item.keyVault.vaultName | quote }}
