@@ -1,0 +1,19 @@
+# Config for `helm schema` (losisin/helm-values-schema-json), which generates
+# values.schema.json from the `# @schema` annotations in values.yaml.
+# Run it through `make helm-schema` from the repo root.
+values:
+  - values.yaml
+output: values.schema.json
+draft: 2020
+indent: 2
+bundle: true
+# Inline the referenced subschemas without $id, so editors using Microsoft's JSON
+# language server (VS Code) resolve them too. Helm handles either form.
+bundleWithoutID: true
+schemaRoot:
+  title: ezca-cert-controller values
+  description: >-
+    Generated from values.yaml — do not edit by hand. Helm validates the merged
+    values (chart defaults plus every -f/--set) against this file on install,
+    upgrade, template, lint and package.
+  additionalProperties: false

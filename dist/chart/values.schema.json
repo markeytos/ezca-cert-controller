@@ -1,0 +1,873 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ezca-cert-controller values",
+  "description": "Generated from values.yaml — do not edit by hand. Helm validates the merged values (chart defaults plus every -f/--set) against this file on install, upgrade, template, lint and package.",
+  "type": "object",
+  "properties": {
+    "appCerts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/app-cert.schema.yaml"
+      }
+    },
+    "clusterIdentity": {
+      "$ref": "#/$defs/cluster-identity.schema.yaml",
+      "type": "object",
+      "properties": {
+        "allowedNamespaces": {
+          "type": "array"
+        },
+        "appID": {
+          "type": "string"
+        },
+        "appObjectID": {
+          "type": "string"
+        },
+        "certSecretName": {
+          "type": "string"
+        },
+        "certSecretNamespace": {
+          "type": "string"
+        },
+        "keyVault": {
+          "type": "object",
+          "properties": {
+            "certName": {
+              "type": "string"
+            },
+            "vaultName": {
+              "type": "string"
+            }
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "renewalThreshold": {
+          "type": "integer"
+        }
+      }
+    },
+    "controller": {
+      "$ref": "#/$defs/controller.schema.yaml",
+      "type": "object",
+      "properties": {
+        "certManager": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "crd": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "keep": {
+              "type": "boolean"
+            }
+          }
+        },
+        "fullnameOverride": {
+          "type": "string"
+        },
+        "manager": {
+          "type": "object",
+          "properties": {
+            "affinity": {
+              "type": "object"
+            },
+            "annotations": {
+              "type": "object"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "env": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "valueFrom": {
+                    "type": "object",
+                    "properties": {
+                      "fieldRef": {
+                        "type": "object",
+                        "properties": {
+                          "fieldPath": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "envOverrides": {
+              "type": "object"
+            },
+            "extraVolumeMounts": {
+              "type": "array"
+            },
+            "extraVolumes": {
+              "type": "array"
+            },
+            "image": {
+              "type": "object",
+              "properties": {
+                "pullPolicy": {
+                  "type": "string"
+                },
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": "string"
+                }
+              }
+            },
+            "imagePullSecrets": {
+              "type": "array"
+            },
+            "labels": {
+              "type": "object"
+            },
+            "nodeSelector": {
+              "type": "object"
+            },
+            "pod": {
+              "type": "object",
+              "properties": {
+                "annotations": {
+                  "type": "object"
+                },
+                "labels": {
+                  "type": "object"
+                }
+              }
+            },
+            "podSecurityContext": {
+              "type": "object",
+              "properties": {
+                "runAsNonRoot": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "priorityClassName": {
+              "type": "string"
+            },
+            "replicas": {
+              "type": "integer"
+            },
+            "resources": {
+              "type": "object"
+            },
+            "securityContext": {
+              "type": "object",
+              "properties": {
+                "allowPrivilegeEscalation": {
+                  "type": "boolean"
+                },
+                "readOnlyRootFilesystem": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "strategy": {
+              "type": "object"
+            },
+            "terminationGracePeriodSeconds": {
+              "type": "integer"
+            },
+            "tolerations": {
+              "type": "array"
+            },
+            "topologySpreadConstraints": {
+              "type": "array"
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "secure": {
+              "type": "boolean"
+            }
+          }
+        },
+        "nameOverride": {
+          "type": "string"
+        },
+        "networkPolicy": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "prometheus": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "rbac": {
+          "type": "object",
+          "properties": {
+            "helpers": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "namespaced": {
+              "type": "boolean"
+            }
+          }
+        },
+        "serviceAccount": {
+          "type": "object",
+          "properties": {
+            "annotations": {
+              "type": "object"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "labels": {
+              "type": "object"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "global": {
+      "$ref": "#/$defs/global.schema.yaml",
+      "type": "object",
+      "properties": {
+        "appInsightsConnString": {
+          "type": "string"
+        },
+        "cloud": {
+          "type": "string"
+        },
+        "ezcaURL": {
+          "type": "string"
+        },
+        "tenantID": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "app-cert.schema.yaml": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "appCerts entry",
+      "description": "One ManagedCredential. subjectName, caID and templateID identify what to issue; everything else is optional.",
+      "type": "object",
+      "required": [
+        "subjectName",
+        "caID",
+        "templateID"
+      ],
+      "properties": {
+        "appID": {
+          "description": "Entra app (client) ID. Pairs with appObjectID and the root tenantID.",
+          "type": "string"
+        },
+        "appObjectID": {
+          "description": "Entra directory object ID of that app registration.",
+          "type": "string"
+        },
+        "caID": {
+          "description": "EZCA SSL CA that issues the certificate.",
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "certSecretName": {
+          "description": "Issued-certificate Secret. Defaults to this entry's name.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+          "maxLength": 253
+        },
+        "dnsNames": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "emailAddresses": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "extendedKeyUsages": {
+          "description": "Empty means ServerAuth + ClientAuth.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "Any",
+              "ServerAuth",
+              "ClientAuth",
+              "CodeSigning",
+              "EmailProtection",
+              "IPSECEndSystem",
+              "IPSECTunnel",
+              "IPSECUser",
+              "TimeStamping",
+              "OCSPSigning",
+              "MicrosoftServerGatedCrypto",
+              "NetscapeServerGatedCrypto",
+              "MicrosoftCommercialCodeSigning",
+              "MicrosoftKernelCodeSigning"
+            ]
+          }
+        },
+        "identityRef": {
+          "description": "Identity that bootstraps first issuance. Required only when issuing into an empty Secret.",
+          "type": "object",
+          "required": [
+            "name",
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "ClusterCertIdentity",
+                "CertIdentity"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "ipAddresses": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "keyUsages": {
+          "description": "Empty means DigitalSignature + KeyEncipherment.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "DigitalSignature",
+              "KeyEncipherment",
+              "DataEncipherment",
+              "KeyAgreement",
+              "NonRepudiation"
+            ]
+          }
+        },
+        "keyVault": {
+          "description": "Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.",
+          "type": "object",
+          "properties": {
+            "certName": {
+              "type": "string"
+            },
+            "vaultName": {
+              "description": "Vault name, not the full URL.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "dependentRequired": {
+            "certName": [
+              "vaultName"
+            ],
+            "vaultName": [
+              "certName"
+            ]
+          }
+        },
+        "name": {
+          "description": "metadata.name. Defaults to app-cert-\u003cn\u003e.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+          "maxLength": 253
+        },
+        "namespace": {
+          "description": "metadata.namespace. Blank means the release namespace.",
+          "type": "string",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "maxLength": 63
+        },
+        "renewalThreshold": {
+          "description": "Percent of lifetime remaining at/below which to renew.",
+          "type": "integer",
+          "maximum": 99,
+          "minimum": 1
+        },
+        "subjectName": {
+          "description": "Full RFC 4514 DN (CN=app,O=corp) or a bare CN (app.example.com).",
+          "type": "string",
+          "minLength": 1
+        },
+        "templateID": {
+          "description": "EZCA template used when issuing.",
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "uris": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "validityInDays": {
+          "description": "Requested lifetime. Unset means the issuer default (90 days).",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "dependentRequired": {
+        "appID": [
+          "appObjectID"
+        ],
+        "appObjectID": [
+          "appID"
+        ]
+      }
+    },
+    "cluster-identity.schema.yaml": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "clusterIdentity",
+      "description": "The bootstrap identity other credentials authenticate as. Rendered only when name is set.",
+      "type": "object",
+      "properties": {
+        "allowedNamespaces": {
+          "description": "Namespaces whose ManagedCredentials may reference this identity via identityRef. Blank means the release namespace alone.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "appID": {
+          "description": "Entra app (client) ID whose certificate credentials are rotated. Set with appObjectID and global.tenantID, or leave all blank for a certificate-only identity.",
+          "type": "string"
+        },
+        "appObjectID": {
+          "description": "Entra directory object ID of that app registration (the object's id, not the appId).",
+          "type": "string"
+        },
+        "certSecretName": {
+          "description": "Pre-existing kubernetes.io/tls Secret holding the bootstrap certificate. The chart references it and never creates it.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+          "maxLength": 253
+        },
+        "certSecretNamespace": {
+          "description": "Namespace of that Secret. Blank means the release namespace.",
+          "type": "string",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "maxLength": 63
+        },
+        "keyVault": {
+          "description": "Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.",
+          "type": "object",
+          "properties": {
+            "certName": {
+              "type": "string"
+            },
+            "vaultName": {
+              "description": "Vault name, not the full URL.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "dependentRequired": {
+            "certName": [
+              "vaultName"
+            ],
+            "vaultName": [
+              "certName"
+            ]
+          }
+        },
+        "name": {
+          "description": "metadata.name of the ClusterCertIdentity. Blank means none is created.",
+          "type": "string",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+          "maxLength": 253
+        },
+        "renewalThreshold": {
+          "description": "Percent of lifetime remaining at/below which to renew.",
+          "type": "integer",
+          "maximum": 99,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "dependentRequired": {
+        "appID": [
+          "appObjectID"
+        ],
+        "appObjectID": [
+          "appID"
+        ]
+      }
+    },
+    "controller.schema.yaml": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "controller",
+      "description": "Runtime settings for the operator. The defaults install a working controller.",
+      "type": "object",
+      "properties": {
+        "certManager": {
+          "description": "cert-manager integration for webhook and metrics certificates.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "crd": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Install the CRDs with the chart.",
+              "type": "boolean"
+            },
+            "keep": {
+              "description": "Keep the CRDs, and therefore the CRs, on uninstall.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "fullnameOverride": {
+          "description": "Fully override the generated resource names.",
+          "type": "string"
+        },
+        "manager": {
+          "description": "The controller manager Deployment.",
+          "type": "object",
+          "properties": {
+            "affinity": {
+              "type": "object"
+            },
+            "annotations": {
+              "description": "Extra annotations on the Deployment.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "enabled": {
+              "description": "Set to false to skip installing the manager.",
+              "type": "boolean"
+            },
+            "env": {
+              "description": "Raw Kubernetes env entries.",
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "envOverrides": {
+              "description": "Flat NAME=value map; wins over an env entry of the same name.",
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            },
+            "extraVolumeMounts": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "extraVolumes": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "image": {
+              "type": "object",
+              "properties": {
+                "pullPolicy": {
+                  "enum": [
+                    "Always",
+                    "IfNotPresent",
+                    "Never"
+                  ]
+                },
+                "repository": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "tag": {
+                  "description": "Defaults to Chart.appVersion when blank.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "imagePullSecrets": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "labels": {
+              "description": "Extra labels on the Deployment.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "nodeSelector": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "pod": {
+              "description": "Extra labels and annotations on the pod template.",
+              "type": "object",
+              "properties": {
+                "annotations": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "labels": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "podSecurityContext": {
+              "description": "Pod-level securityContext, passed through as-is.",
+              "type": "object"
+            },
+            "priorityClassName": {
+              "type": "string"
+            },
+            "replicas": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "resources": {
+              "description": "Container resources, passed through as-is.",
+              "type": "object"
+            },
+            "securityContext": {
+              "description": "Container-level securityContext, passed through as-is.",
+              "type": "object"
+            },
+            "strategy": {
+              "description": "Deployment strategy, passed through as-is.",
+              "type": "object"
+            },
+            "terminationGracePeriodSeconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tolerations": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "topologySpreadConstraints": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer",
+              "maximum": 65535,
+              "minimum": 1
+            },
+            "secure": {
+              "description": "HTTPS with certs and authn/authz (true) or plain HTTP (false).",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "nameOverride": {
+          "description": "Partially override the generated resource names, keeping the release name.",
+          "type": "string"
+        },
+        "networkPolicy": {
+          "description": "NetworkPolicies restricting ingress to the manager.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "prometheus": {
+          "description": "Prometheus ServiceMonitor for metrics scraping. Needs prometheus-operator.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "rbac": {
+          "type": "object",
+          "properties": {
+            "helpers": {
+              "description": "Convenience admin/editor/viewer roles for the CRDs.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            },
+            "namespaced": {
+              "description": "true renders Role/RoleBinding scoped to the release namespace instead of ClusterRole/ClusterRoleBinding.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "serviceAccount": {
+          "type": "object",
+          "properties": {
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "enabled": {
+              "description": "Install the ServiceAccount provided by the chart.",
+              "type": "boolean"
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "name": {
+              "description": "Name of an existing ServiceAccount, used only when enabled is false.",
+              "type": "string",
+              "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "global.schema.yaml": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "global",
+      "description": "Settings shared by every ClusterCertIdentity and ManagedCredential the chart renders.",
+      "type": "object",
+      "required": [
+        "ezcaURL"
+      ],
+      "properties": {
+        "appInsightsConnString": {
+          "description": "Optional Application Insights connection string. When set, renewals, rotations and errors are reported for every certificate.",
+          "type": "string"
+        },
+        "cloud": {
+          "description": "Azure sovereign cloud used to reach Entra ID and Microsoft Graph.",
+          "enum": [
+            "Public",
+            "USGov"
+          ]
+        },
+        "ezcaURL": {
+          "description": "Base URL of the EZCA instance that issues and renews the certificates.",
+          "type": "string",
+          "pattern": "^https://[^\\s]+$"
+        },
+        "tenantID": {
+          "description": "Entra ID (Azure AD) tenant that owns the app registrations. Blank turns Entra credential rotation off everywhere; when set it pairs with each item's appID/appObjectID.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
