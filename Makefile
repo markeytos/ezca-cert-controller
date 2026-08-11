@@ -279,11 +279,25 @@ install-helm: ## Install the latest version of Helm.
 ## Version of the helm-values-schema-json plugin used to generate values.schema.json
 HELM_SCHEMA_PLUGIN_VERSION ?= 2.5.0
 
+## Source of the helm schema plugin
+HELM_SCHEMA_PLUGIN_URL ?= https://github.com/losisin/helm-values-schema-json
+
 .PHONY: install-helm-schema
 install-helm-schema: install-helm ## Install the helm schema plugin used by helm-schema.
-	@$(HELM) plugin list | grep -q '^schema' || \
-		$(HELM) plugin install https://github.com/losisin/helm-values-schema-json \
-			--version $(HELM_SCHEMA_PLUGIN_VERSION) --verify=false
+	@installed="$$($(HELM) plugin list 2>/dev/null)"; \
+	case "$$installed" in \
+	*schema*) exit 0 ;; \
+	esac; \
+	usage="$$($(HELM) plugin install --help 2>&1)"; \
+	case "$$usage" in \
+	*--verify*) \
+		: "Helm 4 verifies plugin signatures by default; this source is unsigned." ; \
+		$(HELM) plugin install $(HELM_SCHEMA_PLUGIN_URL) \
+			--version $(HELM_SCHEMA_PLUGIN_VERSION) --verify=false ;; \
+	*) \
+		$(HELM) plugin install $(HELM_SCHEMA_PLUGIN_URL) \
+			--version $(HELM_SCHEMA_PLUGIN_VERSION) ;; \
+	esac
 
 .PHONY: helm-schema
 helm-schema: install-helm-schema ## Regenerate dist/chart/values.schema.json from the @schema annotations in values.yaml.
