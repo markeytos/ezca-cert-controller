@@ -50,6 +50,11 @@ jobs:
         run: |
           helm lint ./dist/chart
 
+        # values.schema.json is generated from the @schema annotations in
+        # values.yaml, so a values change without a regenerated schema fails here.
+      - name: Check values.schema.json is up to date
+        run: make helm-schema-check
+
         # TODO: Uncomment if cert-manager is enabled
         #      - name: Install cert-manager via Helm (wait for readiness)
         #        run: |

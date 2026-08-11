@@ -276,13 +276,36 @@ install-helm: ## Install the latest version of Helm.
 		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; \
 	}
 
+## Version of the helm-values-schema-json plugin used to generate values.schema.json
+HELM_SCHEMA_PLUGIN_VERSION ?= 2.5.0
+
+.PHONY: install-helm-schema
+install-helm-schema: install-helm ## Install the helm schema plugin used by helm-schema.
+	@$(HELM) plugin list | grep -q '^schema' || \
+		$(HELM) plugin install https://github.com/losisin/helm-values-schema-json \
+			--version $(HELM_SCHEMA_PLUGIN_VERSION) --verify=false
+
+.PHONY: helm-schema
+helm-schema: install-helm-schema ## Regenerate dist/chart/values.schema.json from the @schema annotations in values.yaml.
+	cd $(HELM_CHART_DIR) && $(HELM) schema
+
+.PHONY: helm-schema-check
+helm-schema-check: helm-schema ## Fail if values.schema.json is out of date with values.yaml.
+	@if [ -n "$$(git status --porcelain -- $(HELM_CHART_DIR)/values.schema.json)" ]; then \
+		git --no-pager diff -- $(HELM_CHART_DIR)/values.schema.json; \
+		echo ""; \
+		echo "values.schema.json is out of date with values.yaml."; \
+		echo "Run 'make helm-schema' and commit the result."; \
+		exit 1; \
+	fi
+
 .PHONY: helm-deploy
 helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
 	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
 		--namespace $(HELM_NAMESPACE) \
 		--create-namespace \
-		--set manager.image.repository=$${IMG%:*} \
-		--set manager.image.tag=$${IMG##*:} \
+		--set controller.manager.image.repository=$${IMG%:*} \
+		--set controller.manager.image.tag=$${IMG##*:} \
 		--wait \
 		--timeout 5m \
 		$(HELM_EXTRA_ARGS)
