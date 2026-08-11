@@ -34,8 +34,9 @@ kubectl -n ezca-cert-controller-system create secret tls cluster-cert-identity \
 To configure the Helm chart, you will need to create a `values.yaml` file. Here is an example:
 
 ```yaml
-ezcaURL: https://portal.ezca.io
-tenantID: "00000000-0000-0000-0000-000000000000"
+global:
+  ezcaURL: https://portal.ezca.io
+  tenantID: "00000000-0000-0000-0000-000000000000"
 
 clusterIdentity:
   name: master-cert-identity-1
@@ -80,8 +81,8 @@ but every part is optional — you configure only the behavior you need:
 - **Certificates only.** Give an entry a `subjectName`, `caID`, and `templateID`
   and the controller issues and renews that certificate into a Secret. Nothing
   else is required.
-- **Entra credential rotation.** Add `appID` / `appObjectID` (with the top-level
-  `tenantID`) and the controller also installs each renewed certificate onto that
+- **Entra credential rotation.** Add `appID` / `appObjectID` (with
+  `global.tenantID`) and the controller also installs each renewed certificate onto that
   Entra app registration, removing the old credential once it expires.
 - **Key Vault sync.** Add `keyVault` and the controller keeps the named Key Vault
   certificate in step with the Secret, re-importing whenever they diverge. This
@@ -144,19 +145,44 @@ This will not delete the CRDs from your cluster. You must delete them manually i
 > See [`dist/chart/values.yaml`](dist/chart/values.yaml) for the authoritative,
 > commented list of every setting.
 
+The chart ships a JSON Schema ([`values.schema.json`](dist/chart/values.schema.json))
+that Helm checks your values against on `install`, `upgrade`, `template` and `lint`.
+Misspelled keys, bad enum values, out-of-range thresholds and malformed UUIDs are
+reported before anything reaches the cluster:
+
+```
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+ezca-cert-controller:
+- at '/appCerts/0': additional properties 'dnsName' not allowed
+```
+
+That file is **generated**: each section of `values.yaml` points at a readable
+schema in [`dist/chart/schemas/`](dist/chart/schemas) — `global.schema.yaml`,
+`cluster-identity.schema.yaml`, `app-cert.schema.yaml`, `controller.schema.yaml` —
+which `make helm-schema` bundles into `values.schema.json`. Edit the schema files,
+never the generated one; CI fails if the two are out of step.
+
+Your values file only ever needs the certificate settings documented below. The
+operator's own runtime — image, replicas, RBAC scope, metrics, scheduling — lives
+under a single `controller:` key whose defaults install a working controller; see
+the second half of [`values.yaml`](dist/chart/values.yaml) if you need to reach in.
+
 The chart renders **one** `ClusterCertIdentity` (from `clusterIdentity`) and **one**
 `ManagedCredential` per entry in `appCerts`.
 
-**Root-only fields** are set once at the top level and applied to *every* generated CR.
+### `global` — settings shared by every certificate
+
+**Global fields** are set once and applied to *every* generated CR; they cannot be
+overridden per item.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `cloud` | `Public` | Azure sovereign cloud for Entra ID / Graph. One of `Public`, `USGov`. |
-| `ezcaURL` | `https://portal.ezca.io` | Base URL of your EZCA instance. **Required.** |
-| `tenantID` | `""` | Entra tenant that owns the app registrations. Only emitted on a CR that also sets `appID` + `appObjectID`. |
-| `appInsightsConnString` | `""` | Optional App Insights connection string; when set, renewals/rotations/errors are reported. |
+| `global.cloud` | `Public` | Azure sovereign cloud for Entra ID / Graph. One of `Public`, `USGov`. |
+| `global.ezcaURL` | `https://portal.ezca.io` | Base URL of your EZCA instance. **Required.** |
+| `global.tenantID` | `""` | Entra tenant that owns the app registrations. Only emitted on a CR that also sets `appID` + `appObjectID`. |
+| `global.appInsightsConnString` | `""` | Optional App Insights connection string; when set, renewals/rotations/errors are reported. |
 
-> **Entra fields are all-or-nothing.** The CRD requires `tenantID`, `appID`, and
+> **Entra fields are all-or-nothing.** The CRD requires `global.tenantID`, `appID`, and
 > `appObjectID` to be set together (or all absent). `keyVault` requires them too,
 > since the controller authenticates to the vault as that app. The chart fails
 > rendering if only some are set.
@@ -195,7 +221,7 @@ Zero or more entries; each with a `subjectName` renders one `ManagedCredential`.
 | `validityInDays` | no | Requested lifetime in days. Unset → issuer default (90 days). |
 | `certSecretName` | no | Name of the issued-cert Secret. |
 | `renewalThreshold` | no | Percent of lifetime remaining at/below which to renew (1–99, default 20). |
-| `appID` / `appObjectID` | no | Optional per-item Entra app (paired with root `tenantID`). |
+| `appID` / `appObjectID` | no | Optional per-item Entra app (paired with `global.tenantID`). |
 | `keyVault.vaultName` / `keyVault.certName` | no | Optional Key Vault sync; requires the app fields. |
 | `identityRef.name` / `identityRef.kind` | no | Identity that bootstraps first issuance. `kind` is `ClusterCertIdentity` or `CertIdentity`. Required only on first issuance into an empty Secret; omit if the Secret is provisioned externally. |
 
