@@ -1,0 +1,68 @@
+## Schema for `clusterIdentity:` in values.yaml — the one cluster-scoped
+## ClusterCertIdentity this chart renders. Bundled into values.schema.json by
+## `make helm-schema`.
+##
+## Keep in step with dist/chart/templates/cr/clustercertidentity.yaml and the
+## ClusterCertIdentity CRD.
+$schema: https://json-schema.org/draft/2020-12/schema
+title: clusterIdentity
+description: The bootstrap identity other credentials authenticate as. Rendered only when name is set.
+type: object
+additionalProperties: false
+
+properties:
+  name:
+    description: metadata.name of the ClusterCertIdentity. Blank means none is created.
+    type: string
+    maxLength: 253
+    pattern: ^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+
+  appID:
+    description: Entra app (client) ID whose certificate credentials are rotated. Set with appObjectID and global.tenantID, or leave all blank for a certificate-only identity.
+    type: string
+  appObjectID:
+    description: Entra directory object ID of that app registration (the object's id, not the appId).
+    type: string
+
+  certSecretName:
+    description: Pre-existing kubernetes.io/tls Secret holding the bootstrap certificate. The chart references it and never creates it.
+    type: string
+    maxLength: 253
+    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+  certSecretNamespace:
+    description: Namespace of that Secret. Blank means the release namespace.
+    type: string
+    maxLength: 63
+    pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+
+  renewalThreshold:
+    description: Percent of lifetime remaining at/below which to renew.
+    type: integer
+    minimum: 1
+    maximum: 99
+
+  allowedNamespaces:
+    description: Namespaces whose ManagedCredentials may reference this identity via identityRef. Blank means the release namespace alone.
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+
+  keyVault:
+    description: Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.
+    type: object
+    additionalProperties: false
+    properties:
+      vaultName:
+        description: Vault name, not the full URL.
+        type: string
+      certName:
+        type: string
+    dependentRequired:
+      vaultName: [certName]
+      certName: [vaultName]
+
+dependentRequired:
+  appID: [appObjectID]
+  appObjectID: [appID]

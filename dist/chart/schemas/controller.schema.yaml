@@ -1,0 +1,210 @@
+## Schema for `controller:` in values.yaml — how the operator itself is deployed.
+## Bundled into values.schema.json by `make helm-schema`.
+##
+## Kubernetes pass-through objects (resources, securityContext, affinity, …) are
+## deliberately free-form: they go straight into the Deployment, so constraining
+## them here would only reject valid Kubernetes.
+##
+## additionalProperties is false at every level the chart owns, so a key added to
+## values.yaml without a matching entry here fails `helm lint` immediately.
+$schema: https://json-schema.org/draft/2020-12/schema
+title: controller
+description: Runtime settings for the operator. The defaults install a working controller.
+type: object
+additionalProperties: false
+
+properties:
+  nameOverride:
+    description: Partially override the generated resource names, keeping the release name.
+    type: string
+  fullnameOverride:
+    description: Fully override the generated resource names.
+    type: string
+
+  manager:
+    description: The controller manager Deployment.
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: Set to false to skip installing the manager.
+        type: boolean
+      replicas:
+        type: integer
+        minimum: 0
+      image:
+        type: object
+        additionalProperties: false
+        properties:
+          repository:
+            type: string
+            minLength: 1
+          tag:
+            description: Defaults to Chart.appVersion when blank.
+            type: string
+          pullPolicy:
+            enum: [Always, IfNotPresent, Never]
+      args:
+        type: array
+        items:
+          type: string
+      env:
+        description: Raw Kubernetes env entries.
+        type: array
+        items:
+          type: object
+      envOverrides:
+        description: Flat NAME=value map; wins over an env entry of the same name.
+        type: object
+        additionalProperties:
+          type: [string, number, boolean]
+      imagePullSecrets:
+        type: array
+        items:
+          type: object
+      podSecurityContext:
+        description: Pod-level securityContext, passed through as-is.
+        type: object
+      securityContext:
+        description: Container-level securityContext, passed through as-is.
+        type: object
+      resources:
+        description: Container resources, passed through as-is.
+        type: object
+      affinity:
+        type: object
+      nodeSelector:
+        type: object
+        additionalProperties:
+          type: string
+      tolerations:
+        type: array
+        items:
+          type: object
+      topologySpreadConstraints:
+        type: array
+        items:
+          type: object
+      strategy:
+        description: Deployment strategy, passed through as-is.
+        type: object
+      priorityClassName:
+        type: string
+      terminationGracePeriodSeconds:
+        type: integer
+        minimum: 0
+      extraVolumes:
+        type: array
+        items:
+          type: object
+      extraVolumeMounts:
+        type: array
+        items:
+          type: object
+      labels:
+        description: Extra labels on the Deployment.
+        type: object
+        additionalProperties:
+          type: string
+      annotations:
+        description: Extra annotations on the Deployment.
+        type: object
+        additionalProperties:
+          type: string
+      pod:
+        description: Extra labels and annotations on the pod template.
+        type: object
+        additionalProperties: false
+        properties:
+          labels:
+            type: object
+            additionalProperties:
+              type: string
+          annotations:
+            type: object
+            additionalProperties:
+              type: string
+
+  rbac:
+    type: object
+    additionalProperties: false
+    properties:
+      namespaced:
+        description: true renders Role/RoleBinding scoped to the release namespace instead of ClusterRole/ClusterRoleBinding.
+        type: boolean
+      helpers:
+        description: Convenience admin/editor/viewer roles for the CRDs.
+        type: object
+        additionalProperties: false
+        properties:
+          enabled:
+            type: boolean
+
+  serviceAccount:
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: Install the ServiceAccount provided by the chart.
+        type: boolean
+      name:
+        description: Name of an existing ServiceAccount, used only when enabled is false.
+        type: string
+        pattern: ^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+      annotations:
+        type: object
+        additionalProperties:
+          type: string
+      labels:
+        type: object
+        additionalProperties:
+          type: string
+
+  crd:
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        description: Install the CRDs with the chart.
+        type: boolean
+      keep:
+        description: Keep the CRDs, and therefore the CRs, on uninstall.
+        type: boolean
+
+  metrics:
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        type: boolean
+      port:
+        type: integer
+        minimum: 1
+        maximum: 65535
+      secure:
+        description: HTTPS with certs and authn/authz (true) or plain HTTP (false).
+        type: boolean
+
+  certManager:
+    description: cert-manager integration for webhook and metrics certificates.
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        type: boolean
+
+  prometheus:
+    description: Prometheus ServiceMonitor for metrics scraping. Needs prometheus-operator.
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        type: boolean
+
+  networkPolicy:
+    description: NetworkPolicies restricting ingress to the manager.
+    type: object
+    additionalProperties: false
+    properties:
+      enabled:
+        type: boolean

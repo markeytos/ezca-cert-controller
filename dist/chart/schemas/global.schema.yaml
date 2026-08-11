@@ -1,0 +1,27 @@
+## Schema for `global:` in values.yaml — the settings applied to EVERY certificate
+## this chart manages. Bundled into values.schema.json by `make helm-schema`.
+##
+## These are the CertIdentitySpecBase fields the chart never lets you override per
+## item; see dist/chart/templates/_ezca_helpers.tpl.
+$schema: https://json-schema.org/draft/2020-12/schema
+title: global
+description: Settings shared by every ClusterCertIdentity and ManagedCredential the chart renders.
+type: object
+additionalProperties: false
+required:
+  - ezcaURL
+
+properties:
+  cloud:
+    description: Azure sovereign cloud used to reach Entra ID and Microsoft Graph.
+    enum: [Public, USGov]
+  ezcaURL:
+    description: Base URL of the EZCA instance that issues and renews the certificates.
+    type: string
+    pattern: ^https://[^\s]+$
+  tenantID:
+    description: Entra ID (Azure AD) tenant that owns the app registrations. Blank turns Entra credential rotation off everywhere; when set it pairs with each item's appID/appObjectID.
+    type: string
+  appInsightsConnString:
+    description: Optional Application Insights connection string. When set, renewals, rotations and errors are reported for every certificate.
+    type: string
