@@ -84,6 +84,9 @@ pull_dir=''
 cleanup() {
 	[ -n "$cli_config" ] && rm -f "$cli_config"
 	[ -n "$pull_dir" ] && rm -rf "$pull_dir"
+	# The certificate and key only need to live on disk long enough to be imported
+	# into the Secret; remove them so key material is not left sitting around.
+	rm -f "$cert_pem" "$cert_key"
 	return 0
 }
 trap cleanup EXIT
