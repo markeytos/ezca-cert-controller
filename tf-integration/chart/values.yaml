@@ -34,11 +34,6 @@ clusterIdentity:
   # appID: ""
   # appObjectID: ""
 
-  ## Key Vault sync. Builds on the Entra fields above.
-  # keyVault:
-  #   vaultName: my-keyvault
-  #   certName: master-identity
-
 ## Application certificates, one ManagedCredential per entry. Empty to start:
 ## add entries once the identity above is issuing successfully.
 appCerts: []

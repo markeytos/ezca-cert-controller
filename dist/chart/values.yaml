@@ -51,31 +51,26 @@ clusterIdentity:
   renewalThreshold: 20
   ## Namespaces allowed to reference this identity. Blank -> [release namespace].
   allowedNamespaces: []
-  ## Optional Key Vault certificate to keep in sync. Needs the Entra app fields.
-  keyVault:
-    vaultName: ""
-    certName: ""
 
 ## One ManagedCredential per entry — your application certificates.
 ## Fields: schemas/app-cert.schema.yaml
 # @schema itemRef: schemas/app-cert.schema.yaml
 appCerts: []
-  # - name: web-frontend-cert            # metadata.name (defaults to app-cert-<n>)
-  #   namespace: ""                       # blank -> release namespace
-  #   subjectName: web.example.com        # required
-  #   dnsNames: [web.example.com, www.example.com]
-  #   extendedKeyUsages: [ServerAuth]
-  #   validityInDays: 90
-  #   caID: "00000000-0000-0000-0000-000000000000"        # required (EZCA CA UUID)
-  #   templateID: "00000000-0000-0000-0000-000000000000"  # required (EZCA template UUID)
-  #   certSecretName: web-frontend-cert   # issued-cert Secret (defaults to name)
-  #   renewalThreshold: 20
-  #   appID: ""                           # optional per-item Entra app
-  #   appObjectID: ""
-  #   keyVault: {vaultName: "", certName: ""}
-  #   identityRef:                        # identity that bootstraps first issuance
-  #     name: master-cert-identity-1
-  #     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity
+# - name: web-frontend-cert            # metadata.name (defaults to app-cert-<n>)
+#   namespace: ""                       # blank -> release namespace
+#   subjectName: web.example.com        # required
+#   dnsNames: [web.example.com, www.example.com]
+#   extendedKeyUsages: [ServerAuth]
+#   validityInDays: 90
+#   caID: "00000000-0000-0000-0000-000000000000"        # required (EZCA CA UUID)
+#   templateID: "00000000-0000-0000-0000-000000000000"  # required (EZCA template UUID)
+#   certSecretName: web-frontend-cert   # issued-cert Secret (defaults to name)
+#   renewalThreshold: 20
+#   appID: ""                           # optional per-item Entra app
+#   appObjectID: ""
+#   identityRef:                        # identity that bootstraps first issuance
+#     name: master-cert-identity-1
+#     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity
 
 ## ─────────────────────────────────────────────────────────────────────────────
 ## Controller runtime — how the operator itself is deployed.
@@ -125,7 +120,7 @@ controller:
       # @schema hidden
       capabilities:
         drop:
-        - ALL
+          - ALL
       readOnlyRootFilesystem: true
 
     resources:
