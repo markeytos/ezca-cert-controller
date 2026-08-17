@@ -29,17 +29,6 @@
         "certSecretNamespace": {
           "type": "string"
         },
-        "keyVault": {
-          "type": "object",
-          "properties": {
-            "certName": {
-              "type": "string"
-            },
-            "vaultName": {
-              "type": "string"
-            }
-          }
-        },
         "name": {
           "type": "string"
         },
