@@ -574,6 +574,136 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(mc.Status.PendingThumbprint).To(Equal(pki.Thumbprint(issued)))
 	})
 
+	It("falls back to the identityRef when renewal fails and its own registered cert is expired", func() {
+		createParent("mcp-exp", "mcp-exp-sec")
+		// The current cert matches the spec and is still recorded as registered on
+		// the credential's own app, but it has expired — so it can no longer
+		// authenticate. Renewal fails, and the fallback re-issuance must NOT try to
+		// authenticate as the own app with the dead cert; it must use the identityRef
+		// so the credential can self-heal instead of deadlocking.
+		expPEM, expKeyPEM, expCert := genCertSANs(dnFB, []string{dnFB}, now.Add(-90*24*time.Hour), now.Add(-24*time.Hour))
+		createSecret("mc-exp-sec", expPEM, expKeyPEM)
+		ezcaClient.err = errors.New("cannot authenticate with an expired certificate")
+		_, _, issued := genCertSANs(dnFB, []string{dnFB}, now, now.Add(365*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+
+		mc := newManagedCredential("mc-exp", "mc-exp-sec", "mcp-exp", "CN=fb.ezca.io", []string{dnFB})
+		tnt, app, obj := ownTntID, ownAppID, "exp-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// Record the (now expired) current cert as registered in the own app.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-exp"}, mc)).To(Succeed())
+		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+			Thumbprint: pki.Thumbprint(expCert),
+			KeyID:      "key-1",
+			NotAfter:   metav1.Time{Time: expCert.NotAfter},
+		}}
+		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-exp")
+
+		Expect(ezcaClient.called).To(BeTrue())
+		Expect(issuerClient.called).To(BeTrue())
+		// The expired own cert must not be used; issuance falls back to the parent.
+		Expect(credTenant).To(Equal(parentTntID))
+	})
+
+	It("persists a bootstrapped certificate even when app registration fails, and does not re-issue", func() {
+		createParent("mcp-storm", "mcp-storm-sec")
+		_, _, issued := genCertSANs("storm.ezca.io", []string{"storm.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+		// addKey to the own app fails (e.g. the Graph 401 seen in the field).
+		entraClient.addErr = errors.New("addKey failed with status 401")
+
+		mc := newManagedCredential("mc-storm", "mc-storm-sec", "mcp-storm", "CN=storm.ezca.io", []string{"storm.ezca.io"})
+		tnt, app, obj := ownTntID, ownAppID, "storm-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// Reconcile #1: bootstrap issues, registration fails — but the certificate
+		// must be persisted rather than discarded.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mc-storm"}})
+		Expect(err).To(HaveOccurred(), "addKey failure surfaces as a reconcile error/backoff")
+		Expect(issuerClient.called).To(BeTrue())
+
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-storm-sec"}, &secret)).To(Succeed())
+		chain, _, perr := parseSecret(&secret)
+		Expect(perr).NotTo(HaveOccurred())
+		Expect(chain[0].Equal(issued)).To(BeTrue(), "the issued cert must be persisted despite the addKey failure")
+
+		// Reconcile #2: the Secret now holds the cert, so we must NOT bootstrap and
+		// issue a brand-new certificate again (no issuance storm).
+		issuerClient.called = false
+		_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mc-storm"}})
+		Expect(issuerClient.called).To(BeFalse(), "must not re-issue once the certificate is persisted")
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-storm-sec"}, &secret)).To(Succeed())
+		chain2, _, perr := parseSecret(&secret)
+		Expect(perr).NotTo(HaveOccurred())
+		Expect(chain2[0].Equal(issued)).To(BeTrue(), "the persisted cert is unchanged (not replaced by a fresh issuance)")
+	})
+
+	It("skips Key Vault sync when its certificate is not registered on the app", func() {
+		createParent("mcp-kvguard", "mcp-kvguard-sec")
+		cn := "kvguard.ezca.io"
+		certPEM, keyPEM, _ := genCertSANs(cn, []string{cn}, now.Add(-24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("mc-kvguard-sec", certPEM, keyPEM)
+
+		mc := newManagedCredential("mc-kvguard", "mc-kvguard-sec", "mcp-kvguard", "CN="+cn, []string{cn})
+		tnt, app, obj := ownTntID, ownAppID, "kvguard-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-kvguard")
+
+		// The cert is not in status.ManagedKeyCredentials (never registered), so Key
+		// Vault must be left untouched and the real reason surfaced.
+		Expect(kvClient.matchCalls).To(Equal(0), "Key Vault must not be touched with an unregistered cert")
+		Expect(kvClient.imported).To(BeEmpty())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-kvguard"}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+		Expect(meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity).Reason).To(Equal("CertificateNotRegisteredOnApp"))
+	})
+
+	It("syncs Key Vault once its certificate is registered on the app", func() {
+		createParent("mcp-kvok", "mcp-kvok-sec")
+		cn := "kvok.ezca.io"
+		certPEM, keyPEM, cert := genCertSANs(cn, []string{cn}, now.Add(-24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("mc-kvok-sec", certPEM, keyPEM)
+
+		mc := newManagedCredential("mc-kvok", "mc-kvok-sec", "mcp-kvok", "CN="+cn, []string{cn})
+		tnt, app, obj := ownTntID, ownAppID, "kvok-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// Record the active cert as registered on the app.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-kvok"}, mc)).To(Succeed())
+		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+			Thumbprint: pki.Thumbprint(cert),
+			KeyID:      "k1",
+			NotAfter:   metav1.Time{Time: cert.NotAfter},
+		}}
+		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
+
+		kvClient.matches = false
+		reconcileMC("mc-kvok")
+
+		// Registered -> Key Vault sync proceeds (cert differs from vault -> imported).
+		Expect(kvClient.imported).To(HaveLen(1))
+	})
+
 	It("registers a bootstrapped certificate on its own app via the master cert", func() {
 		createParent("mcp-app", "mcp-app-sec")
 		_, _, issued := genCertSANs("appboot.ezca.io", []string{"appboot.ezca.io"}, now, now.Add(90*24*time.Hour))

@@ -86,8 +86,11 @@ func (f *fakeEntra) VerifyCredential(_ context.Context) error {
 }
 
 func (f *fakeEntra) AddKey(_ context.Context, _ string, der []byte) (string, error) {
-	if len(der) <= 0 {
+	if f.addErr != nil {
 		return "", f.addErr
+	}
+	if len(der) <= 0 {
+		return "", errors.New("fakeEntra: empty certificate DER")
 	}
 	f.added = append(f.added, der)
 	return "new-key-id", nil
@@ -405,6 +408,92 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		// propagation poll interval, and the old certificate keeps serving.
 		Expect(res.RequeueAfter).To(Equal(time.Minute))
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+	})
+
+	It("discards an expired staged certificate that outlived its status and recovers the active cert", func() {
+		// A staged (pending) certificate can survive in the Secret across a CR
+		// delete/recreate, which wipes status — including PendingSince. If that
+		// staged cert is already expired it can never be promoted, so the
+		// controller must drop it and fall back to the healthy active certificate
+		// instead of polling a dead cert forever.
+		activePEM, activeKeyPEM, activeCert := genCert("stale.ezca.io", now.Add(-10*day), now.Add(90*day))
+		pendingPEM, pendingKeyPEM, _ := genCert("stale.ezca.io", now.Add(-30*day), now.Add(-10*day)) // expired
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale-secret", Namespace: namespace},
+			Type:       corev1.SecretTypeTLS,
+			Data: map[string][]byte{
+				tlsCertKey:        activePEM,
+				tlsKeyKey:         activeKeyPEM,
+				tlsCertPendingKey: pendingPEM,
+				tlsKeyPendingKey:  pendingKeyPEM,
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		// Fresh identity: its status carries no PendingSince, mirroring a recreate.
+		cci := createIdentity("stale", "stale-secret", ezcav1.CloudPublic, true)
+
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+		secretName := types.NamespacedName{Name: "stale-secret", Namespace: namespace}
+
+		// Reconcile #1: the expired staged cert is dropped without any attempt to
+		// authenticate with it, and the controller requeues promptly.
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(entraClient.verifyCalls).To(Equal(0), "must not authenticate with an expired staged cert")
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		var s corev1.Secret
+		Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+		Expect(s.Data).NotTo(HaveKey(tlsCertPendingKey))
+		Expect(s.Data).NotTo(HaveKey(tlsKeyPendingKey))
+
+		// Reconcile #2: with the pending gone, the healthy active cert goes Available
+		// and is never renewed away.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ezcaClient.called).To(BeFalse())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		Expect(cci.Status.Thumbprint).To(Equal(pki.Thumbprint(activeCert)))
+	})
+
+	It("adopts a PendingSince for a staged cert whose status was lost, then waits out the grace", func() {
+		// Same delete/recreate scenario, but the staged cert is still valid: the
+		// controller must adopt a fresh PendingSince and enter the grace window,
+		// rather than looping with a nil PendingSince that can never time out.
+		activePEM, activeKeyPEM, oldCert := genCert("adopt.ezca.io", now.Add(-10*day), now.Add(90*day))
+		pendingPEM, pendingKeyPEM, pendingCert := genCert("adopt.ezca.io", now, now.Add(100*day))
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "adopt-secret", Namespace: namespace},
+			Type:       corev1.SecretTypeTLS,
+			Data: map[string][]byte{
+				tlsCertKey:        activePEM,
+				tlsKeyKey:         activeKeyPEM,
+				tlsCertPendingKey: pendingPEM,
+				tlsKeyPendingKey:  pendingKeyPEM,
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		cci := createIdentity("adopt", "adopt-secret", ezcav1.CloudPublic, true)
+
+		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		Expect(err).NotTo(HaveOccurred())
+		// PendingSince adopted as now -> inside the grace window, so it waits the
+		// full grace without authenticating and keeps the staged cert.
+		Expect(entraClient.verifyCalls).To(Equal(0))
+		Expect(res.RequeueAfter).To(Equal(propagationGrace))
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+		Expect(cci.Status.PendingSince).NotTo(BeNil())
+		Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(pendingCert)))
+
+		var s corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "adopt-secret", Namespace: namespace}, &s)).To(Succeed())
+		Expect(s.Data).To(HaveKey(tlsCertPendingKey))
+		chain, err := pki.ParseCertChainPEM(s.Data[tlsCertKey])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chain[0].Equal(oldCert)).To(BeTrue(), "active cert must keep serving during the grace")
 	})
 
 	It("removes expired managed credentials from the app", func() {

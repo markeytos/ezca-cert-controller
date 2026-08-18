@@ -232,19 +232,38 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	pendingChain, pendingKey, err := parsePendingSecret(secret)
 	if err != nil {
 		// The staged data is unusable; drop it and renew again next pass.
-		delete(secret.Data, tlsCertPendingKey)
-		delete(secret.Data, tlsKeyPendingKey)
-		if uerr := d.kubeClient().Update(ctx, secret); uerr != nil {
-			return ctrl.Result{}, uerr
+		if derr := discardPendingCert(ctx, d, obj, secret); derr != nil {
+			return ctrl.Result{}, derr
 		}
-		status.PendingThumbprint = ""
-		status.PendingSince = nil
 		setDegraded(obj, "InvalidPendingCertificate", fmt.Sprintf("Staged certificate is invalid: %v", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	pendingLeaf := pendingChain[0]
 
-	if status.PendingSince != nil && now.Sub(status.PendingSince.Time) < propagationGrace {
+	// A staged certificate outside its validity window can never be promoted —
+	// for instance one left behind in the Secret by an earlier rotation after the
+	// object's status (and its PendingSince) was reset by a delete/recreate. Drop
+	// it and requeue so the active certificate is re-evaluated, rather than
+	// polling a dead certificate forever.
+	if pendingLeaf.NotBefore.After(now) || !pendingLeaf.NotAfter.After(now) {
+		log.Info("Discarding staged certificate outside its validity window; falling back to the active certificate",
+			"thumbprint", pki.Thumbprint(pendingLeaf), "notBefore", pendingLeaf.NotBefore, "notAfter", pendingLeaf.NotAfter)
+		if derr := discardPendingCert(ctx, d, obj, secret); derr != nil {
+			return ctrl.Result{}, derr
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	// Every pending certificate needs a PendingSince to drive the grace and
+	// timeout windows below. If it is missing — the staged certificate outlived
+	// the status that tracked it — adopt now, so promotion still makes progress
+	// and can time out instead of looping indefinitely.
+	if status.PendingSince == nil {
+		status.PendingSince = &metav1.Time{Time: now}
+		status.PendingThumbprint = pki.Thumbprint(pendingLeaf)
+	}
+
+	if now.Sub(status.PendingSince.Time) < propagationGrace {
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
 			Status:  metav1.ConditionTrue,
@@ -262,7 +281,7 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		// Past the grace window and still not usable. Poll until the propagation
 		// timeout; beyond it, fail loudly (retries continue, more slowly, so the
 		// certificate can still self-heal).
-		if status.PendingSince != nil && now.Sub(status.PendingSince.Time) > propagationTimeout {
+		if now.Sub(status.PendingSince.Time) > propagationTimeout {
 			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(obj))
 			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
@@ -382,6 +401,19 @@ func writePendingSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Se
 	if err := setTLSData(secret, tlsCertPendingKey, tlsKeyPendingKey, chain, key); err != nil {
 		return err
 	}
+	return d.kubeClient().Update(ctx, secret)
+}
+
+// discardPendingCert removes the staged certificate from the Secret and clears
+// the pending status fields, so the next reconcile falls back to the active
+// certificate. Used when the staged certificate can never be promoted (its data
+// is unusable, or it is outside its validity window).
+func discardPendingCert(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret) error {
+	delete(secret.Data, tlsCertPendingKey)
+	delete(secret.Data, tlsKeyPendingKey)
+	status := obj.StatusBase()
+	status.PendingThumbprint = ""
+	status.PendingSince = nil
 	return d.kubeClient().Update(ctx, secret)
 }
 

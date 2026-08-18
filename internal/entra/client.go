@@ -214,11 +214,16 @@ func (c *Client) newProof() (string, error) {
 		"x5t": x5t,
 		"kid": x5t,
 	}
+	// Microsoft Graph requires the proof's exp to be nbf + 10 minutes. Derive exp
+	// from nbf (not from now) so the clock-skew backdate on nbf cannot widen the
+	// window past 10 minutes — Graph rejects an over-long proof, surfacing it as
+	// "Access Token missing or malformed".
+	nbf := now.Add(-proofClockSkewLeeway)
 	claims := map[string]any{
 		"aud": graphProofAudience,
 		"iss": c.appID,
-		"nbf": now.Add(-proofClockSkewLeeway).Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
+		"nbf": nbf.Unix(),
+		"exp": nbf.Add(10 * time.Minute).Unix(),
 	}
 	return jwt.SignRS256(header, claims, c.key)
 }

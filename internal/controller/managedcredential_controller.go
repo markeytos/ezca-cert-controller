@@ -192,7 +192,22 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	result, coreErr := reconcileCertState(ctx, r, mc, &secret, chain, key, now, tel)
 
 	if mc.Spec.KeyVault != nil {
-		syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
+		// Key Vault sync authenticates to the vault AS this credential's app using
+		// the active certificate, which only works once that certificate has been
+		// registered on the app registration (via addKey). If it is not registered
+		// yet, syncing would just fail vault authentication on every reconcile, so
+		// skip it and surface the real reason instead of a misleading Key Vault
+		// error that masks the missing registration.
+		if appConfigured(mc) && !leafRegisteredInEntra(mc, chain[0]) {
+			logf.FromContext(ctx).Info("Skipping Key Vault sync: certificate is not registered on the app registration",
+				"thumbprint", pki.Thumbprint(chain[0]), "appID", *mc.Spec.AppID)
+			if coreErr == nil {
+				setDegraded(mc, "CertificateNotRegisteredOnApp",
+					"Certificate is not registered on the app registration, so it cannot authenticate to Key Vault; the app registration (addKey) must succeed first")
+			}
+		} else {
+			syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
+		}
 	}
 	return result, coreErr
 }
@@ -222,7 +237,7 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 		return ctrl.Result{}, nil
 	}
 
-	cred, err := r.issuanceCredential(ctx, mc, currentLeaf, currentKey)
+	cred, err := r.issuanceCredential(ctx, mc, currentLeaf, currentKey, now)
 	if err != nil {
 		tel.TrackError(err, "Failed to obtain issuance credential", identityProps(mc))
 		setDegraded(mc, "IssuanceCredentialUnavailable", fmt.Sprintf("Could not obtain a credential to issue the certificate: %v", err))
@@ -287,18 +302,32 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 	// authenticated by a certificate the app already trusts — the current
 	// certificate once it is registered, otherwise the referenced master
 	// identity's certificate on first issuance.
-	authCert, authKey, err := r.appAuthCert(ctx, mc, currentLeaf, currentKey)
+	authCert, authKey, err := r.appAuthCert(ctx, mc, currentLeaf, currentKey, now)
 	if err != nil {
 		tel.TrackError(err, "Failed to obtain a credential to register the certificate on the app", identityProps(mc))
 		setDegraded(mc, "AppAuthUnavailable", fmt.Sprintf("Could not obtain a credential to register the certificate on the app registration: %v", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
+
+	// First issuance: nothing is being served yet, so persist the certificate as
+	// active up front — before attempting registration. Registering it on the app
+	// can fail (Entra/Graph), and persisting first means such a failure does not
+	// throw the freshly issued certificate away and re-issue a brand-new one on
+	// every subsequent reconcile (an unbounded issuance loop against EZCA).
+	if currentLeaf == nil {
+		if err := r.storeIssuedCert(ctx, mc, secret, chain, newKey); err != nil {
+			tel.TrackError(err, "Failed to store issued certificate", identityProps(mc))
+			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to write issued certificate to Secret: %v", err))
+			return ctrl.Result{}, err
+		}
+	}
+
 	if err := manageApp(ctx, r, mc, authCert, authKey, newLeaf, tel, now); err != nil {
 		setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
 		return ctrl.Result{}, err
 	}
 
-	// If a certificate is already being served, keep serving it and stage the new
+	// If a certificate was already being served, keep serving it and stage the new
 	// one as pending; the shared promotion flow swaps it in once Entra can
 	// authenticate with it.
 	if currentLeaf != nil {
@@ -319,14 +348,8 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, mc.Status.PendingSince)}, nil
 	}
 
-	// First issuance: nothing to keep serving, so write the certificate active. It
-	// is registered on the app; Key Vault sync and app authentication wait out
-	// propagation.
-	if err := r.storeIssuedCert(ctx, mc, secret, chain, newKey); err != nil {
-		tel.TrackError(err, "Failed to store issued certificate", identityProps(mc))
-		setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to write issued certificate to Secret: %v", err))
-		return ctrl.Result{}, err
-	}
+	// First issuance: already stored above and now registered on the app. Key Vault
+	// sync and app authentication wait out propagation.
 	return r.finishIssuance(mc, newLeaf, now, successReason), nil
 }
 
@@ -352,8 +375,8 @@ func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredentia
 // certificate when it is already registered, otherwise the referenced master
 // identity's certificate (which is trusted on the app registration to bootstrap
 // the first certificate).
-func (r *ManagedCredentialReconciler) appAuthCert(ctx context.Context, mc *ezcav1.ManagedCredential, currentLeaf *x509.Certificate, currentKey *rsa.PrivateKey) (*x509.Certificate, *rsa.PrivateKey, error) {
-	if currentLeaf != nil && currentKey != nil && leafRegisteredInEntra(mc, currentLeaf) {
+func (r *ManagedCredentialReconciler) appAuthCert(ctx context.Context, mc *ezcav1.ManagedCredential, currentLeaf *x509.Certificate, currentKey *rsa.PrivateKey, now time.Time) (*x509.Certificate, *rsa.PrivateKey, error) {
+	if currentKey != nil && currentCertUsable(mc, currentLeaf, now) {
 		return currentLeaf, currentKey, nil
 	}
 	cert, key, _, err := r.identityRefCertKey(ctx, mc)
@@ -389,8 +412,8 @@ func (r *ManagedCredentialReconciler) storeIssuedCert(ctx context.Context, mc *e
 // issuanceCredential selects the Azure credential used to authenticate the
 // issuance request: the credential's own app when it already has a certificate
 // registered in Entra, otherwise the referenced bootstrap identity's app.
-func (r *ManagedCredentialReconciler) issuanceCredential(ctx context.Context, mc *ezcav1.ManagedCredential, currentLeaf *x509.Certificate, currentKey *rsa.PrivateKey) (azcore.TokenCredential, error) {
-	if appConfigured(mc) && currentLeaf != nil && currentKey != nil && leafRegisteredInEntra(mc, currentLeaf) {
+func (r *ManagedCredentialReconciler) issuanceCredential(ctx context.Context, mc *ezcav1.ManagedCredential, currentLeaf *x509.Certificate, currentKey *rsa.PrivateKey, now time.Time) (azcore.TokenCredential, error) {
+	if appConfigured(mc) && currentKey != nil && currentCertUsable(mc, currentLeaf, now) {
 		return r.newTokenCredential(*mc.Spec.TenantID, *mc.Spec.AppID, cloudFor(mc.Spec.Cloud), currentLeaf, currentKey)
 	}
 	return r.identityRefCredential(ctx, mc)
@@ -501,6 +524,18 @@ func leafRegisteredInEntra(mc *ezcav1.ManagedCredential, leaf *x509.Certificate)
 		}
 	}
 	return false
+}
+
+// currentCertUsable reports whether the credential's current certificate can
+// authenticate as its own Entra app: it must be registered on the app and
+// currently within its validity window. An expired (or not-yet-valid) current
+// certificate cannot authenticate, so the caller must fall back to the
+// identityRef to recover instead of deadlocking on the dead certificate.
+func currentCertUsable(mc *ezcav1.ManagedCredential, leaf *x509.Certificate, now time.Time) bool {
+	return leaf != nil &&
+		leafRegisteredInEntra(mc, leaf) &&
+		!leaf.NotBefore.After(now) &&
+		leaf.NotAfter.After(now)
 }
 
 // reissueOnRenewFailure implements renewFallback: when renewal fails (for
