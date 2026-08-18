@@ -4,15 +4,17 @@
 # manager, crd, rbac, metrics, certManager, prometheus, networkPolicy -- uses
 # the chart defaults; see the chart's own values.yaml to override them.
 
-## Base URL of the EZCA instance used to renew/issue certificates. Required.
-ezcaURL: "https://portal.ezca.io"
+## Settings applied to every certificate this chart manages.
+global:
+  ## Base URL of the EZCA instance used to renew/issue certificates. Required.
+  ezcaURL: "https://portal.ezca.io"
 
-## Azure sovereign cloud for Entra ID / Microsoft Graph. Uncomment for USGov.
-# cloud: USGov
+  ## Azure sovereign cloud for Entra ID / Microsoft Graph. Uncomment for USGov.
+  # cloud: USGov
 
-## Entra ID tenant that owns the app registrations. Required only alongside the
-## appID / appObjectID fields.
-tenantID: "00000000-0000-0000-0000-000000000000"
+  ## Entra ID tenant that owns the app registrations. Required only alongside the
+  ## appID / appObjectID fields.
+  tenantID: "00000000-0000-0000-0000-000000000000"
 
 ## The cluster-scoped identity that bootstraps first issuance for appCerts.
 ## Rendered only while name is set.
