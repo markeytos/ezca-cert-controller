@@ -1,0 +1,55 @@
+# Values for the ezca-cert-controller chart, installed by tf-kube-script.sh.
+#
+# Only settings you are expected to change are listed. Everything else --
+# manager, crd, rbac, metrics, certManager, prometheus, networkPolicy -- uses
+# the chart defaults; see the chart's own values.yaml to override them.
+
+## Settings applied to every certificate this chart manages.
+global:
+  ## Base URL of the EZCA instance used to renew/issue certificates. Required.
+  ezcaURL: "https://portal.ezca.io"
+
+  ## Azure sovereign cloud for Entra ID / Microsoft Graph. Uncomment for USGov.
+  # cloud: USGov
+
+  ## Entra ID tenant that owns the app registrations. Required only alongside the
+  ## appID / appObjectID fields.
+  tenantID: "00000000-0000-0000-0000-000000000000"
+
+## The cluster-scoped identity that bootstraps first issuance for appCerts.
+## Rendered only while name is set.
+clusterIdentity:
+  name: master-cert-identity-1
+
+  ## The kubernetes.io/tls Secret that tf-kube-script.sh creates from the
+  ## Terraform outputs. Keep in step with secret_name in that script.
+  certSecretName: cluster-cert-identity
+
+  ## Namespaces whose ManagedCredentials may reference this identity via
+  ## identityRef. Defaults to the release namespace, so set this once appCerts
+  ## live anywhere else.
+  # allowedNamespaces:
+  #   - team-web
+
+  ## Entra app credential rotation. Set both, plus tenantID above, and the
+  ## controller installs each renewed cert onto the app registration.
+  # appID: ""
+  # appObjectID: ""
+
+## Application certificates, one ManagedCredential per entry. Empty to start:
+## add entries once the identity above is issuing successfully.
+appCerts: []
+# - name: web-frontend-cert
+#   namespace: team-web
+#   subjectName: web.example.com
+#   dnsNames: [web.example.com, www.example.com]
+#   extendedKeyUsages: [ServerAuth]
+#   appID: ""
+#   appObjectID: ""
+#   validityInDays: 90
+#   caID: "00000000-0000-0000-0000-000000000000"
+#   templateID: "00000000-0000-0000-0000-000000000000"
+#   certSecretName: web-frontend-cert
+#   identityRef:
+#     name: master-cert-identity-1
+#     kind: ClusterCertIdentity

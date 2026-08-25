@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/*
+Dockerfile.cross
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Kubernetes Generated files - skip generated files, except for vendored files
+!vendor/**/zz_generated.*
+
+# editor and IDE paraphernalia
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+config/samples/simple*.yaml
+tls.*
+
+# Kubeconfig might contain secrets
+*.kubeconfig
+
+# Build artifacts under dist/ (the chart source under dist/chart is committed)
+dist/install.yaml
+dist/*.tgz
+dist/*.tgz.prov
+
+# scripts that are developer specific
+secret-scripts
+
+# test scripts that are Keytos specific
+config/samples/test

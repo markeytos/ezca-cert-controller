@@ -1,0 +1,194 @@
+## values.schema.json is GENERATED from this file plus the schemas/ directory:
+## run `make helm-schema`. Field docs and constraints live in schemas/*.yaml —
+## edit them there, never in values.schema.json.
+
+## ─────────────────────────────────────────────────────────────────────────────
+## Certificate configuration — the CRs this chart renders.
+##
+## This is the section you configure. Everything under `controller:` at the bottom
+## is the operator's own runtime (image, RBAC, metrics); its defaults suit almost
+## every install.
+##
+## The chart renders one cluster-scoped ClusterCertIdentity (from clusterIdentity)
+## and one namespaced ManagedCredential per entry in appCerts.
+##
+## GLOBAL fields are set once and applied to EVERY generated CR — they are not
+## overridable per item. The Entra app is per item via appID/appObjectID (each
+## pairs with global.tenantID). See README.md for the full field reference and how
+## these values map to the CRD field names.
+## ─────────────────────────────────────────────────────────────────────────────
+
+## Applied to every certificate this chart manages.
+## Fields: schemas/global.schema.yaml
+# @schema $ref: schemas/global.schema.yaml
+global:
+  ## Azure sovereign cloud for Entra ID / Microsoft Graph: Public or USGov.
+  cloud: Public
+  ## Base URL of your EZCA instance. Required.
+  ezcaURL: "https://portal.ezca.io"
+  ## Entra tenant that owns the app registrations. Blank -> no Entra rotation.
+  tenantID: ""
+  ## Optional Application Insights connection string.
+  appInsightsConnString: ""
+
+## The cluster-scoped bootstrap identity. Rendered ONLY when name is set, so the
+## default creates nothing — for when your appCerts reference an identity created
+## elsewhere, or you only need namespaced ManagedCredentials.
+## Fields: schemas/cluster-identity.schema.yaml
+# @schema $ref: schemas/cluster-identity.schema.yaml
+clusterIdentity:
+  ## metadata.name of the ClusterCertIdentity. Blank -> not created.
+  name: ""
+  ## Entra app to rotate credentials on. Set both, or neither.
+  appID: ""
+  appObjectID: ""
+  ## Pre-existing kubernetes.io/tls Secret with the bootstrap cert. The chart
+  ## references this Secret; it does NOT create it (see README.md).
+  certSecretName: cluster-cert-identity
+  ## Namespace of that Secret. Blank -> the release namespace.
+  certSecretNamespace: ""
+  ## Percent of lifetime remaining at/below which to renew (1-99).
+  renewalThreshold: 20
+  ## Namespaces allowed to reference this identity. Blank -> [release namespace].
+  allowedNamespaces: []
+
+## One ManagedCredential per entry — your application certificates.
+## Fields: schemas/app-cert.schema.yaml
+# @schema itemRef: schemas/app-cert.schema.yaml
+appCerts: []
+# - name: web-frontend-cert            # metadata.name (defaults to app-cert-<n>)
+#   namespace: ""                       # blank -> release namespace
+#   subjectName: web.example.com        # required
+#   dnsNames: [web.example.com, www.example.com]
+#   extendedKeyUsages: [ServerAuth]
+#   validityInDays: 90
+#   caID: "00000000-0000-0000-0000-000000000000"        # required (EZCA CA UUID)
+#   templateID: "00000000-0000-0000-0000-000000000000"  # required (EZCA template UUID)
+#   certSecretName: web-frontend-cert   # issued-cert Secret (defaults to name)
+#   renewalThreshold: 20
+#   appID: ""                           # optional per-item Entra app
+#   appObjectID: ""
+#   identityRef:                        # identity that bootstraps first issuance
+#     name: master-cert-identity-1
+#     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity
+
+## ─────────────────────────────────────────────────────────────────────────────
+## Controller runtime — how the operator itself is deployed.
+##
+## Nothing below is required reading: the defaults install a working controller.
+## Reach in here to pin an image, scope RBAC to a single namespace, turn metrics
+## off, or set the usual scheduling knobs.
+## Fields: schemas/controller.schema.yaml
+## ─────────────────────────────────────────────────────────────────────────────
+# @schema $ref: schemas/controller.schema.yaml
+controller:
+  nameOverride: ""
+  fullnameOverride: ""
+
+  manager:
+    enabled: true
+    replicas: 1
+
+    image:
+      repository: keytos-eqgzasb8bufxa0cd.azurecr.io/ezca/cert-controller
+      ## Blank -> Chart.appVersion
+      tag: ""
+      pullPolicy: IfNotPresent
+
+    args:
+      - --leader-elect
+
+    env:
+      - name: POD_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+
+    ## Flat NAME=value map; wins over an env entry of the same name.
+    envOverrides: {}
+
+    imagePullSecrets: []
+
+    podSecurityContext:
+      runAsNonRoot: true
+      # @schema hidden
+      seccompProfile:
+        type: RuntimeDefault
+
+    securityContext:
+      allowPrivilegeEscalation: false
+      # @schema hidden
+      capabilities:
+        drop:
+          - ALL
+      readOnlyRootFilesystem: true
+
+    resources:
+      # @schema hidden
+      limits:
+        cpu: 500m
+        memory: 128Mi
+      # @schema hidden
+      requests:
+        cpu: 10m
+        memory: 64Mi
+
+    affinity: {}
+    nodeSelector: {}
+    tolerations: []
+    topologySpreadConstraints: []
+
+    ## e.g. {type: RollingUpdate, rollingUpdate: {maxSurge: 25%, maxUnavailable: 25%}}
+    strategy: {}
+
+    priorityClassName: ""
+    terminationGracePeriodSeconds: 10
+
+    extraVolumes: []
+    extraVolumeMounts: []
+
+    ## Extra labels/annotations on the Deployment and on the pod template.
+    labels: {}
+    annotations: {}
+    pod:
+      labels: {}
+      annotations: {}
+
+  rbac:
+    ## false -> ClusterRole/ClusterRoleBinding; true -> Role/RoleBinding in the
+    ## release namespace only.
+    namespaced: false
+    ## Convenience admin/editor/viewer roles for the CRDs.
+    helpers:
+      enabled: false
+
+  serviceAccount:
+    enabled: true
+    ## Existing ServiceAccount to use when enabled is false.
+    name: ""
+    annotations: {}
+    labels: {}
+
+  crd:
+    ## Install the CRDs with the chart, and keep them on uninstall.
+    enabled: true
+    keep: true
+
+  metrics:
+    enabled: true
+    port: 8443
+    ## HTTPS with certs/authn (true) or plain HTTP (false). Secure metrics need
+    ## ClusterRole access for authn/authz.
+    secure: true
+
+  ## Needs cert-manager installed; issues webhook and metrics certificates.
+  certManager:
+    enabled: false
+
+  ## Needs prometheus-operator installed; renders a ServiceMonitor.
+  prometheus:
+    enabled: false
+
+  ## Restrict ingress to the controller manager.
+  networkPolicy:
+    enabled: false

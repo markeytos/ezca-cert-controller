@@ -1,0 +1,30 @@
+# Patterns to ignore when building Helm packages.
+# Operating system files
+.DS_Store
+
+# Version control directories
+.git/
+.gitignore
+.bzr/
+.hg/
+.hgignore
+.svn/
+
+# Backup and temporary files
+*.swp
+*.tmp
+*.bak
+*.orig
+*~
+
+# IDE and editor-related files
+.idea/
+.vscode/
+
+# Helm chart artifacts
+dist/chart/*.tgz
+
+# Schema generation inputs. values.schema.json ships (Helm validates against it);
+# the config and the referenced subschemas are bundled into it, so they do not.
+.schema.yaml
+schemas/

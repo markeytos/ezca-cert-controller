@@ -1,0 +1,151 @@
+## Schema for one entry of appCerts[] in values.yaml — the ManagedCredential this
+## chart renders. Referenced from values.yaml via `# @schema itemRef:` and bundled
+## into values.schema.json by `make helm-schema`.
+##
+## appCerts entries are examples in values.yaml (the default is an empty list), so
+## there is nothing for `helm schema` to infer their shape from; this file is that
+## shape. Keep it in step with dist/chart/templates/cr/managedcredentials.yaml and
+## the ManagedCredential CRD.
+$schema: https://json-schema.org/draft/2020-12/schema
+title: appCerts entry
+description: One ManagedCredential. subjectName, caID and templateID identify what to issue; everything else is optional.
+type: object
+additionalProperties: false
+required:
+  - subjectName
+  - caID
+  - templateID
+
+properties:
+  name:
+    description: metadata.name. Defaults to app-cert-<n>.
+    type: string
+    maxLength: 253
+    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+  namespace:
+    description: metadata.namespace. Blank means the release namespace.
+    type: string
+    maxLength: 63
+    pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+
+  subjectName:
+    description: Full RFC 4514 DN (CN=app,O=corp) or a bare CN (app.example.com).
+    type: string
+    minLength: 1
+  caID:
+    description: EZCA SSL CA that issues the certificate.
+    type: string
+    pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+  templateID:
+    description: EZCA template used when issuing.
+    type: string
+    pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+
+  dnsNames:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+  ipAddresses:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+  uris:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+  emailAddresses:
+    type: array
+    uniqueItems: true
+    items:
+      type: string
+      minLength: 1
+
+  keyUsages:
+    description: Empty means DigitalSignature + KeyEncipherment.
+    type: array
+    uniqueItems: true
+    items:
+      enum:
+        - DigitalSignature
+        - KeyEncipherment
+        - DataEncipherment
+        - KeyAgreement
+        - NonRepudiation
+  extendedKeyUsages:
+    description: Empty means ServerAuth + ClientAuth.
+    type: array
+    uniqueItems: true
+    items:
+      enum:
+        - Any
+        - ServerAuth
+        - ClientAuth
+        - CodeSigning
+        - EmailProtection
+        - IPSECEndSystem
+        - IPSECTunnel
+        - IPSECUser
+        - TimeStamping
+        - OCSPSigning
+        - MicrosoftServerGatedCrypto
+        - NetscapeServerGatedCrypto
+        - MicrosoftCommercialCodeSigning
+        - MicrosoftKernelCodeSigning
+
+  validityInDays:
+    description: Requested lifetime. Unset means the issuer default (90 days).
+    type: integer
+    minimum: 1
+  certSecretName:
+    description: Issued-certificate Secret. Defaults to this entry's name.
+    type: string
+    maxLength: 253
+    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+  renewalThreshold:
+    description: Percent of lifetime remaining at/below which to renew.
+    type: integer
+    minimum: 1
+    maximum: 99
+
+  appID:
+    description: Entra app (client) ID. Pairs with appObjectID and the root tenantID.
+    type: string
+  appObjectID:
+    description: Entra directory object ID of that app registration.
+    type: string
+
+  keyVault:
+    description: Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.
+    type: object
+    additionalProperties: false
+    properties:
+      vaultName:
+        description: Vault name, not the full URL.
+        type: string
+      certName:
+        type: string
+    dependentRequired:
+      vaultName: [certName]
+      certName: [vaultName]
+
+  identityRef:
+    description: Identity that bootstraps first issuance. Required only when issuing into an empty Secret.
+    type: object
+    additionalProperties: false
+    required: [name, kind]
+    properties:
+      name:
+        type: string
+        minLength: 1
+      kind:
+        enum: [ClusterCertIdentity, CertIdentity]
+
+dependentRequired:
+  appID: [appObjectID]
+  appObjectID: [appID]
