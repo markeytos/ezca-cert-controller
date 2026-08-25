@@ -649,6 +649,51 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(chain2[0].Equal(issued)).To(BeTrue(), "the persisted cert is unchanged (not replaced by a fresh issuance)")
 	})
 
+	It("retries app registration for a persisted but unregistered certificate", func() {
+		const mcName = "mc-rereg"
+		createParent("mcp-rereg", "mcp-rereg-sec")
+		_, _, issued := genCertSANs("rereg.ezca.io", []string{"rereg.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+		entraClient.addErr = errors.New("addKey failed with status 401")
+
+		mc := newManagedCredential(mcName, "mc-rereg-sec", "mcp-rereg", "CN=rereg.ezca.io", []string{"rereg.ezca.io"})
+		tnt, app, obj := ownTntID, ownAppID, "rereg-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// Bootstrap: issuance succeeds, registration fails.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
+		Expect(err).To(HaveOccurred())
+
+		// While the certificate is unregistered, later reconciles must retry the
+		// registration and keep the credential unavailable — not report it healthy.
+		issuerClient.called = false
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
+		Expect(err).To(HaveOccurred(), "the registration failure must keep surfacing")
+		Expect(issuerClient.called).To(BeFalse(), "the retry must not issue a new certificate")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeFalse(),
+			"must not report Available while the certificate is unregistered")
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("AppRotationFailed"))
+
+		// Entra recovers: the persisted certificate is registered, the credential
+		// becomes Available, and still nothing is re-issued.
+		entraClient.addErr = nil
+		reconcileMC(mcName)
+
+		Expect(entraClient.added).To(HaveLen(1))
+		Expect(entraClient.added[0]).To(Equal(issued.Raw))
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(mc.Status.ManagedKeyCredentials).To(HaveLen(1))
+		Expect(mc.Status.ManagedKeyCredentials[0].Thumbprint).To(Equal(pki.Thumbprint(issued)))
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+	})
+
 	It("skips Key Vault sync when its certificate is not registered on the app", func() {
 		createParent("mcp-kvguard", "mcp-kvguard-sec")
 		cn := "kvguard.ezca.io"
@@ -661,12 +706,16 @@ var _ = Describe("ManagedCredential Controller", func() {
 		mc.Spec.AppID = &app
 		mc.Spec.AppObjectID = &obj
 		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		// Externally provisioned: with an identityRef the controller would register
+		// the certificate itself (see the registration-retry spec) and then sync.
+		mc.Spec.IdentityRef = nil
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 
 		reconcileMC("mc-kvguard")
 
 		// The cert is not in status.ManagedKeyCredentials (never registered), so Key
 		// Vault must be left untouched and the real reason surfaced.
+		Expect(entraClient.added).To(BeEmpty(), "nothing to authenticate a registration with")
 		Expect(kvClient.matchCalls).To(Equal(0), "Key Vault must not be touched with an unregistered cert")
 		Expect(kvClient.imported).To(BeEmpty())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-kvguard"}, mc)).To(Succeed())

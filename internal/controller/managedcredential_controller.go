@@ -189,6 +189,29 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 		return r.issueAndStore(ctx, mc, &secret, chain[0], key, req, now, tel, "Reissued")
 	}
 
+	// An issued app credential is persisted before it is registered on the app
+	// (see installIssuedCert), so a failed registration leaves a valid but
+	// unregistered certificate behind. Retry the registration here and stay
+	// Degraded until it succeeds; otherwise the steady-state path would report
+	// the credential Available and the certificate would silently stay off the
+	// app until renewal. Credentials without an identityRef are excluded: their
+	// certificate is provisioned (and registered) externally, and there is no
+	// identity to authenticate a registration with.
+	if appConfigured(mc) && canSelfBootstrap(mc) && !hasPendingCert(&secret) && !leafRegisteredInEntra(mc, chain[0]) {
+		authCert, authKey, err := r.appAuthCert(ctx, mc, chain[0], key, now)
+		if err != nil {
+			tel.TrackError(err, "Failed to obtain a credential to register the certificate on the app", identityProps(mc))
+			setDegraded(mc, "AppAuthUnavailable", fmt.Sprintf("Could not obtain a credential to register the certificate on the app registration: %v", err))
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		if err := manageApp(ctx, r, mc, authCert, authKey, chain[0], tel, now); err != nil {
+			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
+			return ctrl.Result{}, err
+		}
+		logf.FromContext(ctx).Info("Registered the active certificate on the app registration",
+			"thumbprint", pki.Thumbprint(chain[0]))
+	}
+
 	result, coreErr := reconcileCertState(ctx, r, mc, &secret, chain, key, now, tel)
 
 	if mc.Spec.KeyVault != nil {
