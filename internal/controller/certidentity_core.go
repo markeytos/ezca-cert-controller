@@ -354,6 +354,7 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 			Thumbprint: pki.Thumbprint(newLeaf),
 			KeyID:      keyID,
 			NotAfter:   metav1.Time{Time: newLeaf.NotAfter},
+			AddedAt:    &metav1.Time{Time: now},
 		})
 		tel.TrackEvent("CertificateAddedToApp", identityProps(obj))
 	}
@@ -460,16 +461,19 @@ func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Cer
 // rather than a hard failure.
 func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, now time.Time, tel *telemetry.Telemetry, result *ctrl.Result, coreErr error) {
 	log := logf.FromContext(ctx)
-	status := obj.StatusBase()
 
-	// A freshly issued active certificate may not yet be usable on every AAD
-	// token replica; give it the propagation grace before authenticating to Key
-	// Vault with it. This is measured from the certificate's own NotBefore
-	// rather than the last renewal time, so a certificate promoted only after it
-	// already authenticated (and waited out the grace since being staged) is not
-	// charged the grace a second time — it syncs right away.
-	if status.NotBefore != nil && now.Sub(status.NotBefore.Time) < propagationGrace {
-		requeueAtMost(result, propagationRequeueAfter(now, status.NotBefore))
+	// A freshly registered active certificate may not yet be usable on every
+	// AAD token replica; give it the propagation grace before authenticating to
+	// Key Vault with it. The window is measured from when the certificate was
+	// added to the app registration (falling back to its NotBefore), because
+	// NotBefore can predate the registration by hours (EZCA backdates it) or
+	// days (a certificate registered only after issuance). A certificate
+	// promoted only after it already authenticated (and waited out the grace
+	// since being staged) is not charged the grace a second time — it syncs
+	// right away.
+	since := kvPropagationSince(obj)
+	if since != nil && now.Sub(since.Time) < propagationGrace {
+		requeueAtMost(result, propagationRequeueAfter(now, since))
 		return
 	}
 
@@ -481,7 +485,7 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	// reached. Poll quietly until the propagation timeout; past that it is no
 	// longer plausibly propagation, so fall through and report it as a failure.
 	if isCredentialPropagating(kvErr) &&
-		(status.NotBefore == nil || now.Sub(status.NotBefore.Time) <= propagationTimeout) {
+		(since == nil || now.Sub(since.Time) <= propagationTimeout) {
 		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
 		requeueAtMost(result, propagationRequeue)
 		return
@@ -545,6 +549,21 @@ func requeueAtMost(result *ctrl.Result, d time.Duration) {
 // endpoint replica that served the request.
 func isCredentialPropagating(err error) bool {
 	return err != nil && strings.Contains(err.Error(), entra.KeyNotFoundOnAppErrorCode)
+}
+
+// kvPropagationSince returns the moment Entra propagation of the active
+// certificate is measured from: when the controller added it to the app
+// registration, falling back to the certificate's own NotBefore for
+// certificates registered out of band (or recorded before addedAt existed).
+func kvPropagationSince(obj certIdentity) *metav1.Time {
+	status := obj.StatusBase()
+	since := status.NotBefore
+	for _, kc := range status.ManagedKeyCredentials {
+		if kc.Thumbprint == status.Thumbprint && kc.AddedAt != nil && (since == nil || kc.AddedAt.After(since.Time)) {
+			since = kc.AddedAt
+		}
+	}
+	return since
 }
 
 func requeueForRenewal(cert *x509.Certificate, thresholdPct int32, now time.Time) time.Duration {

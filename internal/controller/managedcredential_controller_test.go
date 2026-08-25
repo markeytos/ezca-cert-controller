@@ -694,6 +694,49 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 	})
 
+	It("measures Key Vault propagation from the app registration, not the certificate's NotBefore", func() {
+		const mcName = "mc-kvprop"
+		createParent("mcp-kvprop", "mcp-kvprop-sec")
+		cn := "kvprop.ezca.io"
+		// The active certificate long predates the registration performed below,
+		// so a NotBefore-based propagation window would already be exhausted.
+		certPEM, keyPEM, _ := genCertSANs(cn, []string{cn}, now.Add(-24*time.Hour), now.Add(90*24*time.Hour))
+		createSecret("mc-kvprop-sec", certPEM, keyPEM)
+
+		mc := newManagedCredential(mcName, "mc-kvprop-sec", "mcp-kvprop", "CN="+cn, []string{cn})
+		tnt, app, obj := ownTntID, ownAppID, "kvprop-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+
+		// Reconcile #1 registers the certificate on the app; Key Vault must then
+		// wait out the propagation grace measured from that registration.
+		reconcileMC(mcName)
+		Expect(entraClient.added).To(HaveLen(1))
+		Expect(kvClient.matchCalls).To(Equal(0), "the grace runs from the registration, not NotBefore")
+
+		// Within the propagation window a key-not-found vault error is transient:
+		// polled quietly, not Degraded.
+		clockNow = now.Add(6 * time.Minute)
+		kvClient.matchErr = errors.New("ClientCertificateCredential authentication failed: AADSTS700027: key not found")
+		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(propagationRequeue))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+
+		// Past the propagation timeout (still measured from the registration) the
+		// same error is no longer plausibly propagation and is reported.
+		clockNow = now.Add(20 * time.Minute)
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+		Expect(meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity).Reason).To(Equal("KeyVaultSyncFailed"))
+	})
+
 	It("skips Key Vault sync when its certificate is not registered on the app", func() {
 		createParent("mcp-kvguard", "mcp-kvguard-sec")
 		cn := "kvguard.ezca.io"

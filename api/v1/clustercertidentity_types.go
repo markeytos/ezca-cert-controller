@@ -214,6 +214,13 @@ type ManagedKeyCredential struct {
 	// from the app registration only after this time.
 	// +required
 	NotAfter metav1.Time `json:"notAfter"`
+
+	// addedAt is when the credential was added to the app registration. Entra
+	// propagation windows are measured from this time; the certificate's own
+	// notBefore can predate the registration by hours (EZCA backdates it) or
+	// days (a certificate registered after issuance).
+	// +optional
+	AddedAt *metav1.Time `json:"addedAt,omitempty"`
 }
 
 // ClusterCertIdentityStatus defines the observed state of ClusterCertIdentity.

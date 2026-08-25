@@ -387,8 +387,9 @@ func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredentia
 	if mc.Spec.KeyVault != nil {
 		// Hand off to the steady-state path so the new certificate syncs to Key
 		// Vault once it is usable — that is, after its propagation grace, which
-		// the Key Vault sync measures from the certificate's own NotBefore.
-		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, mc.Status.NotBefore)}
+		// the Key Vault sync measures from when the certificate was registered
+		// on the app (kvPropagationSince).
+		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, kvPropagationSince(mc))}
 	}
 	return ctrl.Result{RequeueAfter: requeueForRenewal(newLeaf, mc.Spec.RenewalThreshold, now)}
 }
