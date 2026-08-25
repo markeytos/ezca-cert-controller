@@ -169,11 +169,6 @@ controller:
     annotations: {}
     labels: {}
 
-  crd:
-    ## Install the CRDs with the chart, and keep them on uninstall.
-    enabled: true
-    keep: true
-
   metrics:
     enabled: true
     port: 8443

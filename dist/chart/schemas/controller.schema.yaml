@@ -160,17 +160,6 @@ properties:
         additionalProperties:
           type: string
 
-  crd:
-    type: object
-    additionalProperties: false
-    properties:
-      enabled:
-        description: Install the CRDs with the chart.
-        type: boolean
-      keep:
-        description: Keep the CRDs, and therefore the CRs, on uninstall.
-        type: boolean
-
   metrics:
     type: object
     additionalProperties: false
