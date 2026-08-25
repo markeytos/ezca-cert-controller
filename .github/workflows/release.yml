@@ -14,7 +14,8 @@ on:
     inputs:
       version:
         description: 'Version to publish (semver, no leading v, e.g. 0.1.0)'
-        default: "1.0.0"
+        default: "1.0.2"
+        required: true
         type: string
 
 permissions: {}
