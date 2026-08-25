@@ -274,6 +274,14 @@ kubebuilder edit --plugins=helm/v2-alpha                      # Generates dist/c
 kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts  # Generates charts/chart/
 ```
 
+**CAUTION — this chart diverges from the scaffold:** the CRDs live as plain YAML
+in `dist/chart/crds/` (Helm's special directory, installed before templates are
+validated) so a fresh single-command install can also render the CRs from
+values. Rerunning `kubebuilder edit --plugins=helm/v2-alpha` re-scaffolds
+`dist/chart/templates/crd/` and the `controller.crd.*` values; if you rerun it,
+delete those again and refresh `dist/chart/crds/` from `config/crd/bases/`
+instead (the files are identical copies).
+
 **For development:**
 ```bash
 make helm-deploy IMG=<registry>/<project>:<tag>          # Deploy manager via Helm

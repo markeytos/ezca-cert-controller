@@ -106,6 +106,11 @@ helm install ezca-cert-controller-system \
   -f values.yaml
 ```
 
+> The chart ships its CRDs in the chart's `crds/` directory, so Helm installs
+> them before anything else — a single install on a fresh cluster works even
+> when your values render `ClusterCertIdentity` / `ManagedCredential` resources.
+> If you manage CRDs out of band, pass `--skip-crds`.
+
 ## What it does
 
 You store a certificate in a Kubernetes `kubernetes.io/tls` Secret. The controller
@@ -132,13 +137,37 @@ On top of renewal it can, per certificate:
 | **ManagedCredential** | Namespaced | An application/leaf certificate. On first issuance it authenticates to EZCA using an identity (`identityRef`); thereafter the controller renews and rotates it. |
 
 
+### Upgrade
+
+Helm deliberately never touches the contents of a chart's `crds/` directory
+after the first install, so `helm upgrade` alone will not pick up CRD schema
+changes. When upgrading to a new chart version, apply the packaged CRDs first,
+then upgrade the release:
+
+```bash
+helm pull oci://keytos-eqgzasb8bufxa0cd.azurecr.io/ezca/helm/ezca-cert-controller \
+  --version <version> --untar --destination /tmp/ezca-cert-controller
+kubectl apply --server-side --force-conflicts -f /tmp/ezca-cert-controller/ezca-cert-controller/crds/
+helm upgrade ezca-cert-controller-system \
+  oci://keytos-eqgzasb8bufxa0cd.azurecr.io/ezca/helm/ezca-cert-controller \
+  --version <version> --namespace ezca-cert-controller-system -f values.yaml
+```
+
+Both steps are idempotent, so it is safe to run them unconditionally in CI.
+
 ### Uninstall
 
 ```bash
 helm uninstall ezca-cert-controller-system --namespace ezca-cert-controller-system
 ```
 
-This will not delete the CRDs from your cluster. You must delete them manually if you want a full teardown.
+This will not delete the CRDs (or therefore your `ClusterCertIdentity` /
+`ManagedCredential` resources) from your cluster. To fully tear down, delete the
+CRDs manually afterwards:
+
+```bash
+kubectl delete crd certidentities.ezca.keytos.io clustercertidentities.ezca.keytos.io managedcredentials.ezca.keytos.io
+```
 
 ## Values reference
 
