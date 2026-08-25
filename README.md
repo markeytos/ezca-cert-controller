@@ -162,7 +162,7 @@ helm uninstall ezca-cert-controller-system --namespace ezca-cert-controller-syst
 ```
 
 This will not delete the CRDs (or therefore your `ClusterCertIdentity` /
-`ManagedCredential` resources) from your cluster. To fully tear down, delete the
+`CertIdentity` / `ManagedCredential` resources) from your cluster. To fully tear down, delete the
 CRDs manually afterwards:
 
 ```bash
