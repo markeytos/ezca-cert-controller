@@ -8,8 +8,8 @@ A Helm chart for the **ezca-cert-controller** — a Kubernetes operator that kee
 - Kubernetes cluster and Helm 3.
 - An EZCA subscription.
 - For each identity, a **bootstrap Secret you create yourself** (see below).
-- (optional) For Entra rotation / Key Vault sync: an Entra app registration and its
-  `tenantID` / `appID` / `appObjectID`, with Graph and Key Vault permissions.
+- (optional) For Entra rotation: an Entra app registration and its
+  `tenantID` / `appID` / `appObjectID`, with Graph permissions.
 
 ## Installation
 
@@ -46,9 +46,6 @@ clusterIdentity:
   renewalThreshold: 20
   allowedNamespaces:
     - team-web
-  keyVault:
-    vaultName: my-keyvault
-    certName: master-identity
 
 appCerts:
   - name: web-frontend-cert
@@ -84,10 +81,6 @@ but every part is optional — you configure only the behavior you need:
 - **Entra credential rotation.** Add `appID` / `appObjectID` (with
   `global.tenantID`) and the controller also installs each renewed certificate onto that
   Entra app registration, removing the old credential once it expires.
-- **Key Vault sync.** Add `keyVault` and the controller keeps the named Key Vault
-  certificate in step with the Secret, re-importing whenever they diverge. This
-  builds on the Entra fields, since the controller authenticates to the vault as
-  that app.
 - **No cluster identity.** The `ClusterCertIdentity` is opt-in: it is rendered
   only when you set `clusterIdentity.name`. Omit the `clusterIdentity` block (or
   leave `name` blank) and no `ClusterCertIdentity` is created — for when your
@@ -126,8 +119,6 @@ On top of renewal it can, per certificate:
 - **Rotate Entra ID (Azure AD) app credentials** — when a certificate is a credential
   on an Entra app registration, the controller adds the renewed certificate to the app
   and removes the old one once it expires.
-- **Sync to Azure Key Vault** — keep a named Key Vault certificate in step with the
-  Secret, re-importing whenever they diverge.
 
 ### The two resource kinds
 
@@ -212,9 +203,8 @@ overridden per item.
 | `global.appInsightsConnString` | `""` | Optional App Insights connection string; when set, renewals/rotations/errors are reported. |
 
 > **Entra fields are all-or-nothing.** The CRD requires `global.tenantID`, `appID`, and
-> `appObjectID` to be set together (or all absent). `keyVault` requires them too,
-> since the controller authenticates to the vault as that app. The chart fails
-> rendering if only some are set.
+> `appObjectID` to be set together (or all absent). The chart fails rendering if
+> only some are set.
 
 ### `clusterIdentity` — the ClusterCertIdentity
 
@@ -226,12 +216,11 @@ created elsewhere).
 | Key | Default | Description |
 | --- | --- | --- |
 | `name` | `""` | `metadata.name` of the ClusterCertIdentity. Blank → not created. |
-| `appID` / `appObjectID` | `""` | Entra app (client) ID and directory object ID. Set both to enable Entra rotation + Key Vault sync; leave blank for a certificate-only identity. |
+| `appID` / `appObjectID` | `""` | Entra app (client) ID and directory object ID. Set both to enable Entra rotation; leave blank for a certificate-only identity. |
 | `certSecretName` | `cluster-cert-identity` | Name of the pre-existing `kubernetes.io/tls` Secret with the bootstrap cert. |
 | `certSecretNamespace` | `""` | Namespace of that Secret. Blank → the release namespace. |
 | `renewalThreshold` | `20` | Percent of lifetime remaining at/below which to renew (1–99). |
 | `allowedNamespaces` | `[]` | Namespaces whose `ManagedCredential`s may reference this identity via `identityRef`. Required (≥1); blank → `[release namespace]`. |
-| `keyVault.vaultName` / `keyVault.certName` | `""` | Optional Key Vault cert to keep in sync. Requires the Entra app fields. |
 
 ### `appCerts[]` — the ManagedCredentials
 
@@ -248,10 +237,9 @@ Zero or more entries; each with a `subjectName` renders one `ManagedCredential`.
 | `keyUsages` | no | Subset of `DigitalSignature`, `KeyEncipherment`, `DataEncipherment`, `KeyAgreement`, `NonRepudiation`. Empty → `DigitalSignature` + `KeyEncipherment`. |
 | `extendedKeyUsages` | no | Subset of `Any`, `ServerAuth`, `ClientAuth`, `CodeSigning`, `EmailProtection`, `IPSECEndSystem`, `IPSECTunnel`, `IPSECUser`, `TimeStamping`, `OCSPSigning`, `MicrosoftServerGatedCrypto`, `NetscapeServerGatedCrypto`, `MicrosoftCommercialCodeSigning`, `MicrosoftKernelCodeSigning`. Empty → `ServerAuth` + `ClientAuth`. |
 | `validityInDays` | no | Requested lifetime in days. Unset → issuer default (90 days). |
-| `certSecretName` | no | Name of the issued-cert Secret. |
+| `certSecretName` | no | Name of the issued-cert Secret. Defaults to this entry's `name`. |
 | `renewalThreshold` | no | Percent of lifetime remaining at/below which to renew (1–99, default 20). |
 | `appID` / `appObjectID` | no | Optional per-item Entra app (paired with `global.tenantID`). |
-| `keyVault.vaultName` / `keyVault.certName` | no | Optional Key Vault sync; requires the app fields. |
 | `identityRef.name` / `identityRef.kind` | no | Identity that bootstraps first issuance. `kind` is `ClusterCertIdentity` or `CertIdentity`. Required only on first issuance into an empty Secret; omit if the Secret is provisioned externally. |
 
 
