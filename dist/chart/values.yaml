@@ -56,14 +56,16 @@ clusterIdentity:
 ## Fields: schemas/app-cert.schema.yaml
 # @schema itemRef: schemas/app-cert.schema.yaml
 appCerts: []
+## An entry with identityRef issues its own certificate, so it must say what to
+## issue (subjectName, caID, templateID):
 # - name: web-frontend-cert            # metadata.name (defaults to app-cert-<n>)
 #   namespace: ""                       # blank -> release namespace
-#   subjectName: web.example.com        # required
+#   subjectName: web.example.com        # required when identityRef is set
 #   dnsNames: [web.example.com, www.example.com]
 #   extendedKeyUsages: [ServerAuth]
 #   validityInDays: 90
-#   caID: "00000000-0000-0000-0000-000000000000"        # required (EZCA CA UUID)
-#   templateID: "00000000-0000-0000-0000-000000000000"  # required (EZCA template UUID)
+#   caID: "00000000-0000-0000-0000-000000000000"        # EZCA CA UUID; required when identityRef is set
+#   templateID: "00000000-0000-0000-0000-000000000000"  # EZCA template UUID; required when identityRef is set
 #   certSecretName: web-frontend-cert   # issued-cert Secret (defaults to name)
 #   renewalThreshold: 20
 #   appID: ""                           # optional per-item Entra app
@@ -71,6 +73,11 @@ appCerts: []
 #   identityRef:                        # identity that bootstraps first issuance
 #     name: master-cert-identity-1
 #     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity
+## An entry without identityRef renews a certificate you provision into the
+## Secret yourself; subject, CA, and template all come from that certificate:
+# - name: provisioned-cert
+#   certSecretName: provisioned-cert    # pre-existing kubernetes.io/tls Secret
+#   renewalThreshold: 20
 
 ## ─────────────────────────────────────────────────────────────────────────────
 ## Controller runtime — how the operator itself is deployed.

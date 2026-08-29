@@ -71,16 +71,19 @@ const (
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
 // +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.identityRef) || (has(self.subjectName) && has(self.caID) && has(self.templateID))",message="subjectName, caID, and templateID are required when identityRef is set; they define what identityRef issues"
 type ManagedCredentialSpec struct {
 	CertIdentitySpecBase `json:",inline"`
 
 	// subjectName is the certificate subject. It may be a full RFC 4514
 	// distinguished name (for example "CN=app,OU=team,O=corp") or a bare common
 	// name (for example "app.example.com"), in which case it is treated as the
-	// CN.
-	// +required
+	// CN. Required when identityRef is set; without identityRef the certificate
+	// is provisioned externally and its subject comes from the certificate
+	// itself.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
-	SubjectName string `json:"subjectName"`
+	SubjectName string `json:"subjectName,omitempty"`
 
 	// dnsNames are the DNS Name (dNSName) subject alternative names.
 	// +optional
@@ -119,18 +122,22 @@ type ManagedCredentialSpec struct {
 	ExtendedKeyUsages []ExtKeyUsage `json:"extendedKeyUsages,omitempty"`
 
 	// caID is the EZCA SSL certificate authority (UUID) that issues this
-	// credential's certificate when it is bootstrapped or re-issued.
-	// +required
+	// credential's certificate when it is bootstrapped or re-issued. Required
+	// when identityRef is set; renewals of an externally provisioned certificate
+	// authenticate with that certificate and do not need it.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Format=uuid
-	CAID string `json:"caID"`
+	CAID string `json:"caID,omitempty"`
 
 	// templateID is the EZCA template (UUID) used when issuing this credential's
-	// certificate.
-	// +required
+	// certificate. Required when identityRef is set; renewals of an externally
+	// provisioned certificate authenticate with that certificate and do not
+	// need it.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Format=uuid
-	TemplateID string `json:"templateID"`
+	TemplateID string `json:"templateID,omitempty"`
 
 	// identityRef points to the identity whose certificate bootstraps this
 	// credential. It is required on first issuance (when the Secret is empty),
