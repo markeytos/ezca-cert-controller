@@ -271,13 +271,20 @@
     "app-cert.schema.yaml": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "appCerts entry",
-      "description": "One ManagedCredential. subjectName, caID and templateID identify what to issue; everything else is optional.",
+      "description": "One ManagedCredential. With identityRef, subjectName, caID and templateID define what to issue; without it, the certificate is provisioned into the Secret externally and everything comes from the certificate itself.",
       "type": "object",
-      "required": [
-        "subjectName",
-        "caID",
-        "templateID"
-      ],
+      "if": {
+        "required": [
+          "identityRef"
+        ]
+      },
+      "then": {
+        "required": [
+          "subjectName",
+          "caID",
+          "templateID"
+        ]
+      },
       "properties": {
         "appID": {
           "description": "Entra app (client) ID. Pairs with appObjectID and the root tenantID.",

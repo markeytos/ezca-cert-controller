@@ -8,13 +8,19 @@
 ## the ManagedCredential CRD.
 $schema: https://json-schema.org/draft/2020-12/schema
 title: appCerts entry
-description: One ManagedCredential. subjectName, caID and templateID identify what to issue; everything else is optional.
+description: One ManagedCredential. With identityRef, subjectName, caID and templateID define what to issue; without it, the certificate is provisioned into the Secret externally and everything comes from the certificate itself.
 type: object
 additionalProperties: false
-required:
-  - subjectName
-  - caID
-  - templateID
+# Issuance (identityRef set) needs to know what to issue. A credential without
+# identityRef only renews an externally provisioned certificate, which carries
+# its own subject, CA, and template.
+if:
+  required: [identityRef]
+then:
+  required:
+    - subjectName
+    - caID
+    - templateID
 
 properties:
   name:
