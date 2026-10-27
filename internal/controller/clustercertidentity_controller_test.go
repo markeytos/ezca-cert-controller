@@ -1287,6 +1287,79 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		})
 
+		It("promotes for the primary app alone once the active certificate expires while an additional app cannot take the key", func() {
+			certPEM, keyPEM, oldCert := genCert("stuck.ezca.io", now.Add(-90*day), now.Add(30*time.Minute))
+			createSecret("stuck-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("stuck-identity", "stuck-secret")
+
+			_, _, parsedNew := genCert("stuck.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			secretName := types.NamespacedName{Name: "stuck-secret", Namespace: namespace}
+			expectServing := func(want *x509.Certificate) {
+				GinkgoHelper()
+				var s corev1.Secret
+				Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+				chain, err := pki.ParseCertChainPEM(s.Data[tlsCertKey])
+				Expect(err).NotTo(HaveOccurred())
+				Expect(chain[0].Equal(want)).To(BeTrue())
+			}
+			expectUnrotated := func() {
+				GinkgoHelper()
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+				Expect(cond).NotTo(BeNil())
+				Expect(cond.Reason).To(Equal("AdditionalAppRotationFailed"))
+				Expect(cond.Message).To(ContainSubstring(extraAppID3))
+				Expect(cond.Message).NotTo(ContainSubstring(extraAppID2))
+			}
+
+			// The app registration was deleted: every addition fails.
+			extra3.addErr = errors.New("404 Request_ResourceNotFound")
+			res, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(verifyInterval))
+
+			// While the active certificate is valid, the missing app holds
+			// promotion back, but the next pass comes no later than its expiry.
+			clockNow = now.Add(verifyInterval)
+			res, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(30*time.Minute - verifyInterval))
+			expectServing(oldCert)
+			expectUnrotated()
+
+			// Once it expires the primary app alone decides: it already holds the
+			// staged certificate, so the first passing check promotes it.
+			clockNow = oldCert.NotAfter
+			extra3VerifyCalls := extra3.verifyCalls
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			expectServing(parsedNew)
+			Expect(extra3.verifyCalls).To(Equal(extra3VerifyCalls), "a missing app must not hold the promotion back")
+			expectUnrotated()
+			Expect(meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity).Message).To(ContainSubstring("Request_ResourceNotFound"))
+			Expect(cci.Status.PendingThumbprint).To(BeEmpty())
+
+			// The condition holds on steady-state passes while the app still
+			// cannot authenticate with the certificate...
+			extra3.verifyErr = errors.New("AADSTS700027: key not found")
+			clockNow = oldCert.NotAfter.Add(time.Hour)
+			res, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(unrotatedAppsRecheck))
+			expectUnrotated()
+
+			// ...and clears once an administrator has added it to the app.
+			extra3.verifyErr = nil
+			clockNow = clockNow.Add(unrotatedAppsRecheck)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		})
+
 		It("tracks a staged certificate already on the primary app without adding it again", func() {
 			activePEM, activeKeyPEM, _ := genCert("lost.ezca.io", now.Add(-10*day), now.Add(90*day))
 			pendingPEM, pendingKeyPEM, pendingCert := genCert("lost.ezca.io", now, now.Add(100*day))

@@ -132,7 +132,11 @@ type CertIdentitySpecBase struct {
 	// every rotation the renewed certificate is added to the primary app and to
 	// every additional app, and it is not promoted into the Secret (and the
 	// identity does not report Available) until every one of those apps can
-	// authenticate with it. Graph's addKey requires a proof of possession
+	// authenticate with it. Once the active certificate has expired, only the
+	// primary app has to authenticate: the renewed certificate is promoted and
+	// the identity reports Degraded (AdditionalAppRotationFailed) for the
+	// additional apps that do not hold it, which then need it added again by
+	// an administrator. Graph's addKey requires a proof of possession
 	// signed by a certificate the target app already trusts, so each
 	// additional app must be bootstrapped with the identity's certificate (for
 	// a ManagedCredential, the identityRef's certificate also works) before it

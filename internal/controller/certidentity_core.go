@@ -53,6 +53,12 @@ const (
 	// reasonPendingPropagation is the Progressing condition reason used while a
 	// newly added certificate awaits Entra ID propagation before promotion.
 	reasonPendingPropagation = "PendingPropagation"
+	// reasonAdditionalAppRotationFailed is the Degraded condition reason used
+	// while some additional apps do not hold the identity's certificate.
+	reasonAdditionalAppRotationFailed = "AdditionalAppRotationFailed"
+	// unrotatedAppsRecheck is how often an identity whose additional apps were
+	// left without its certificate checks whether they have been fixed.
+	unrotatedAppsRecheck = time.Hour
 
 	tlsCertKey = "tls.crt"
 	tlsKeyKey  = "tls.key"
@@ -228,6 +234,10 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 				log.Error(err, "Failed to clean up expired app credentials")
 			}
 		}
+		if apps := unrotatedAdditionalApps(ctx, d, obj, current, key); len(apps) > 0 {
+			setAdditionalAppsNotRotated(obj, apps, nil)
+			return ctrl.Result{RequeueAfter: unrotatedAppsRequeue(current, spec.RenewalThreshold, now)}, nil
+		}
 		setAvailable(obj, "CertificateValid", "Certificate is valid and not yet due for renewal")
 		return ctrl.Result{RequeueAfter: requeueForRenewal(current, spec.RenewalThreshold, now)}, nil
 	}
@@ -281,7 +291,8 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 	// App identity: stage the renewed certificate as pending, then add it to the
 	// app registration (and to every additional app) using the current
 	// (trusted) certificate. It is promoted into the active Secret only once
-	// every app can authenticate with it (see promoteIfReady), so the Secret
+	// every app can authenticate with it, or the primary app can after the
+	// active certificate has expired (see promoteIfReady), so the Secret
 	// never serves an unusable cert to the controller or to other consumers.
 	//
 	// Staging comes first so that a failed registration never discards the
@@ -314,7 +325,7 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		Message: "Renewed certificate added to the app registration; waiting for Entra ID propagation",
 	})
 	log.Info("Staged renewed certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-	return ctrl.Result{RequeueAfter: checkInterval(d.propagation(), certValidAt(current, now))}, nil
+	return ctrl.Result{RequeueAfter: checkBefore(checkInterval(d.propagation(), certValidAt(current, now)), current.NotAfter, now)}, nil
 }
 
 // promoteIfReady checks whether the staged (pending) certificate can now
@@ -361,10 +372,12 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	// When the active certificate has already expired (or cannot be read),
 	// nothing is left to protect by waiting out the propagation grace: the
 	// staged certificate is checked often and promoted as soon as it
-	// authenticates as every app.
+	// authenticates as the primary app.
 	activeValid := false
+	var activeExpiry time.Time
 	if activeChain, _, perr := parseSecret(secret); perr == nil {
 		activeValid = certValidAt(activeChain[0], now)
+		activeExpiry = activeChain[0].NotAfter
 	}
 
 	// Every pending certificate needs a PendingSince to drive the grace and
@@ -381,38 +394,35 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	// never added to the primary app (the rotation's registration failed, or its
 	// record was lost); it must be before anything else can happen. A failed
 	// registration on any app keeps the identity Degraded with the Graph error,
-	// and there is nothing to verify until every app holds the certificate.
+	// and while the active certificate is valid there is nothing to verify
+	// until every app holds the certificate.
+	//
+	// Once the active certificate has expired, additional apps no longer hold
+	// promotion back. An app still missing the staged certificate then can no
+	// longer receive it with the active one (Graph's addKey proof must be
+	// signed by a certificate the app trusts), and every app sharing the
+	// certificate is already failing with the expired one, so waiting would
+	// only keep the primary app down too. The registration is still retried
+	// first (a ManagedCredential may have its identityRef to authenticate
+	// with), and the apps left without the certificate stay named in the
+	// Degraded condition after promotion.
 	pendingThumbprint := pki.Thumbprint(pendingLeaf)
-	onPrimary := managedCredentialFor(status, pendingThumbprint) != nil
-	if !onPrimary && authenticatesAs(ctx, d, spec, *spec.AppID, pendingLeaf, pendingKey) {
-		// The primary app already trusts the staged certificate: it was added,
-		// but the record of it was lost (every status write after the addKey
-		// failed). Adding it again would duplicate the key, or fail for good if
-		// Graph rejects the duplicate. Track it without a keyID instead; the
-		// controller cannot remove a key whose ID it never recorded, so that key
-		// stays on the app after it expires.
-		log.Info("Staged certificate is already registered on the app but was not recorded; it will not be removed automatically when it expires",
-			"thumbprint", pendingThumbprint, "appID", *spec.AppID)
-		status.ManagedKeyCredentials = append(status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
-			Thumbprint: pendingThumbprint,
-			NotAfter:   metav1.Time{Time: pendingLeaf.NotAfter},
-		})
-		onPrimary = true
-	}
+	onPrimary := managedCredentialFor(status, pendingThumbprint) != nil || adoptUnrecordedPrimaryKey(ctx, d, obj, pendingLeaf, pendingKey)
+	var registerErr error
 	if !onPrimary || len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
-		aerr := registerStaged(ctx, d, obj, secret, pendingLeaf, tel, now)
-		if aerr != nil {
-			reportRegistrationFailure(ctx, obj, pendingThumbprint, aerr)
+		registerErr = registerStaged(ctx, d, obj, secret, pendingLeaf, tel, now)
+		if registerErr != nil {
+			reportRegistrationFailure(ctx, obj, pendingThumbprint, registerErr)
 		}
 		if managedCredentialFor(status, pendingThumbprint) == nil {
-			return ctrl.Result{}, aerr
+			return ctrl.Result{}, registerErr
 		}
-		if len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
+		if activeValid && len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
 			// Adding the key later moves the propagation anchor, which restarts
 			// the checks, so none are worth making until then.
-			return ctrl.Result{RequeueAfter: checkInterval(d.propagation(), activeValid)}, nil
+			return ctrl.Result{RequeueAfter: checkBefore(checkInterval(d.propagation(), activeValid), activeExpiry, now)}, nil
 		}
-		if aerr == nil {
+		if registerErr == nil {
 			recoverFromDegraded(obj, activeValid)
 		}
 	}
@@ -443,14 +453,7 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		return ctrl.Result{RequeueAfter: nextCheck.Sub(now)}, nil
 	}
 
-	// The staged certificate must authenticate as the primary app and as every
-	// additional app: it is not "there" until every app that shares it can use
-	// it.
-	verifyAppIDs := []string{*spec.AppID}
-	for _, app := range spec.AdditionalApps {
-		verifyAppIDs = append(verifyAppIDs, app.AppID)
-	}
-	for _, appID := range verifyAppIDs {
+	for _, appID := range promotionAppIDs(spec, activeValid) {
 		cl, err := d.newEntraClient(*spec.TenantID, appID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -498,6 +501,14 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	tel.TrackEvent("CertificateRenewed", identityProps(obj))
 	log.Info("Promoted renewed certificate", "thumbprint", pki.Thumbprint(pendingLeaf), "notAfter", pendingLeaf.NotAfter)
 	setAvailable(obj, "CertificateRenewed", "Certificate renewed successfully")
+	if missing := missingAdditionalApps(obj, pendingThumbprint); len(missing) > 0 {
+		// Promoted without some additional apps (the active certificate had
+		// expired): they cannot authenticate with the identity's certificate
+		// until an administrator adds it to them again.
+		log.Info("Promoted renewed certificate without some additional app registrations", "thumbprint", pendingThumbprint, "appIDs", additionalAppIDs(missing))
+		setAdditionalAppsNotRotated(obj, missing, registerErr)
+		return ctrl.Result{RequeueAfter: unrotatedAppsRequeue(pendingLeaf, spec.RenewalThreshold, now)}, nil
+	}
 	return ctrl.Result{RequeueAfter: requeueForRenewal(pendingLeaf, spec.RenewalThreshold, now)}, nil
 }
 
@@ -509,6 +520,53 @@ func checkInterval(timing PropagationTiming, activeValid bool) time.Duration {
 		return propagationRequeue
 	}
 	return timing.verifyInterval()
+}
+
+// adoptUnrecordedPrimaryKey tracks a staged certificate status does not record
+// on the primary app when the app already trusts it: it was added, but the
+// record of it was lost (every status write after the addKey failed). Adding it
+// again would duplicate the key, or fail for good if Graph rejects the
+// duplicate. It is tracked without a keyID instead; the controller cannot
+// remove a key whose ID it never recorded, so that key stays on the app after
+// it expires. It reports whether the certificate was adopted.
+func adoptUnrecordedPrimaryKey(ctx context.Context, d reconcilerDeps, obj certIdentity, leaf *x509.Certificate, key *rsa.PrivateKey) bool {
+	spec := obj.SpecBase()
+	status := obj.StatusBase()
+	if !authenticatesAs(ctx, d, spec, *spec.AppID, leaf, key) {
+		return false
+	}
+	thumbprint := pki.Thumbprint(leaf)
+	logf.FromContext(ctx).Info("Staged certificate is already registered on the app but was not recorded; it will not be removed automatically when it expires",
+		"thumbprint", thumbprint, "appID", *spec.AppID)
+	status.ManagedKeyCredentials = append(status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
+		Thumbprint: thumbprint,
+		NotAfter:   metav1.Time{Time: leaf.NotAfter},
+	})
+	return true
+}
+
+// promotionAppIDs returns the apps a staged certificate must authenticate as
+// before it is promoted: the primary app and every additional app, since it is
+// not "there" until every app that shares it can use it. With the active
+// certificate expired, only the primary app: withholding the staged
+// certificate cannot help an additional app that does not accept it yet, since
+// none of them accepts the expired one.
+func promotionAppIDs(spec *ezcav1.CertIdentitySpecBase, activeValid bool) []string {
+	appIDs := []string{*spec.AppID}
+	if activeValid {
+		appIDs = append(appIDs, additionalAppIDs(spec.AdditionalApps)...)
+	}
+	return appIDs
+}
+
+// checkBefore caps the wait d before a staged certificate is next checked at
+// the active certificate's expiry, when additional apps still missing the
+// staged certificate stop holding its promotion back.
+func checkBefore(d time.Duration, expiry, now time.Time) time.Duration {
+	if expiry.After(now) && expiry.Sub(now) < d {
+		return expiry.Sub(now)
+	}
+	return d
 }
 
 // recoverFromDegraded clears a Degraded condition an earlier pass left behind
@@ -822,13 +880,58 @@ func reportRegistrationFailure(ctx context.Context, obj certIdentity, thumbprint
 		log.Error(err, "Failed to record certificate app registrations in status", "thumbprint", thumbprint)
 		return
 	}
-	appIDs := make([]string, 0, len(missing))
-	for _, app := range missing {
+	appIDs := additionalAppIDs(missing)
+	log.Error(err, "Failed to add certificate to additional app registrations", "thumbprint", thumbprint, "appIDs", appIDs)
+	setDegraded(obj, reasonAdditionalAppRotationFailed, fmt.Sprintf("Failed to add certificate to additional app registrations %s: %s",
+		strings.Join(appIDs, ", "), conditionError(err)))
+}
+
+// setAdditionalAppsNotRotated reports an active certificate that the given
+// additional apps do not hold, so they cannot authenticate with it. err, when
+// non-nil, is the last error adding it to them.
+func setAdditionalAppsNotRotated(obj certIdentity, apps []ezcav1.AdditionalAppSpec, err error) {
+	msg := fmt.Sprintf("Additional app registrations %s do not hold the active certificate and cannot authenticate with it; add the certificate to them or remove them from spec.additionalApps",
+		strings.Join(additionalAppIDs(apps), ", "))
+	if err != nil {
+		msg += ". Last error adding it: " + conditionError(err)
+	}
+	setDegraded(obj, reasonAdditionalAppRotationFailed, msg)
+}
+
+// unrotatedAdditionalApps returns the additional apps a rotation had to leave
+// without the active certificate (see promoteIfReady) that still cannot
+// authenticate with it. It only looks while the identity reports them, so a
+// healthy identity spends no token requests here; an app an administrator has
+// since given the certificate (or removed from spec.additionalApps) no longer
+// counts.
+func unrotatedAdditionalApps(ctx context.Context, d reconcilerDeps, obj certIdentity, cert *x509.Certificate, key *rsa.PrivateKey) []ezcav1.AdditionalAppSpec {
+	cond := meta.FindStatusCondition(obj.StatusBase().Conditions, typeDegradedCertIdentity)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != reasonAdditionalAppRotationFailed {
+		return nil
+	}
+	spec := obj.SpecBase()
+	var apps []ezcav1.AdditionalAppSpec
+	for _, app := range missingAdditionalApps(obj, pki.Thumbprint(cert)) {
+		if !authenticatesAs(ctx, d, spec, app.AppID, cert, key) {
+			apps = append(apps, app)
+		}
+	}
+	return apps
+}
+
+// unrotatedAppsRequeue is when to next check an identity reporting additional
+// apps without its certificate: before renewal is due, and at least every
+// unrotatedAppsRecheck so the condition clears once they are fixed.
+func unrotatedAppsRequeue(cert *x509.Certificate, threshold int32, now time.Time) time.Duration {
+	return min(requeueForRenewal(cert, threshold, now), unrotatedAppsRecheck)
+}
+
+func additionalAppIDs(apps []ezcav1.AdditionalAppSpec) []string {
+	appIDs := make([]string, 0, len(apps))
+	for _, app := range apps {
 		appIDs = append(appIDs, app.AppID)
 	}
-	log.Error(err, "Failed to add certificate to additional app registrations", "thumbprint", thumbprint, "appIDs", appIDs)
-	setDegraded(obj, "AdditionalAppRotationFailed", fmt.Sprintf("Failed to add certificate to additional app registrations %s: %s",
-		strings.Join(appIDs, ", "), conditionError(err)))
+	return appIDs
 }
 
 // conditionError renders err on a single line for a condition message, since
