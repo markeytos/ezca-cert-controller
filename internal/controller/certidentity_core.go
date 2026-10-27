@@ -296,17 +296,16 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 	d.releaseIssued(obj.GetUID())
 	stagePending(status, newLeaf, now)
 	if err := manageApp(ctx, d, obj, current, key, newLeaf, tel, now); err != nil {
+		reportRegistrationFailure(ctx, obj, pki.Thumbprint(newLeaf), err)
 		if managedCredentialFor(status, pki.Thumbprint(newLeaf)) == nil {
 			// Not even the primary app took the certificate. It stays staged;
 			// promotion retries the registration.
-			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
 			return ctrl.Result{}, err
 		}
 		// The primary app holds the renewed certificate but some additional apps
-		// do not yet. The registrations made so far are recorded in status, and
+		// may not yet. The registrations made so far are recorded in status, and
 		// promotion retries the missing apps and waits until every app holds the
 		// certificate.
-		log.Error(err, "Renewed certificate is missing from some additional app registrations; retrying them before promotion")
 	}
 	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 		Type:    typeProgressingCertIdentity,
@@ -380,9 +379,9 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	// certificate is promoted only once every configured app holds it, so retry
 	// the missing addKey calls. A staged certificate status does not track was
 	// never added to the primary app (the rotation's registration failed, or its
-	// record was lost); it must be before anything else can happen, so a failure
-	// there keeps the identity Degraded and retries. Failures on additional apps
-	// surface through the verification below, which times out into Degraded.
+	// record was lost); it must be before anything else can happen. A failed
+	// registration on any app keeps the identity Degraded with the Graph error,
+	// and there is nothing to verify until every app holds the certificate.
 	pendingThumbprint := pki.Thumbprint(pendingLeaf)
 	onPrimary := managedCredentialFor(status, pendingThumbprint) != nil
 	if !onPrimary && authenticatesAs(ctx, d, spec, *spec.AppID, pendingLeaf, pendingKey) {
@@ -402,13 +401,18 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	}
 	if !onPrimary || len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
 		aerr := registerStaged(ctx, d, obj, secret, pendingLeaf, tel, now)
-		if !onPrimary && managedCredentialFor(status, pendingThumbprint) == nil {
-			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add staged certificate to app registration: %v", aerr))
+		if aerr != nil {
+			reportRegistrationFailure(ctx, obj, pendingThumbprint, aerr)
+		}
+		if managedCredentialFor(status, pendingThumbprint) == nil {
 			return ctrl.Result{}, aerr
 		}
-		if aerr != nil {
-			log.Error(aerr, "Failed to add staged certificate to additional app registrations")
-		} else {
+		if len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
+			// Adding the key later moves the propagation anchor, which restarts
+			// the checks, so none are worth making until then.
+			return ctrl.Result{RequeueAfter: checkInterval(d.propagation(), activeValid)}, nil
+		}
+		if aerr == nil {
 			recoverFromDegraded(obj, activeValid)
 		}
 	}
@@ -646,7 +650,7 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 			}
 			acl, err := d.newEntraClient(*spec.TenantID, app.AppID, cloudFor(spec.Cloud), authCert, authKey)
 			if err != nil {
-				addErr = errors.Join(addErr, err)
+				addErr = errors.Join(addErr, fmt.Errorf("authenticating as additional app %s: %w", app.AppID, err))
 				continue
 			}
 			keyID, err := acl.AddKey(ctx, app.AppObjectID, newLeaf.Raw)
@@ -797,6 +801,40 @@ func missingAdditionalApps(obj certIdentity, thumbprint string) []ezcav1.Additio
 		}
 	}
 	return missing
+}
+
+// reportRegistrationFailure surfaces err, returned by manageApp while adding
+// the certificate with the given thumbprint, on the condition the failure
+// earns: AppRotationFailed when the primary app does not hold the certificate,
+// AdditionalAppRotationFailed (naming the apps) when only some additional apps
+// do not. When every app holds it, err only failed to record that in status,
+// and is logged.
+func reportRegistrationFailure(ctx context.Context, obj certIdentity, thumbprint string, err error) {
+	log := logf.FromContext(ctx)
+	spec := obj.SpecBase()
+	if managedCredentialFor(obj.StatusBase(), thumbprint) == nil {
+		log.Error(err, "Failed to add certificate to app registration", "thumbprint", thumbprint, "appID", *spec.AppID)
+		setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add certificate to app registration %s: %s", *spec.AppID, conditionError(err)))
+		return
+	}
+	missing := missingAdditionalApps(obj, thumbprint)
+	if len(missing) == 0 {
+		log.Error(err, "Failed to record certificate app registrations in status", "thumbprint", thumbprint)
+		return
+	}
+	appIDs := make([]string, 0, len(missing))
+	for _, app := range missing {
+		appIDs = append(appIDs, app.AppID)
+	}
+	log.Error(err, "Failed to add certificate to additional app registrations", "thumbprint", thumbprint, "appIDs", appIDs)
+	setDegraded(obj, "AdditionalAppRotationFailed", fmt.Sprintf("Failed to add certificate to additional app registrations %s: %s",
+		strings.Join(appIDs, ", "), conditionError(err)))
+}
+
+// conditionError renders err on a single line for a condition message, since
+// errors.Join separates the errors it joins with newlines.
+func conditionError(err error) string {
+	return strings.ReplaceAll(err.Error(), "\n", "; ")
 }
 
 // writeActiveSecret rewrites the active tls.crt/tls.key with the given chain

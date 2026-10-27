@@ -399,7 +399,11 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(entraClient.added).To(HaveLen(1))
 		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeFalse())
-		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+		cond := meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("AdditionalAppRotationFailed"))
+		Expect(cond.Message).To(ContainSubstring(extraAppID))
+		Expect(cond.Message).To(ContainSubstring("graph is down"))
 
 		// The app recovers: the next pass completes the missing registration
 		// without issuing a new certificate, and the credential settles.

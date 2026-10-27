@@ -208,7 +208,7 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
 		if err := manageApp(ctx, r, mc, authCert, authKey, chain[0], tel, now); err != nil {
-			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
+			reportRegistrationFailure(ctx, mc, pki.Thumbprint(chain[0]), err)
 			return ctrl.Result{}, err
 		}
 		logf.FromContext(ctx).Info("Registered the active certificate on the app registrations",
@@ -375,15 +375,14 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 	}
 
 	if err := manageApp(ctx, r, mc, authCert, authKey, newLeaf, tel, now); err != nil {
+		reportRegistrationFailure(ctx, mc, pki.Thumbprint(newLeaf), err)
 		// Tolerate a failure limited to the additional apps when a certificate is
 		// already being served: the issued certificate is on the primary app and
 		// recorded in status, and the promotion flow retries the missing
 		// additional registrations.
 		if currentLeaf == nil || managedCredentialFor(mc.StatusBase(), pki.Thumbprint(newLeaf)) == nil {
-			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
 			return ctrl.Result{}, err
 		}
-		log.Error(err, "Issued certificate is missing from some additional app registrations; retrying them before promotion")
 	}
 
 	if currentLeaf != nil {

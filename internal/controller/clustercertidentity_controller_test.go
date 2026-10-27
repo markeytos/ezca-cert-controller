@@ -1240,12 +1240,34 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 			Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
 			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(1))
+			expectAdditionalAppFailure := func() {
+				GinkgoHelper()
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+				Expect(cond).NotTo(BeNil())
+				Expect(cond.Reason).To(Equal("AdditionalAppRotationFailed"))
+				Expect(cond.Message).To(ContainSubstring(extraAppID3))
+				Expect(cond.Message).To(ContainSubstring("graph is down"))
+				Expect(cond.Message).NotTo(ContainSubstring(extraAppID2), "only the app missing the certificate is named")
+			}
+			expectAdditionalAppFailure()
+
+			// Still failing past the propagation timeout: the condition keeps
+			// reporting the registration error, not a propagation timeout, and no
+			// token checks are spent on a certificate an app does not hold.
+			verifyCallsBefore := extra3.verifyCalls
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			res, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(verifyInterval))
+			expectAdditionalAppFailure()
+			Expect(extra3.verifyCalls).To(Equal(verifyCallsBefore))
 
 			// The app recovers well after staging: the next pass completes the
 			// missing registration, but that app only now holds the key, so
 			// propagation starts over from here rather than promoting right away.
 			extra3.addErr = nil
-			recoveredAt := now.Add(DefaultPropagationGrace + time.Minute)
+			recoveredAt := now.Add(DefaultPropagationTimeout + 2*time.Minute)
 			clockNow = recoveredAt
 			_, err = reconciler.Reconcile(ctx, req)
 			Expect(err).NotTo(HaveOccurred())
@@ -1253,6 +1275,8 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			Expect(extra3.added[0]).To(Equal(parsedNew.Raw))
 			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
 			Expect(s.Data).To(HaveKey(tlsCertPendingKey), "a late-registered app must get the full grace")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
 
 			// Promoted only after a full grace for that app.
 			settle(req, recoveredAt)
