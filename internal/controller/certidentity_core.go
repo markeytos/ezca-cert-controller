@@ -27,9 +27,11 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -762,11 +764,40 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 	// that fails, this ensures the added credential is already recorded so it is
 	// cleaned up on expiry instead of being orphaned on the app registration.
 	if addedKeys {
-		if err := d.kubeClient().Status().Update(ctx, obj); err != nil {
+		if err := updateStatus(ctx, d.kubeClient(), obj); err != nil {
 			return errors.Join(addErr, err)
 		}
 	}
 	return addErr
+}
+
+// updateStatus writes obj's status, retrying on a conflict against the latest
+// resourceVersion. The controller is the only writer of status, so its status
+// wins; a conflict only means something else (a spec or metadata edit) changed
+// the object since it was read. Retrying matters most for the keyIDs manageApp
+// records: a lost record makes the next pass add the key to the app again,
+// leaving a duplicate key that is never removed, or failing on every pass if
+// Graph rejects the duplicate. obj takes the new resourceVersion, so later
+// writes in the same reconcile do not conflict too, but keeps its spec: the
+// change that caused the conflict triggers its own reconcile.
+func updateStatus(ctx context.Context, c client.Client, obj client.Object) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		written := obj.DeepCopyObject().(client.Object)
+		err := c.Status().Update(ctx, written)
+		if err == nil {
+			obj.SetResourceVersion(written.GetResourceVersion())
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			return err
+		}
+		latest := obj.DeepCopyObject().(client.Object)
+		if gerr := c.Get(ctx, client.ObjectKeyFromObject(obj), latest); gerr != nil {
+			return gerr
+		}
+		obj.SetResourceVersion(latest.GetResourceVersion())
+		return err
+	})
 }
 
 // removeAdditionalKeys removes an expired certificate's keyCredentials from the

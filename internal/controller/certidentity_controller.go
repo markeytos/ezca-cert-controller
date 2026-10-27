@@ -95,7 +95,7 @@ func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the CertIdentity watch.
 	if !equality.Semantic.DeepEqual(originalStatus, &ci.Status) {
-		if err := r.Status().Update(ctx, &ci); err != nil {
+		if err := updateStatus(ctx, r.Client, &ci); err != nil {
 			log.Error(err, "Failed to update CertIdentity status")
 			if reconcileErr == nil {
 				reconcileErr = err

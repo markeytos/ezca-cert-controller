@@ -80,6 +80,8 @@ type fakeEntra struct {
 	addErr      error
 	removed     []string
 	removeErr   error
+	// onAdd, when set, runs after each successful AddKey.
+	onAdd func()
 }
 
 func (f *fakeEntra) VerifyCredential(_ context.Context) error {
@@ -95,6 +97,9 @@ func (f *fakeEntra) AddKey(_ context.Context, _ string, der []byte) (string, err
 		return "", errors.New("fakeEntra: empty certificate DER")
 	}
 	f.added = append(f.added, der)
+	if f.onAdd != nil {
+		f.onAdd()
+	}
 	return "new-key-id", nil
 }
 
@@ -1357,6 +1362,44 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
 			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		})
+
+		It("records the added keys when the object changes mid-rotation, so no app gets the key twice", func() {
+			certPEM, keyPEM, _ := genCert("conflict.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("conflict-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("conflict-identity", "conflict-secret")
+
+			_, _, parsedNew := genCert("conflict.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+			// Someone edits the object while the keys are being added, so the
+			// resourceVersion the reconcile read is stale by the time it records
+			// them.
+			extra3.onAdd = func() {
+				var latest ezcav1.ClusterCertIdentity
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, &latest)).To(Succeed())
+				latest.Labels = map[string]string{"edited": "true"}
+				Expect(k8sClient.Update(ctx, &latest)).To(Succeed())
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			extra3.onAdd = nil
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(parsedNew)))
+			Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
+			Expect(cci.Status.ManagedKeyCredentials[0].KeyID).NotTo(BeEmpty())
+			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(2))
+
+			// Later passes find every key recorded and add none again.
+			settle(req, now)
+			Expect(entraClient.added).To(HaveLen(1))
+			Expect(extra2.added).To(HaveLen(1))
+			Expect(extra3.added).To(HaveLen(1))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.PendingThumbprint).To(BeEmpty())
 			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		})
 

@@ -122,7 +122,7 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the ManagedCredential watch.
 	if !equality.Semantic.DeepEqual(originalStatus, &mc.Status) {
-		if err := r.Status().Update(ctx, &mc); err != nil {
+		if err := updateStatus(ctx, r.Client, &mc); err != nil {
 			log.Error(err, "Failed to update ManagedCredential status")
 			if reconcileErr == nil {
 				reconcileErr = err

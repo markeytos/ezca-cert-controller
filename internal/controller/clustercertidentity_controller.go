@@ -94,7 +94,7 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the ClusterCertIdentity watch.
 	if !equality.Semantic.DeepEqual(originalStatus, &cci.Status) {
-		if err := r.Status().Update(ctx, &cci); err != nil {
+		if err := updateStatus(ctx, r.Client, &cci); err != nil {
 			log.Error(err, "Failed to update ClusterCertIdentity status")
 			if reconcileErr == nil {
 				reconcileErr = err
