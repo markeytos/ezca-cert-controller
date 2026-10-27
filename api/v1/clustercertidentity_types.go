@@ -78,6 +78,17 @@ type CertIdentityStatusBase struct {
 	// +optional
 	PendingSince *metav1.Time `json:"pendingSince,omitempty"`
 
+	// pendingVerifications counts the consecutive checks, spread across the
+	// propagation grace, in which the pending certificate authenticated as the
+	// primary app and as every additional app. It is promoted only once enough
+	// checks have succeeded; a failed check resets the count.
+	// +optional
+	PendingVerifications int32 `json:"pendingVerifications,omitempty"`
+
+	// pendingLastVerified is when the pending certificate was last checked.
+	// +optional
+	PendingLastVerified *metav1.Time `json:"pendingLastVerified,omitempty"`
+
 	// managedKeyCredentials are the certificates the controller has added to
 	// the Entra ID app registration, tracked so expired ones can be removed.
 	// +listType=map
@@ -255,6 +266,11 @@ type AdditionalAppKey struct {
 	// keyID is the keyCredential identifier assigned by Microsoft Graph.
 	// +required
 	KeyID string `json:"keyID"`
+
+	// addedAt is when the key was added to this app registration. Entra
+	// propagation for this app is measured from this time.
+	// +optional
+	AddedAt *metav1.Time `json:"addedAt,omitempty"`
 }
 
 // ManagedKeyCredential records a certificate the controller added to an Entra ID
@@ -265,8 +281,10 @@ type ManagedKeyCredential struct {
 	Thumbprint string `json:"thumbprint"`
 
 	// keyID is the keyCredential identifier assigned by Microsoft Graph. It is
-	// empty once the expired key has been removed from the primary app while
-	// its removal from some additional apps is still being retried.
+	// empty when there is no primary key for the controller to remove: the
+	// expired key was already removed from the primary app while its removal
+	// from some additional apps is still being retried, or the certificate was
+	// found already registered on the primary app without its keyID recorded.
 	// +required
 	KeyID string `json:"keyID"`
 

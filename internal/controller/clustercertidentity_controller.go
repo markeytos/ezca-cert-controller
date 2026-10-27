@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -151,7 +152,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterCertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ezcav1.ClusterCertIdentity{}).
+		For(&ezcav1.ClusterCertIdentity{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("clustercertidentity").
 		Complete(r)

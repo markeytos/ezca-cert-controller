@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -146,7 +147,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 // SetupWithManager sets up the controller with the Manager.
 func (r *CertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ezcav1.CertIdentity{}).
+		For(&ezcav1.CertIdentity{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("certidentity").
 		Complete(r)

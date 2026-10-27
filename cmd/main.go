@@ -61,6 +61,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var propagation controller.PropagationTiming
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -82,10 +83,21 @@ func main() {
 	opts := zap.Options{
 		Development: true,
 	}
+	flag.DurationVar(&propagation.Grace, "propagation-grace", controller.DefaultPropagationGrace,
+		"Minimum time between adding a renewed certificate to an app registration and promoting it into the Secret. "+
+			"The checks that the certificate authenticates are spread across it.")
+	flag.DurationVar(&propagation.Timeout, "propagation-timeout", controller.DefaultPropagationTimeout,
+		"How long a renewed certificate may fail to authenticate after being added to an app registration "+
+			"before the identity reports Degraded. Must exceed --propagation-grace.")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := propagation.Validate(); err != nil {
+		setupLog.Error(err, "Invalid propagation flags")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -180,8 +192,9 @@ func main() {
 
 	if err := (&controller.ClusterCertIdentityReconciler{
 		ReconcilerBase: controller.ReconcilerBase{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			Propagation: propagation,
 		},
 		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
@@ -190,8 +203,9 @@ func main() {
 	}
 	if err := (&controller.ManagedCredentialReconciler{
 		ReconcilerBase: controller.ReconcilerBase{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			Propagation: propagation,
 		},
 		DefaultNamespace: os.Getenv("POD_NAMESPACE"),
 	}).SetupWithManager(mgr); err != nil {
@@ -200,8 +214,9 @@ func main() {
 	}
 	if err := (&controller.CertIdentityReconciler{
 		ReconcilerBase: controller.ReconcilerBase{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			Propagation: propagation,
 		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "certidentity")

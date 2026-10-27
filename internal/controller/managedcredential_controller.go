@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -262,6 +263,18 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 		return ctrl.Result{}, nil
 	}
 
+	// A certificate issued on an earlier pass whose Secret write failed is
+	// reused (while it still matches the spec), rather than having EZCA issue
+	// another on every retry.
+	replaces := ""
+	if currentLeaf != nil {
+		replaces = pki.Thumbprint(currentLeaf)
+	}
+	if chain, newKey, held := r.heldIssued(mc.UID, replaces, now); held && pki.LeafMatchesSpec(chain[0], req) {
+		log.Info("Reusing the issued certificate an earlier pass could not store", "thumbprint", pki.Thumbprint(chain[0]))
+		return r.installIssuedCert(ctx, mc, secret, currentLeaf, currentKey, chain, newKey, now, tel, successReason)
+	}
+
 	cred, err := r.issuanceCredential(ctx, mc, currentLeaf, currentKey, now)
 	if err != nil {
 		tel.TrackError(err, "Failed to obtain issuance credential", identityProps(mc))
@@ -299,6 +312,7 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 			"Issued certificate does not match spec.subjectName and SANs; check the CA and template configuration")
 		return ctrl.Result{RequeueAfter: maxRequeueAfter}, nil
 	}
+	r.holdIssued(mc.UID, replaces, chain, newKey)
 
 	return r.installIssuedCert(ctx, mc, secret, currentLeaf, currentKey, chain, newKey, now, tel, successReason)
 }
@@ -320,8 +334,34 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to write issued certificate to Secret: %v", err))
 			return ctrl.Result{}, err
 		}
+		r.releaseIssued(mc.UID)
 		return r.finishIssuance(mc, newLeaf, now, successReason), nil
 	}
+
+	// Persist the issued certificate before attempting registration. Registering
+	// it on the app can fail (Entra/Graph), and persisting first means such a
+	// failure does not throw the freshly issued certificate away and re-issue a
+	// brand-new one on every subsequent reconcile (an unbounded issuance loop
+	// against EZCA). On first issuance nothing is being served yet, so it is
+	// written active and the steady-state path retries the registration. When a
+	// certificate is already being served, keep serving it and stage the new one
+	// as pending; the shared promotion flow retries the registration and swaps
+	// it in once Entra can authenticate with it.
+	if currentLeaf == nil {
+		if err := r.storeIssuedCert(ctx, mc, secret, chain, newKey); err != nil {
+			tel.TrackError(err, "Failed to store issued certificate", identityProps(mc))
+			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to write issued certificate to Secret: %v", err))
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := writePendingSecret(ctx, r, secret, chain, newKey); err != nil {
+			tel.TrackError(err, "Failed to stage issued certificate", identityProps(mc))
+			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to stage issued certificate: %v", err))
+			return ctrl.Result{}, err
+		}
+		stagePending(mc.StatusBase(), newLeaf, now)
+	}
+	r.releaseIssued(mc.UID)
 
 	// App credential: add the issued certificate to the app registration,
 	// authenticated by a certificate the app already trusts — the current
@@ -334,42 +374,19 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	// First issuance: nothing is being served yet, so persist the certificate as
-	// active up front — before attempting registration. Registering it on the app
-	// can fail (Entra/Graph), and persisting first means such a failure does not
-	// throw the freshly issued certificate away and re-issue a brand-new one on
-	// every subsequent reconcile (an unbounded issuance loop against EZCA).
-	if currentLeaf == nil {
-		if err := r.storeIssuedCert(ctx, mc, secret, chain, newKey); err != nil {
-			tel.TrackError(err, "Failed to store issued certificate", identityProps(mc))
-			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to write issued certificate to Secret: %v", err))
-			return ctrl.Result{}, err
-		}
-	}
-
 	if err := manageApp(ctx, r, mc, authCert, authKey, newLeaf, tel, now); err != nil {
 		// Tolerate a failure limited to the additional apps when a certificate is
 		// already being served: the issued certificate is on the primary app and
-		// recorded in status, so stage it and let the promotion flow retry the
-		// missing additional registrations instead of re-issuing on every pass.
+		// recorded in status, and the promotion flow retries the missing
+		// additional registrations.
 		if currentLeaf == nil || managedCredentialFor(mc.StatusBase(), pki.Thumbprint(newLeaf)) == nil {
 			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
 			return ctrl.Result{}, err
 		}
-		log.Error(err, "Issued certificate is missing from some additional app registrations; staging it and retrying them")
+		log.Error(err, "Issued certificate is missing from some additional app registrations; retrying them before promotion")
 	}
 
-	// If a certificate was already being served, keep serving it and stage the new
-	// one as pending; the shared promotion flow swaps it in once Entra can
-	// authenticate with it.
 	if currentLeaf != nil {
-		if err := writePendingSecret(ctx, r, secret, chain, newKey); err != nil {
-			tel.TrackError(err, "Failed to stage issued certificate", identityProps(mc))
-			setDegraded(mc, "SecretWriteFailed", fmt.Sprintf("Failed to stage issued certificate: %v", err))
-			return ctrl.Result{}, err
-		}
-		mc.Status.PendingThumbprint = pki.Thumbprint(newLeaf)
-		mc.Status.PendingSince = &metav1.Time{Time: now}
 		meta.SetStatusCondition(&mc.Status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
 			Status:  metav1.ConditionTrue,
@@ -377,7 +394,7 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 			Message: "Issued certificate added to the app registration; waiting for Entra ID propagation",
 		})
 		log.Info("Staged issued certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, mc.Status.PendingSince)}, nil
+		return ctrl.Result{RequeueAfter: checkInterval(r.propagation(), certValidAt(currentLeaf, now))}, nil
 	}
 
 	// First issuance: already stored above and now registered on the app. Key Vault
@@ -390,15 +407,14 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredential, newLeaf *x509.Certificate, now time.Time, successReason string) ctrl.Result {
 	setObservedCert(mc, newLeaf)
 	mc.Status.LastRenewalTime = &metav1.Time{Time: now}
-	mc.Status.PendingThumbprint = ""
-	mc.Status.PendingSince = nil
+	clearPending(mc.StatusBase())
 	setAvailable(mc, successReason, "Certificate issued successfully")
 	if mc.Spec.KeyVault != nil {
 		// Hand off to the steady-state path so the new certificate syncs to Key
 		// Vault once it is usable — that is, after its propagation grace, which
 		// the Key Vault sync measures from when the certificate was registered
 		// on the app (kvPropagationSince).
-		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, kvPropagationSince(mc))}
+		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, kvPropagationSince(mc), r.propagation().Grace)}
 	}
 	return ctrl.Result{RequeueAfter: requeueForRenewal(newLeaf, mc.Spec.RenewalThreshold, now)}
 }
@@ -415,6 +431,34 @@ func (r *ManagedCredentialReconciler) appAuthCert(ctx context.Context, mc *ezcav
 	cert, key, _, err := r.identityRefCertKey(ctx, mc)
 	return cert, key, err
 }
+
+// stagedRegistrationAuth implements registrationAuthenticator. A staged
+// certificate is registered with the active certificate when status records it
+// as registered and it is still valid, otherwise first with the identityRef's
+// certificate (which is trusted on the app to bootstrap it) and then with the
+// active certificate while it is valid. The fallback covers credentials
+// without an identityRef, whose externally provisioned certificate status
+// never records; an expired active certificate, which is what drives a
+// re-issuance, is never tried.
+func (r *ManagedCredentialReconciler) stagedRegistrationAuth(ctx context.Context, obj certIdentity, active authCredential, now time.Time) []authCredential {
+	mc, ok := obj.(*ezcav1.ManagedCredential)
+	if !ok {
+		return []authCredential{active}
+	}
+	var creds []authCredential
+	if currentCertUsable(mc, active.cert, now) {
+		creds = append(creds, active)
+	}
+	if cert, key, _, err := r.identityRefCertKey(ctx, mc); err == nil {
+		creds = append(creds, authCredential{cert: cert, key: key})
+	}
+	if !currentCertUsable(mc, active.cert, now) && certValidAt(active.cert, now) {
+		creds = append(creds, active)
+	}
+	return creds
+}
+
+var _ registrationAuthenticator = (*ManagedCredentialReconciler)(nil)
 
 // registrationAuthCert returns the certificate and key used to retry
 // registering the active certificate on the app registrations. It prefers the
@@ -769,7 +813,7 @@ func (r *ManagedCredentialReconciler) newTokenCredential(tenantID, appID string,
 // SetupWithManager sets up the controller with the Manager.
 func (r *ManagedCredentialReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ezcav1.ManagedCredential{}).
+		For(&ezcav1.ManagedCredential{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("managedcredential").
 		Complete(r)

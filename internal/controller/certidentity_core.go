@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -66,18 +67,27 @@ const (
 	// certificate, so managed-credential cleanup also runs at least this often.
 	maxRequeueAfter = 24 * time.Hour
 
-	// propagationRequeue is how often the controller re-checks whether a staged
-	// certificate has become usable, once the propagation grace has elapsed and
-	// there is a point in trying to authenticate with it.
+	// propagationRequeue is how often the controller retries a Key Vault sync
+	// whose certificate has not propagated yet.
 	propagationRequeue = 30 * time.Second
-	// propagationGrace is the minimum time to wait after adding a key before
-	// using it at all. A newly added key is not immediately present on every
-	// token-endpoint replica, so the controller does not authenticate with the
-	// certificate until this window has passed.
-	propagationGrace = 5 * time.Minute
-	// propagationTimeout is how long propagation may take before the controller
-	// surfaces a Degraded condition (it keeps retrying afterwards).
-	propagationTimeout = 15 * time.Minute
+	// propagationVerifications is how many consecutive checks, spaced evenly
+	// across the propagation grace, a staged certificate must pass before it is
+	// promoted. One successful token only shows that one token-endpoint
+	// replica holds the new key.
+	propagationVerifications = 3
+)
+
+const (
+	// DefaultPropagationGrace is the default minimum time between adding a key
+	// to an app registration and promoting the certificate. A newly added key
+	// is not immediately present on every token-endpoint replica, and renewal
+	// starts with a fifth of the certificate's lifetime left (the old key stays
+	// registered until it expires), so waiting is cheap.
+	DefaultPropagationGrace = time.Hour
+	// DefaultPropagationTimeout is the default for how long propagation may take
+	// before the controller surfaces a Degraded condition (it keeps retrying
+	// afterwards).
+	DefaultPropagationTimeout = 2 * time.Hour
 )
 
 // ezcaRenewer renews a certificate through EZCA. Satisfied by
@@ -120,6 +130,10 @@ type reconcilerDeps interface {
 	newEZCAClient(ezcaURL string) (ezcaRenewer, error)
 	newEntraClient(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
 	newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
+	propagation() PropagationTiming
+	holdIssued(uid types.UID, replaces string, chain []*x509.Certificate, key *rsa.PrivateKey)
+	heldIssued(uid types.UID, replaces string, now time.Time) ([]*x509.Certificate, *rsa.PrivateKey, bool)
+	releaseIssued(uid types.UID)
 }
 
 // renewFallback lets a kind (ManagedCredential) recover from a renewal failure
@@ -129,6 +143,65 @@ type reconcilerDeps interface {
 // renewal error.
 type renewFallback interface {
 	reissueOnRenewFailure(ctx context.Context, obj certIdentity, secret *corev1.Secret, current *x509.Certificate, key *rsa.PrivateKey, now time.Time, tel *telemetry.Telemetry, renewErr error) (bool, ctrl.Result, error)
+}
+
+// registrationAuthenticator is implemented by reconcilers that choose which
+// certificate authenticates registering a staged certificate on the app
+// registrations. Kinds that do not implement it (ClusterCertIdentity and
+// CertIdentity) use the active certificate.
+type registrationAuthenticator interface {
+	stagedRegistrationAuth(ctx context.Context, obj certIdentity, active authCredential, now time.Time) []authCredential
+}
+
+// authCredential is a certificate and key to authenticate as an app
+// registration with.
+type authCredential struct {
+	cert *x509.Certificate
+	key  *rsa.PrivateKey
+}
+
+// pendingRegistrationAuth returns, in order of preference, the credentials to
+// try for registering the staged certificate on the app registrations.
+func pendingRegistrationAuth(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, now time.Time) ([]authCredential, error) {
+	activeChain, activeKey, err := parseSecret(secret)
+	if err != nil {
+		return nil, fmt.Errorf("parsing active certificate: %w", err)
+	}
+	active := authCredential{cert: activeChain[0], key: activeKey}
+	if ra, ok := d.(registrationAuthenticator); ok {
+		return ra.stagedRegistrationAuth(ctx, obj, active, now), nil
+	}
+	return []authCredential{active}, nil
+}
+
+// registerStaged adds the staged certificate to the app registrations that do
+// not hold it yet, trying each credential in turn. manageApp is idempotent per
+// app, so a later credential only completes what an earlier one could not.
+func registerStaged(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, pendingLeaf *x509.Certificate, tel *telemetry.Telemetry, now time.Time) error {
+	creds, err := pendingRegistrationAuth(ctx, d, obj, secret, now)
+	if err != nil {
+		return err
+	}
+	if len(creds) == 0 {
+		return errors.New("no valid certificate to authenticate the registration with")
+	}
+	for _, c := range creds {
+		if err = manageApp(ctx, d, obj, c.cert, c.key, pendingLeaf, tel, now); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// authenticatesAs reports whether cert can obtain a token as the app.
+func authenticatesAs(ctx context.Context, d reconcilerDeps, spec *ezcav1.CertIdentitySpecBase, appID string, cert *x509.Certificate, key *rsa.PrivateKey) bool {
+	cl, err := d.newEntraClient(*spec.TenantID, appID, cloudFor(spec.Cloud), cert, key)
+	return err == nil && cl.VerifyCredential(ctx) == nil
+}
+
+// certValidAt reports whether now is within cert's validity window.
+func certValidAt(cert *x509.Certificate, now time.Time) bool {
+	return !cert.NotBefore.After(now) && cert.NotAfter.After(now)
 }
 
 // reconcileCertState runs the renewal/rotation state machine and updates status
@@ -167,15 +240,24 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		Message: "Certificate crossed the renewal threshold and is being renewed",
 	})
 
-	newChain, newKey, err := renew(ctx, d, obj, current, key, tel)
-	if err != nil {
-		if fb, ok := d.(renewFallback); ok {
-			if handled, res, herr := fb.reissueOnRenewFailure(ctx, obj, secret, current, key, now, tel, err); handled {
-				return res, herr
+	// A certificate renewed on an earlier pass whose Secret write failed is
+	// reused, rather than having EZCA issue another on every retry.
+	newChain, newKey, held := d.heldIssued(obj.GetUID(), pki.Thumbprint(current), now)
+	if held {
+		log.Info("Reusing the renewed certificate an earlier pass could not store", "thumbprint", pki.Thumbprint(newChain[0]))
+	} else {
+		var err error
+		newChain, newKey, err = renew(ctx, d, obj, current, key, tel)
+		if err != nil {
+			if fb, ok := d.(renewFallback); ok {
+				if handled, res, herr := fb.reissueOnRenewFailure(ctx, obj, secret, current, key, now, tel, err); handled {
+					return res, herr
+				}
 			}
+			setDegraded(obj, "RenewalFailed", fmt.Sprintf("Failed to renew certificate: %v", err))
+			return ctrl.Result{}, err
 		}
-		setDegraded(obj, "RenewalFailed", fmt.Sprintf("Failed to renew certificate: %v", err))
-		return ctrl.Result{}, err
+		d.holdIssued(obj.GetUID(), pki.Thumbprint(current), newChain, newKey)
 	}
 	newLeaf := newChain[0]
 
@@ -187,6 +269,7 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 			setDegraded(obj, "SecretWriteFailed", fmt.Sprintf("Failed to write renewed certificate to Secret: %v", err))
 			return ctrl.Result{}, err
 		}
+		d.releaseIssued(obj.GetUID())
 		setObservedCert(obj, newLeaf)
 		status.LastRenewalTime = &metav1.Time{Time: now}
 		tel.TrackEvent("CertificateRenewed", identityProps(obj))
@@ -195,32 +278,36 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		return ctrl.Result{RequeueAfter: requeueForRenewal(newLeaf, spec.RenewalThreshold, now)}, nil
 	}
 
-	// App identity: add the renewed certificate to the app registration (and to
-	// every additional app) using the current (trusted) certificate, then stage
-	// it as pending. It is promoted into the active Secret only once every app
-	// can authenticate with it (see promoteIfReady), so the Secret never serves
-	// an unusable cert to the controller or to other consumers.
-	if err := manageApp(ctx, d, obj, current, key, newLeaf, tel, now); err != nil {
-		if managedCredentialFor(status, pki.Thumbprint(newLeaf)) == nil {
-			// Not even the primary app took the certificate: nothing was staged,
-			// so the next pass renews again.
-			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
-			return ctrl.Result{}, err
-		}
-		// The primary app holds the renewed certificate but some additional apps
-		// do not yet. Stage it anyway — the registrations made so far are
-		// recorded in status, and promotion retries the missing apps and waits
-		// until every app holds the certificate — rather than discarding the
-		// renewed certificate and re-issuing on every pass.
-		log.Error(err, "Renewed certificate is missing from some additional app registrations; staging it and retrying them")
-	}
+	// App identity: stage the renewed certificate as pending, then add it to the
+	// app registration (and to every additional app) using the current
+	// (trusted) certificate. It is promoted into the active Secret only once
+	// every app can authenticate with it (see promoteIfReady), so the Secret
+	// never serves an unusable cert to the controller or to other consumers.
+	//
+	// Staging comes first so that a failed registration never discards the
+	// renewed certificate: the next pass finds it staged and retries only the
+	// registration (promoteIfReady), instead of renewing — and having EZCA issue
+	// another certificate — on every retry while Entra keeps failing.
 	if err := writePendingSecret(ctx, d, secret, newChain, newKey); err != nil {
 		tel.TrackError(err, "Failed to stage renewed certificate Secret", identityProps(obj))
 		setDegraded(obj, "SecretWriteFailed", fmt.Sprintf("Failed to stage renewed certificate: %v", err))
 		return ctrl.Result{}, err
 	}
-	status.PendingThumbprint = pki.Thumbprint(newLeaf)
-	status.PendingSince = &metav1.Time{Time: now}
+	d.releaseIssued(obj.GetUID())
+	stagePending(status, newLeaf, now)
+	if err := manageApp(ctx, d, obj, current, key, newLeaf, tel, now); err != nil {
+		if managedCredentialFor(status, pki.Thumbprint(newLeaf)) == nil {
+			// Not even the primary app took the certificate. It stays staged;
+			// promotion retries the registration.
+			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
+			return ctrl.Result{}, err
+		}
+		// The primary app holds the renewed certificate but some additional apps
+		// do not yet. The registrations made so far are recorded in status, and
+		// promotion retries the missing apps and waits until every app holds the
+		// certificate.
+		log.Error(err, "Renewed certificate is missing from some additional app registrations; retrying them before promotion")
+	}
 	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 		Type:    typeProgressingCertIdentity,
 		Status:  metav1.ConditionTrue,
@@ -228,7 +315,7 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		Message: "Renewed certificate added to the app registration; waiting for Entra ID propagation",
 	})
 	log.Info("Staged renewed certificate, waiting for Entra ID propagation", "thumbprint", pki.Thumbprint(newLeaf))
-	return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, status.PendingSince)}, nil
+	return ctrl.Result{RequeueAfter: checkInterval(d.propagation(), certValidAt(current, now))}, nil
 }
 
 // promoteIfReady checks whether the staged (pending) certificate can now
@@ -251,12 +338,12 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	}
 	pendingLeaf := pendingChain[0]
 
-	// A staged certificate outside its validity window can never be promoted —
-	// for instance one left behind in the Secret by an earlier rotation after the
-	// object's status (and its PendingSince) was reset by a delete/recreate. Drop
-	// it and requeue so the active certificate is re-evaluated, rather than
-	// polling a dead certificate forever.
-	if pendingLeaf.NotBefore.After(now) || !pendingLeaf.NotAfter.After(now) {
+	// An expired staged certificate can never be promoted — for instance one
+	// left behind in the Secret by an earlier rotation after the object's status
+	// (and its PendingSince) was reset by a delete/recreate. Drop it and requeue
+	// so the active certificate is re-evaluated, rather than polling a dead
+	// certificate forever.
+	if !pendingLeaf.NotAfter.After(now) {
 		log.Info("Discarding staged certificate outside its validity window; falling back to the active certificate",
 			"thumbprint", pki.Thumbprint(pendingLeaf), "notBefore", pendingLeaf.NotBefore, "notAfter", pendingLeaf.NotAfter)
 		if derr := discardPendingCert(ctx, d, obj, secret); derr != nil {
@@ -264,42 +351,97 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		}
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
+	// A staged certificate that is not valid yet means the controller's clock is
+	// behind the CA's. Wait for it rather than discarding it, which would have
+	// EZCA issue another certificate on every pass.
+	if pendingLeaf.NotBefore.After(now) {
+		log.Info("Staged certificate is not valid yet; waiting for it", "thumbprint", pki.Thumbprint(pendingLeaf), "notBefore", pendingLeaf.NotBefore)
+		return ctrl.Result{RequeueAfter: pendingLeaf.NotBefore.Sub(now) + time.Second}, nil
+	}
+
+	// When the active certificate has already expired (or cannot be read),
+	// nothing is left to protect by waiting out the propagation grace: the
+	// staged certificate is checked often and promoted as soon as it
+	// authenticates as every app.
+	activeValid := false
+	if activeChain, _, perr := parseSecret(secret); perr == nil {
+		activeValid = certValidAt(activeChain[0], now)
+	}
 
 	// Every pending certificate needs a PendingSince to drive the grace and
 	// timeout windows below. If it is missing — the staged certificate outlived
 	// the status that tracked it — adopt now, so promotion still makes progress
 	// and can time out instead of looping indefinitely.
 	if status.PendingSince == nil {
-		status.PendingSince = &metav1.Time{Time: now}
-		status.PendingThumbprint = pki.Thumbprint(pendingLeaf)
+		stagePending(status, pendingLeaf, now)
 	}
 
-	// Complete any additional-app registrations the rotation could not finish:
-	// the staged certificate is promoted only once every configured app holds
-	// it, so retry the missing addKey calls, authenticated with the active
-	// (already-trusted) certificate. Failures surface through the verification
-	// below, which times out into Degraded.
-	if len(missingAdditionalApps(obj, pki.Thumbprint(pendingLeaf))) > 0 {
-		if activeChain, activeKey, perr := parseSecret(secret); perr == nil {
-			if aerr := manageApp(ctx, d, obj, activeChain[0], activeKey, pendingLeaf, tel, now); aerr != nil {
-				log.Error(aerr, "Failed to add staged certificate to additional app registrations")
-			}
+	// Complete any registrations the rotation could not finish: the staged
+	// certificate is promoted only once every configured app holds it, so retry
+	// the missing addKey calls. A staged certificate status does not track was
+	// never added to the primary app (the rotation's registration failed, or its
+	// record was lost); it must be before anything else can happen, so a failure
+	// there keeps the identity Degraded and retries. Failures on additional apps
+	// surface through the verification below, which times out into Degraded.
+	pendingThumbprint := pki.Thumbprint(pendingLeaf)
+	onPrimary := managedCredentialFor(status, pendingThumbprint) != nil
+	if !onPrimary && authenticatesAs(ctx, d, spec, *spec.AppID, pendingLeaf, pendingKey) {
+		// The primary app already trusts the staged certificate: it was added,
+		// but the record of it was lost (every status write after the addKey
+		// failed). Adding it again would duplicate the key, or fail for good if
+		// Graph rejects the duplicate. Track it without a keyID instead; the
+		// controller cannot remove a key whose ID it never recorded, so that key
+		// stays on the app after it expires.
+		log.Info("Staged certificate is already registered on the app but was not recorded; it will not be removed automatically when it expires",
+			"thumbprint", pendingThumbprint, "appID", *spec.AppID)
+		status.ManagedKeyCredentials = append(status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
+			Thumbprint: pendingThumbprint,
+			NotAfter:   metav1.Time{Time: pendingLeaf.NotAfter},
+		})
+		onPrimary = true
+	}
+	if !onPrimary || len(missingAdditionalApps(obj, pendingThumbprint)) > 0 {
+		aerr := registerStaged(ctx, d, obj, secret, pendingLeaf, tel, now)
+		if !onPrimary && managedCredentialFor(status, pendingThumbprint) == nil {
+			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add staged certificate to app registration: %v", aerr))
+			return ctrl.Result{}, aerr
+		}
+		if aerr != nil {
+			log.Error(aerr, "Failed to add staged certificate to additional app registrations")
+		} else {
+			recoverFromDegraded(obj, activeValid)
 		}
 	}
 
-	if now.Sub(status.PendingSince.Time) < propagationGrace {
-		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
-			Type:    typeProgressingCertIdentity,
-			Status:  metav1.ConditionTrue,
-			Reason:  "Stabilizing",
-			Message: fmt.Sprintf("Renewed certificate authenticated; waiting %s for Entra ID propagation to stabilize", propagationGrace),
-		})
-		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, status.PendingSince)}, nil
+	// Propagation is measured from the latest moment a key for the staged
+	// certificate was added to any app, so an app that only received it on a
+	// retry still gets the full grace. The certificate is checked
+	// propagationVerifications times, spaced evenly across the grace, and is
+	// promoted only after that many consecutive checks in which it
+	// authenticated as every app: one successful token only shows that one
+	// token-endpoint replica holds the new key.
+	timing := d.propagation()
+	interval := checkInterval(timing, activeValid)
+	anchor := propagationAnchor(obj, pendingThumbprint)
+	if status.PendingLastVerified != nil && status.PendingLastVerified.Time.Before(anchor) {
+		// Checks made before the latest key was added cannot vouch for it.
+		status.PendingVerifications = 0
+		status.PendingLastVerified = nil
+	}
+	nextCheck := anchor.Add(interval)
+	if status.PendingLastVerified != nil {
+		nextCheck = status.PendingLastVerified.Add(interval)
+	}
+	if now.Before(nextCheck) {
+		if !meta.IsStatusConditionTrue(status.Conditions, typeDegradedCertIdentity) {
+			setStabilizing(obj, timing)
+		}
+		return ctrl.Result{RequeueAfter: nextCheck.Sub(now)}, nil
 	}
 
 	// The staged certificate must authenticate as the primary app and as every
-	// additional app before it is promoted: it is not "there" until every app
-	// that shares it can use it.
+	// additional app: it is not "there" until every app that shares it can use
+	// it.
 	verifyAppIDs := []string{*spec.AppID}
 	for _, app := range spec.AdditionalApps {
 		verifyAppIDs = append(verifyAppIDs, app.AppID)
@@ -313,13 +455,15 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		if verr == nil {
 			continue
 		}
-		// Past the grace window and still not usable. Poll until the propagation
-		// timeout; beyond it, fail loudly (retries continue, more slowly, so the
+		// Not usable yet: start the count over. Keep checking until the
+		// propagation timeout; beyond it, fail loudly (checks continue, so the
 		// certificate can still self-heal).
-		if now.Sub(status.PendingSince.Time) > propagationTimeout {
+		status.PendingVerifications = 0
+		status.PendingLastVerified = &metav1.Time{Time: now}
+		if now.Sub(anchor) > timing.Timeout {
 			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityPropsForApp(obj, appID))
-			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable by app %s after %s: %v", appID, propagationTimeout, verr))
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
+			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable by app %s after %s: %v", appID, timing.Timeout, verr))
+			return ctrl.Result{RequeueAfter: interval}, nil
 		}
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
@@ -327,10 +471,18 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 			Reason:  reasonPendingPropagation,
 			Message: fmt.Sprintf("Waiting for the renewed certificate to propagate in Entra ID for app %s", appID),
 		})
-		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+	status.PendingVerifications++
+	status.PendingLastVerified = &metav1.Time{Time: now}
+	recoverFromDegraded(obj, activeValid)
+	if activeValid && (status.PendingVerifications < propagationVerifications || now.Sub(anchor) < timing.Grace) {
+		setStabilizing(obj, timing)
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
-	// Usable and past the grace window: promote the staged certificate.
+	// Settled across the grace window (or replacing an expired certificate):
+	// promote the staged certificate.
 	if err := promoteSecret(ctx, d, secret); err != nil {
 		tel.TrackError(err, "Failed to promote renewed certificate Secret", identityProps(obj))
 		setDegraded(obj, "SecretWriteFailed", fmt.Sprintf("Failed to promote renewed certificate: %v", err))
@@ -338,12 +490,90 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	}
 	setObservedCert(obj, pendingLeaf)
 	status.LastRenewalTime = &metav1.Time{Time: now}
-	status.PendingThumbprint = ""
-	status.PendingSince = nil
+	clearPending(status)
 	tel.TrackEvent("CertificateRenewed", identityProps(obj))
 	log.Info("Promoted renewed certificate", "thumbprint", pki.Thumbprint(pendingLeaf), "notAfter", pendingLeaf.NotAfter)
 	setAvailable(obj, "CertificateRenewed", "Certificate renewed successfully")
 	return ctrl.Result{RequeueAfter: requeueForRenewal(pendingLeaf, spec.RenewalThreshold, now)}, nil
+}
+
+// checkInterval is how far apart a staged certificate is checked: spread
+// across the grace while the active certificate still serves, and at the
+// propagation poll interval once it has expired.
+func checkInterval(timing PropagationTiming, activeValid bool) time.Duration {
+	if !activeValid {
+		return propagationRequeue
+	}
+	return timing.verifyInterval()
+}
+
+// recoverFromDegraded clears a Degraded condition an earlier pass left behind
+// once the rotation makes progress again (a registration or an authentication
+// check succeeded). The active certificate keeps serving meanwhile, so the
+// identity is Available again; with an expired active certificate it stays
+// Degraded until the staged certificate is promoted.
+func recoverFromDegraded(obj certIdentity, activeValid bool) {
+	status := obj.StatusBase()
+	if !activeValid || !meta.IsStatusConditionTrue(status.Conditions, typeDegradedCertIdentity) {
+		return
+	}
+	meta.RemoveStatusCondition(&status.Conditions, typeDegradedCertIdentity)
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:    typeAvailableCertIdentity,
+		Status:  metav1.ConditionTrue,
+		Reason:  "RotationInProgress",
+		Message: "The active certificate is serving while its renewal propagates in Entra ID",
+	})
+}
+
+// setStabilizing reports a staged certificate that is waiting out the
+// propagation grace or still collecting the checks promotion requires.
+func setStabilizing(obj certIdentity, timing PropagationTiming) {
+	status := obj.StatusBase()
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:   typeProgressingCertIdentity,
+		Status: metav1.ConditionTrue,
+		Reason: "Stabilizing",
+		Message: fmt.Sprintf("Renewed certificate passed %d of %d authentication checks; promoting it once all pass, at least %s after it was added to every app",
+			status.PendingVerifications, propagationVerifications, timing.Grace),
+	})
+}
+
+// stagePending records leaf as the staged certificate, staged at now.
+func stagePending(status *ezcav1.CertIdentityStatusBase, leaf *x509.Certificate, now time.Time) {
+	status.PendingThumbprint = pki.Thumbprint(leaf)
+	status.PendingSince = &metav1.Time{Time: now}
+	status.PendingVerifications = 0
+	status.PendingLastVerified = nil
+}
+
+// clearPending clears the staged-certificate status fields.
+func clearPending(status *ezcav1.CertIdentityStatusBase) {
+	status.PendingThumbprint = ""
+	status.PendingSince = nil
+	status.PendingVerifications = 0
+	status.PendingLastVerified = nil
+}
+
+// propagationAnchor returns when Entra propagation of the staged certificate
+// is measured from: the latest moment a key for it was added to any app
+// registration, or when it was staged if that is later (for instance when no
+// addition recorded its time).
+func propagationAnchor(obj certIdentity, thumbprint string) time.Time {
+	status := obj.StatusBase()
+	anchor := status.PendingSince.Time
+	later := func(t *metav1.Time) {
+		if t != nil && t.After(anchor) {
+			anchor = t.Time
+		}
+	}
+	if entry := managedCredentialFor(status, thumbprint); entry != nil {
+		later(entry.AddedAt)
+		for _, ak := range entry.AdditionalKeys {
+			later(ak.AddedAt)
+		}
+	}
+	return anchor
 }
 
 // renew builds a renewal CSR (with a fresh key) and renews the certificate
@@ -429,6 +659,7 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 				AppObjectID: app.AppObjectID,
 				AppID:       app.AppID,
 				KeyID:       keyID,
+				AddedAt:     &metav1.Time{Time: now},
 			})
 			addedKeys = true
 			tel.TrackEvent("CertificateAddedToApp", identityPropsForApp(obj, app.AppID))
@@ -593,9 +824,7 @@ func writePendingSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Se
 func discardPendingCert(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret) error {
 	delete(secret.Data, tlsCertPendingKey)
 	delete(secret.Data, tlsKeyPendingKey)
-	status := obj.StatusBase()
-	status.PendingThumbprint = ""
-	status.PendingSince = nil
+	clearPending(obj.StatusBase())
 	return d.kubeClient().Update(ctx, secret)
 }
 
@@ -610,13 +839,13 @@ func promoteSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Secret)
 }
 
 // propagationRequeueAfter returns how long to wait before next acting on a
-// certificate that became current at since (staged at PendingSince, or issued
-// at NotBefore).
-func propagationRequeueAfter(now time.Time, since *metav1.Time) time.Duration {
+// certificate that became current at since (added to the app registration, or
+// issued at NotBefore), given the propagation grace.
+func propagationRequeueAfter(now time.Time, since *metav1.Time, grace time.Duration) time.Duration {
 	if since == nil {
 		return propagationRequeue
 	}
-	if remaining := propagationGrace - now.Sub(since.Time); remaining > 0 {
+	if remaining := grace - now.Sub(since.Time); remaining > 0 {
 		return remaining
 	}
 	return propagationRequeue
@@ -652,9 +881,10 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	// promoted only after it already authenticated (and waited out the grace
 	// since being staged) is not charged the grace a second time — it syncs
 	// right away.
+	timing := d.propagation()
 	since := kvPropagationSince(obj)
-	if since != nil && now.Sub(since.Time) < propagationGrace {
-		requeueAtMost(result, propagationRequeueAfter(now, since))
+	if since != nil && now.Sub(since.Time) < timing.Grace {
+		requeueAtMost(result, propagationRequeueAfter(now, since, timing.Grace))
 		return
 	}
 
@@ -666,7 +896,7 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	// reached. Poll quietly until the propagation timeout; past that it is no
 	// longer plausibly propagation, so fall through and report it as a failure.
 	if isCredentialPropagating(kvErr) &&
-		(since == nil || now.Sub(since.Time) <= propagationTimeout) {
+		(since == nil || now.Sub(since.Time) <= timing.Timeout) {
 		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
 		requeueAtMost(result, propagationRequeue)
 		return

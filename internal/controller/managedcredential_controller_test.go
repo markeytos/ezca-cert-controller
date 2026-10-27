@@ -474,7 +474,10 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
 		entry := managedCredentialFor(mc.StatusBase(), pki.Thumbprint(renewed))
 		Expect(entry).NotTo(BeNil())
-		Expect(entry.AdditionalKeys).To(ConsistOf(ezcav1.AdditionalAppKey{AppObjectID: extraObjID, AppID: extraAppID, KeyID: "new-key-id"}))
+		Expect(entry.AdditionalKeys).To(HaveLen(1))
+		Expect(entry.AdditionalKeys[0].AppObjectID).To(Equal(extraObjID))
+		Expect(entry.AdditionalKeys[0].KeyID).To(Equal("new-key-id"))
+		Expect(entry.AdditionalKeys[0].AddedAt.Time).To(BeTemporally("==", now))
 	})
 
 	It("re-issues when the certificate drifts from the desired subject/domains", func() {
@@ -735,6 +738,199 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(credTenant).To(Equal(parentTntID))
 	})
 
+	It("keeps a re-issued certificate staged and does not re-issue while the app keeps rejecting it", func() {
+		createParent("mcp-loop", "mcp-loop-sec")
+		// The active certificate has expired, so renewal fails and the credential
+		// falls back to re-issuance; registering the re-issued certificate must
+		// then authenticate with the identityRef's certificate.
+		expPEM, expKeyPEM, expCert := genCertSANs(dnFB, []string{dnFB}, now.Add(-90*24*time.Hour), now.Add(-24*time.Hour))
+		createSecret("mc-loop-sec", expPEM, expKeyPEM)
+		ezcaClient.err = errors.New("cannot authenticate with an expired certificate")
+		_, _, issued := genCertSANs(dnFB, []string{dnFB}, now, now.Add(365*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+
+		primary := &trustingEntra{fakeEntra: &fakeEntra{}, trusted: map[string]bool{pki.Thumbprint(secretLeaf("mcp-loop-sec")): true}}
+		reconciler.NewEntraClient = func(_, _ string, _ entra.Cloud, cert *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+			return primary.as(cert), nil
+		}
+
+		mc := newManagedCredential("mc-loop", "mc-loop-sec", "mcp-loop", "CN=fb.ezca.io", []string{dnFB})
+		tnt, app, obj := ownTntID, ownAppID, "loop-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		name := types.NamespacedName{Namespace: namespace, Name: "mc-loop"}
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+			Thumbprint: pki.Thumbprint(expCert),
+			KeyID:      ownKeyID,
+			NotAfter:   metav1.Time{Time: expCert.NotAfter},
+		}}
+		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
+		req := reconcile.Request{NamespacedName: name}
+		secretName := types.NamespacedName{Namespace: namespace, Name: "mc-loop-sec"}
+
+		// The app registration rejects the re-issued certificate: it is staged,
+		// not thrown away.
+		primary.addErr = errors.New("graph is down")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).To(HaveOccurred())
+		Expect(issuerClient.called).To(BeTrue())
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, secretName, &secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKey(tlsCertPendingKey))
+
+		// Every retry while Entra keeps failing retries only the registration.
+		for i := 1; i <= 3; i++ {
+			issuerClient.called = false
+			ezcaClient.called = false
+			clockNow = now.Add(time.Duration(i) * time.Hour)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).To(HaveOccurred())
+			Expect(issuerClient.called).To(BeFalse(), "must not re-issue while the staged certificate awaits registration")
+			Expect(ezcaClient.called).To(BeFalse(), "must not renew while the staged certificate awaits registration")
+			Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+			Expect(mc.Status.PendingThumbprint).To(Equal(pki.Thumbprint(issued)))
+			Expect(meta.FindStatusCondition(mc.Status.Conditions, typeDegradedCertIdentity).Reason).To(Equal("AppRotationFailed"))
+		}
+
+		// Entra recovers: the staged certificate is registered (authenticated by
+		// the identityRef's certificate, since the active one has expired), and
+		// propagation is measured from then.
+		primary.addErr = nil
+		registeredAt := now.Add(4 * time.Hour)
+		clockNow = registeredAt
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(primary.added).To(Equal([][]byte{issued.Raw}))
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(managedCredentialFor(mc.StatusBase(), pki.Thumbprint(issued)).AddedAt.Time).To(BeTemporally("==", registeredAt))
+
+		// The active certificate has expired, so nothing is protected by waiting
+		// out the grace; it stays Degraded and is promoted on the first passing
+		// check.
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+		Expect(secretLeaf("mc-loop-sec").Equal(issued)).To(BeFalse())
+		clockNow = registeredAt.Add(propagationRequeue)
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(secretLeaf("mc-loop-sec").Equal(issued)).To(BeTrue())
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		Expect(issuerClient.called).To(BeFalse())
+	})
+
+	Describe("without an identityRef", func() {
+		const (
+			extraAppID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+			extraObjID = "noref-extra-obj"
+		)
+		var primary, extra *trustingEntra
+		var curCert, renewed *x509.Certificate
+
+		// setup creates an externally provisioned credential with an app and one
+		// additional app, whose active certificate status never recorded (it was
+		// registered by an administrator) and is due for renewal. Both apps trust
+		// only that certificate.
+		setup := func(name string) reconcile.Request {
+			var curPEM, curKeyPEM []byte
+			curPEM, curKeyPEM, curCert = genCertSANs(noRefDomain, []string{noRefDomain}, now.Add(-80*24*time.Hour), now.Add(10*24*time.Hour))
+			createSecret(name+"-sec", curPEM, curKeyPEM)
+			_, _, renewed = genCertSANs(noRefDomain, []string{noRefDomain}, now, now.Add(90*24*time.Hour))
+			ezcaClient.newChain = []*x509.Certificate{renewed}
+
+			primary = &trustingEntra{fakeEntra: entraClient, trusted: map[string]bool{pki.Thumbprint(curCert): true}}
+			extra = &trustingEntra{fakeEntra: &fakeEntra{}, trusted: map[string]bool{pki.Thumbprint(curCert): true}}
+			reconciler.NewEntraClient = func(_, appID string, _ entra.Cloud, cert *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+				if appID == extraAppID {
+					return extra.as(cert), nil
+				}
+				return primary.as(cert), nil
+			}
+
+			mc := newManagedCredential(name, name+"-sec", "", "CN="+noRefDomain, []string{noRefDomain})
+			mc.Spec.IdentityRef = nil
+			tnt, app, obj := ownTntID, ownAppID, name+"-obj"
+			mc.Spec.TenantID = &tnt
+			mc.Spec.AppID = &app
+			mc.Spec.AppObjectID = &obj
+			mc.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID, AppObjectID: extraObjID}}
+			Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+			return reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}
+		}
+
+		It("retries registering a staged certificate on the primary app with its active certificate", func() {
+			req := setup("mc-noref-primary")
+
+			primary.addErr = errors.New("graph is down")
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).To(HaveOccurred())
+			Expect(ezcaClient.called).To(BeTrue())
+
+			// Entra recovers. There is no identityRef to fall back on; the retry
+			// must authenticate with the active certificate, the only one the
+			// apps trust.
+			primary.addErr = nil
+			ezcaClient.called = false
+			clockNow = now.Add(time.Hour)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ezcaClient.called).To(BeFalse())
+			Expect(primary.added).To(Equal([][]byte{renewed.Raw}))
+			Expect(extra.added).To(Equal([][]byte{renewed.Raw}))
+			var mc ezcav1.ManagedCredential
+			Expect(k8sClient.Get(ctx, req.NamespacedName, &mc)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+		})
+
+		It("retries registering a staged certificate on an additional app with its active certificate", func() {
+			req := setup("mc-noref-extra")
+
+			extra.addErr = errors.New("graph is down")
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(primary.added).To(Equal([][]byte{renewed.Raw}))
+			Expect(extra.added).To(BeEmpty())
+
+			extra.addErr = nil
+			clockNow = now.Add(time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra.added).To(Equal([][]byte{renewed.Raw}))
+		})
+	})
+
+	It("reuses a bootstrapped certificate while the Secret write keeps failing", func() {
+		createParent("mcp-wfail", "mcp-wfail-sec")
+		_, _, issued := genCertSANs("wfail.ezca.io", []string{"wfail.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+		failing := true
+		reconciler.Client = secretWriteFailingClient{Client: k8sClient, fail: &failing}
+
+		mc := newManagedCredential("mc-wfail", "mc-wfail-sec", "mcp-wfail", "CN=wfail.ezca.io", []string{"wfail.ezca.io"})
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "mc-wfail"}}
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).To(HaveOccurred())
+		Expect(issuerClient.called).To(BeTrue())
+
+		for i := 1; i <= 3; i++ {
+			issuerClient.called = false
+			clockNow = now.Add(time.Duration(i) * time.Hour)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).To(HaveOccurred())
+			Expect(issuerClient.called).To(BeFalse(), "must not issue again while the Secret write keeps failing")
+		}
+
+		failing = false
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(secretLeaf("mc-wfail-sec").Equal(issued)).To(BeTrue())
+	})
+
 	It("persists a bootstrapped certificate even when app registration fails, and does not re-issue", func() {
 		createParent("mcp-storm", "mcp-storm-sec")
 		_, _, issued := genCertSANs("storm.ezca.io", []string{"storm.ezca.io"}, now, now.Add(90*24*time.Hour))
@@ -843,7 +1039,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		// Within the propagation window a key-not-found vault error is transient:
 		// polled quietly, not Degraded.
-		clockNow = now.Add(6 * time.Minute)
+		clockNow = now.Add(DefaultPropagationGrace + time.Minute)
 		kvClient.matchErr = errors.New("ClientCertificateCredential authentication failed: AADSTS700027: key not found")
 		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
 		Expect(err).NotTo(HaveOccurred())
@@ -853,7 +1049,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 
 		// Past the propagation timeout (still measured from the registration) the
 		// same error is no longer plausibly propagation and is reported.
-		clockNow = now.Add(20 * time.Minute)
+		clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: mcName}})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: mcName}, mc)).To(Succeed())
