@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -194,14 +195,24 @@ func reconcileCertState(ctx context.Context, d reconcilerDeps, obj certIdentity,
 		return ctrl.Result{RequeueAfter: requeueForRenewal(newLeaf, spec.RenewalThreshold, now)}, nil
 	}
 
-	// App identity: add the renewed certificate to the app registration using
-	// the current (trusted) certificate, then stage it as pending. It is
-	// promoted into the active Secret only once Entra ID can authenticate with
-	// it (see promoteIfReady), so the Secret never serves an unusable cert to
-	// the controller or to other consumers.
+	// App identity: add the renewed certificate to the app registration (and to
+	// every additional app) using the current (trusted) certificate, then stage
+	// it as pending. It is promoted into the active Secret only once every app
+	// can authenticate with it (see promoteIfReady), so the Secret never serves
+	// an unusable cert to the controller or to other consumers.
 	if err := manageApp(ctx, d, obj, current, key, newLeaf, tel, now); err != nil {
-		setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
-		return ctrl.Result{}, err
+		if managedCredentialFor(status, pki.Thumbprint(newLeaf)) == nil {
+			// Not even the primary app took the certificate: nothing was staged,
+			// so the next pass renews again.
+			setDegraded(obj, "AppRotationFailed", fmt.Sprintf("Failed to add renewed certificate to app registration: %v", err))
+			return ctrl.Result{}, err
+		}
+		// The primary app holds the renewed certificate but some additional apps
+		// do not yet. Stage it anyway — the registrations made so far are
+		// recorded in status, and promotion retries the missing apps and waits
+		// until every app holds the certificate — rather than discarding the
+		// renewed certificate and re-issuing on every pass.
+		log.Error(err, "Renewed certificate is missing from some additional app registrations; staging it and retrying them")
 	}
 	if err := writePendingSecret(ctx, d, secret, newChain, newKey); err != nil {
 		tel.TrackError(err, "Failed to stage renewed certificate Secret", identityProps(obj))
@@ -263,6 +274,19 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		status.PendingThumbprint = pki.Thumbprint(pendingLeaf)
 	}
 
+	// Complete any additional-app registrations the rotation could not finish:
+	// the staged certificate is promoted only once every configured app holds
+	// it, so retry the missing addKey calls, authenticated with the active
+	// (already-trusted) certificate. Failures surface through the verification
+	// below, which times out into Degraded.
+	if len(missingAdditionalApps(obj, pki.Thumbprint(pendingLeaf))) > 0 {
+		if activeChain, activeKey, perr := parseSecret(secret); perr == nil {
+			if aerr := manageApp(ctx, d, obj, activeChain[0], activeKey, pendingLeaf, tel, now); aerr != nil {
+				log.Error(aerr, "Failed to add staged certificate to additional app registrations")
+			}
+		}
+	}
+
 	if now.Sub(status.PendingSince.Time) < propagationGrace {
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
@@ -273,24 +297,35 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 		return ctrl.Result{RequeueAfter: propagationRequeueAfter(now, status.PendingSince)}, nil
 	}
 
-	cl, err := d.newEntraClient(*spec.TenantID, *spec.AppID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
-	if err != nil {
-		return ctrl.Result{}, err
+	// The staged certificate must authenticate as the primary app and as every
+	// additional app before it is promoted: it is not "there" until every app
+	// that shares it can use it.
+	verifyAppIDs := []string{*spec.AppID}
+	for _, app := range spec.AdditionalApps {
+		verifyAppIDs = append(verifyAppIDs, app.AppID)
 	}
-	if verr := cl.VerifyCredential(ctx); verr != nil {
+	for _, appID := range verifyAppIDs {
+		cl, err := d.newEntraClient(*spec.TenantID, appID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		verr := cl.VerifyCredential(ctx)
+		if verr == nil {
+			continue
+		}
 		// Past the grace window and still not usable. Poll until the propagation
 		// timeout; beyond it, fail loudly (retries continue, more slowly, so the
 		// certificate can still self-heal).
 		if now.Sub(status.PendingSince.Time) > propagationTimeout {
-			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityProps(obj))
-			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable after %s: %v", propagationTimeout, verr))
+			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityPropsForApp(obj, appID))
+			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable by app %s after %s: %v", appID, propagationTimeout, verr))
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
 			Status:  metav1.ConditionTrue,
 			Reason:  reasonPendingPropagation,
-			Message: "Waiting for the renewed certificate to propagate in Entra ID",
+			Message: fmt.Sprintf("Waiting for the renewed certificate to propagate in Entra ID for app %s", appID),
 		})
 		return ctrl.Result{RequeueAfter: propagationRequeue}, nil
 	}
@@ -331,10 +366,16 @@ func renew(ctx context.Context, d reconcilerDeps, obj certIdentity, current *x50
 }
 
 // manageApp authenticates to Microsoft Graph as the app (using authCert), adds
-// newLeaf when non-nil, and removes any managed credentials that have expired.
-// It targets the app registration by its directory object ID directly, so no
-// directory-read permission is needed: addKey/removeKey succeed with a
-// proof-of-possession signed by the app's current certificate.
+// newLeaf when non-nil — to the primary app registration and to every
+// additional app (spec.additionalApps) — and removes any managed credentials
+// that have expired. It targets each app registration by its directory object
+// ID directly, so no directory-read permission is needed: addKey/removeKey
+// succeed with a proof-of-possession signed by a certificate the target app
+// already trusts (authCert must be registered on every app).
+//
+// It is idempotent per app: a certificate already recorded as added to an app
+// is not added again, so a retry after a partial failure only completes the
+// missing registrations.
 func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert *x509.Certificate, authKey *rsa.PrivateKey, newLeaf *x509.Certificate, tel *telemetry.Telemetry, now time.Time) error {
 	spec := obj.SpecBase()
 	status := obj.StatusBase()
@@ -344,19 +385,54 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 	}
 	objectID := *spec.AppObjectID
 
+	var addedKeys bool
+	var addErr error
 	if newLeaf != nil {
-		keyID, err := cl.AddKey(ctx, objectID, newLeaf.Raw)
-		if err != nil {
-			tel.TrackError(err, "Failed to add renewed certificate to app registration", identityProps(obj))
-			return err
+		thumbprint := pki.Thumbprint(newLeaf)
+		if managedCredentialFor(status, thumbprint) == nil {
+			keyID, err := cl.AddKey(ctx, objectID, newLeaf.Raw)
+			if err != nil {
+				tel.TrackError(err, "Failed to add renewed certificate to app registration", identityProps(obj))
+				return err
+			}
+			status.ManagedKeyCredentials = append(status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
+				Thumbprint: thumbprint,
+				KeyID:      keyID,
+				NotAfter:   metav1.Time{Time: newLeaf.NotAfter},
+				AddedAt:    &metav1.Time{Time: now},
+			})
+			addedKeys = true
+			tel.TrackEvent("CertificateAddedToApp", identityProps(obj))
 		}
-		status.ManagedKeyCredentials = append(status.ManagedKeyCredentials, ezcav1.ManagedKeyCredential{
-			Thumbprint: pki.Thumbprint(newLeaf),
-			KeyID:      keyID,
-			NotAfter:   metav1.Time{Time: newLeaf.NotAfter},
-			AddedAt:    &metav1.Time{Time: now},
-		})
-		tel.TrackEvent("CertificateAddedToApp", identityProps(obj))
+
+		// Add the certificate to every additional app that does not hold it yet.
+		// Keep going on failure so one unreachable app does not block the others;
+		// every successful addition is recorded (and persisted below) so no key
+		// is orphaned on an app registration.
+		entry := managedCredentialFor(status, thumbprint)
+		for _, app := range spec.AdditionalApps {
+			if hasAdditionalKey(entry, app.AppObjectID) {
+				continue
+			}
+			acl, err := d.newEntraClient(*spec.TenantID, app.AppID, cloudFor(spec.Cloud), authCert, authKey)
+			if err != nil {
+				addErr = errors.Join(addErr, err)
+				continue
+			}
+			keyID, err := acl.AddKey(ctx, app.AppObjectID, newLeaf.Raw)
+			if err != nil {
+				tel.TrackError(err, "Failed to add renewed certificate to additional app registration", identityPropsForApp(obj, app.AppID))
+				addErr = errors.Join(addErr, fmt.Errorf("adding certificate to additional app %s: %w", app.AppID, err))
+				continue
+			}
+			entry.AdditionalKeys = append(entry.AdditionalKeys, ezcav1.AdditionalAppKey{
+				AppObjectID: app.AppObjectID,
+				AppID:       app.AppID,
+				KeyID:       keyID,
+			})
+			addedKeys = true
+			tel.TrackEvent("CertificateAddedToApp", identityPropsForApp(obj, app.AppID))
+		}
 	}
 
 	var remaining []ezcav1.ManagedKeyCredential
@@ -365,13 +441,26 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 			remaining = append(remaining, mc) // still valid
 			continue
 		}
-		if err := cl.RemoveKey(ctx, objectID, mc.KeyID); err != nil {
-			tel.TrackError(err, "Failed to remove expired certificate from app registration", identityProps(obj))
-			remaining = append(remaining, mc) // keep to retry next time
-			continue
+		// Remove the key from the primary app and from every additional app
+		// independently, so a removal that keeps failing on one app does not
+		// leave the expired key on the others. The entry is kept, holding only
+		// the keys still to remove, until every removal has succeeded.
+		mc.AdditionalKeys = removeAdditionalKeys(ctx, d, obj, authCert, authKey, mc.AdditionalKeys, tel)
+		if mc.KeyID != "" {
+			// A 404 means the key (or the app) is already gone.
+			if err := cl.RemoveKey(ctx, objectID, mc.KeyID); err != nil && !entra.IsNotFound(err) {
+				tel.TrackError(err, "Failed to remove expired certificate from app registration", identityProps(obj))
+				remaining = append(remaining, mc) // keep to retry next time
+				continue
+			}
+			tel.TrackEvent("ExpiredCertificateRemoved", identityProps(obj))
+			// An empty keyID records that the primary app no longer holds the key.
+			mc.KeyID = ""
 		}
-		tel.TrackEvent("ExpiredCertificateRemoved", identityProps(obj))
-		// Removed from the app: drop from status.
+		if len(mc.AdditionalKeys) > 0 {
+			remaining = append(remaining, mc)
+		}
+		// Otherwise removed from every app: drop from status.
 	}
 	status.ManagedKeyCredentials = remaining
 
@@ -379,12 +468,104 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 	// still has to stage/promote the certificate and write the Secret; if any of
 	// that fails, this ensures the added credential is already recorded so it is
 	// cleaned up on expiry instead of being orphaned on the app registration.
-	if newLeaf != nil {
+	if addedKeys {
 		if err := d.kubeClient().Status().Update(ctx, obj); err != nil {
-			return err
+			return errors.Join(addErr, err)
+		}
+	}
+	return addErr
+}
+
+// removeAdditionalKeys removes an expired certificate's keyCredentials from the
+// additional apps that hold them, returning the ones still held (removal failed)
+// so they can be retried. A key already gone (404) counts as removed. A key on
+// an app no longer listed in spec.additionalApps is removed best effort and then
+// dropped either way: the controller no longer manages that app, and the active
+// certificate it would authenticate with was likely never added there, so
+// retrying could never succeed.
+func removeAdditionalKeys(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert *x509.Certificate, authKey *rsa.PrivateKey, keys []ezcav1.AdditionalAppKey, tel *telemetry.Telemetry) []ezcav1.AdditionalAppKey {
+	log := logf.FromContext(ctx)
+	spec := obj.SpecBase()
+	var held []ezcav1.AdditionalAppKey
+	for _, ak := range keys {
+		err := removeAdditionalKey(ctx, d, spec, authCert, authKey, ak)
+		switch {
+		case err == nil || entra.IsNotFound(err):
+			tel.TrackEvent("ExpiredCertificateRemoved", identityPropsForApp(obj, ak.AppID))
+		case !additionalAppConfigured(spec, ak):
+			tel.TrackError(err, "Failed to remove expired certificate from an app no longer in additionalApps; no longer tracking it", identityPropsForApp(obj, ak.AppID))
+			log.Error(err, "Could not remove expired certificate from an app no longer in spec.additionalApps; no longer tracking it",
+				"appID", ak.AppID, "appObjectID", ak.AppObjectID, "keyID", ak.KeyID)
+		default:
+			tel.TrackError(err, "Failed to remove expired certificate from additional app registration", identityPropsForApp(obj, ak.AppID))
+			held = append(held, ak)
+		}
+	}
+	return held
+}
+
+func removeAdditionalKey(ctx context.Context, d reconcilerDeps, spec *ezcav1.CertIdentitySpecBase, authCert *x509.Certificate, authKey *rsa.PrivateKey, ak ezcav1.AdditionalAppKey) error {
+	acl, err := d.newEntraClient(*spec.TenantID, ak.AppID, cloudFor(spec.Cloud), authCert, authKey)
+	if err != nil {
+		return err
+	}
+	return acl.RemoveKey(ctx, ak.AppObjectID, ak.KeyID)
+}
+
+// additionalAppConfigured reports whether the app holding ak is still listed in
+// spec.additionalApps.
+func additionalAppConfigured(spec *ezcav1.CertIdentitySpecBase, ak ezcav1.AdditionalAppKey) bool {
+	for _, app := range spec.AdditionalApps {
+		if app.AppObjectID == ak.AppObjectID && app.AppID == ak.AppID {
+			return true
+		}
+	}
+	return false
+}
+
+// managedCredentialFor returns the tracked key-credential entry for the given
+// certificate thumbprint, or nil when the certificate was never added by the
+// controller (for example, it was bootstrapped externally).
+func managedCredentialFor(status *ezcav1.CertIdentityStatusBase, thumbprint string) *ezcav1.ManagedKeyCredential {
+	for i := range status.ManagedKeyCredentials {
+		if status.ManagedKeyCredentials[i].Thumbprint == thumbprint {
+			return &status.ManagedKeyCredentials[i]
 		}
 	}
 	return nil
+}
+
+// hasAdditionalKey reports whether the tracked entry records a keyCredential on
+// the additional app with the given object ID.
+func hasAdditionalKey(entry *ezcav1.ManagedKeyCredential, appObjectID string) bool {
+	for _, ak := range entry.AdditionalKeys {
+		if ak.AppObjectID == appObjectID {
+			return true
+		}
+	}
+	return false
+}
+
+// missingAdditionalApps returns the spec.additionalApps the controller-tracked
+// certificate with the given thumbprint has not been added to yet. It returns
+// nil for a certificate the controller does not track (bootstrapped
+// externally), whose app registrations are the administrator's to manage.
+func missingAdditionalApps(obj certIdentity, thumbprint string) []ezcav1.AdditionalAppSpec {
+	spec := obj.SpecBase()
+	if len(spec.AdditionalApps) == 0 {
+		return nil
+	}
+	entry := managedCredentialFor(obj.StatusBase(), thumbprint)
+	if entry == nil {
+		return nil
+	}
+	var missing []ezcav1.AdditionalAppSpec
+	for _, app := range spec.AdditionalApps {
+		if !hasAdditionalKey(entry, app.AppObjectID) {
+			missing = append(missing, app)
+		}
+	}
+	return missing
 }
 
 // writeActiveSecret rewrites the active tls.crt/tls.key with the given chain
@@ -698,5 +879,13 @@ func identityProps(obj certIdentity) map[string]string {
 	if spec := obj.SpecBase(); spec.AppID != nil {
 		props["appID"] = *spec.AppID
 	}
+	return props
+}
+
+// identityPropsForApp extends identityProps with the app registration an
+// operation targeted, for operations against an additional app.
+func identityPropsForApp(obj certIdentity, appID string) map[string]string {
+	props := identityProps(obj)
+	props["targetAppID"] = appID
 	return props
 }

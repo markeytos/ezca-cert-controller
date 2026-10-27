@@ -28,6 +28,8 @@ import (
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
 // +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
+// +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
 type CertIdentitySpec struct {
 	CertIdentitySpecBase `json:",inline"`
 }

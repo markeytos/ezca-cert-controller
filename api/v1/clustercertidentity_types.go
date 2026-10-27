@@ -116,6 +116,22 @@ type CertIdentitySpecBase struct {
 	// +kubebuilder:validation:MinLength=1
 	AppObjectID *string `json:"appObjectID,omitempty"`
 
+	// additionalApps are extra Entra ID app registrations (in the same tenant
+	// and cloud as the primary app) that share this identity's certificate. On
+	// every rotation the renewed certificate is added to the primary app and to
+	// every additional app, and it is not promoted into the Secret (and the
+	// identity does not report Available) until every one of those apps can
+	// authenticate with it. Graph's addKey requires a proof of possession
+	// signed by a certificate the target app already trusts, so each
+	// additional app must be bootstrapped with the identity's certificate (for
+	// a ManagedCredential, the identityRef's certificate also works) before it
+	// is listed here; the controller maintains the credential from then on.
+	// +optional
+	// +listType=map
+	// +listMapKey=appObjectID
+	// +kubebuilder:validation:MaxItems=50
+	AdditionalApps []AdditionalAppSpec `json:"additionalApps,omitempty"`
+
 	// cloud selects the Azure sovereign cloud used to reach Entra ID and
 	// Microsoft Graph.
 	// +optional
@@ -163,6 +179,8 @@ type CertIdentitySpecBase struct {
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
 // +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
+// +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
 type ClusterCertIdentitySpec struct {
 	CertIdentitySpecBase `json:",inline"`
 
@@ -199,6 +217,46 @@ type KeyVaultSpec struct {
 	CertName string `json:"certName"`
 }
 
+// AdditionalAppSpec identifies one extra Entra ID app registration that shares
+// the identity's certificate (spec.additionalApps). It lives in the same tenant
+// and cloud as the primary app.
+type AdditionalAppSpec struct {
+	// appID is the application (client) ID of the additional app registration.
+	// The controller authenticates as this app with the shared certificate to
+	// manage its credentials and to verify the certificate is usable.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
+	AppID string `json:"appID"`
+
+	// appObjectID is the Entra ID directory object ID of the additional app
+	// registration (the "id" of the application object, not the appId).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
+	AppObjectID string `json:"appObjectID"`
+}
+
+// AdditionalAppKey records the keyCredential a managed certificate received on
+// one additional app registration (spec.additionalApps), so it can be removed
+// from that app once the certificate expires.
+type AdditionalAppKey struct {
+	// appObjectID is the directory object ID of the additional app registration
+	// holding the key.
+	// +required
+	AppObjectID string `json:"appObjectID"`
+
+	// appID is the application (client) ID of that app registration, kept so the
+	// controller can authenticate as the app to remove the key after the
+	// certificate expires.
+	// +required
+	AppID string `json:"appID"`
+
+	// keyID is the keyCredential identifier assigned by Microsoft Graph.
+	// +required
+	KeyID string `json:"keyID"`
+}
+
 // ManagedKeyCredential records a certificate the controller added to an Entra ID
 // app registration so it can be removed once it expires.
 type ManagedKeyCredential struct {
@@ -206,7 +264,9 @@ type ManagedKeyCredential struct {
 	// +required
 	Thumbprint string `json:"thumbprint"`
 
-	// keyID is the keyCredential identifier assigned by Microsoft Graph.
+	// keyID is the keyCredential identifier assigned by Microsoft Graph. It is
+	// empty once the expired key has been removed from the primary app while
+	// its removal from some additional apps is still being retried.
 	// +required
 	KeyID string `json:"keyID"`
 
@@ -221,6 +281,14 @@ type ManagedKeyCredential struct {
 	// days (a certificate registered after issuance).
 	// +optional
 	AddedAt *metav1.Time `json:"addedAt,omitempty"`
+
+	// additionalKeys are the keyCredentials this certificate was assigned on
+	// each additional app registration (spec.additionalApps), tracked so they
+	// can be removed from those apps when the certificate expires.
+	// +listType=map
+	// +listMapKey=appObjectID
+	// +optional
+	AdditionalKeys []AdditionalAppKey `json:"additionalKeys,omitempty"`
 }
 
 // ClusterCertIdentityStatus defines the observed state of ClusterCertIdentity.

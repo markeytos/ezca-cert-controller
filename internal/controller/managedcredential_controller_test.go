@@ -126,6 +126,8 @@ var _ = Describe("ManagedCredential Controller", func() {
 		sharedSecret = "mc-shared-sec"
 		ownTntID     = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 		ownAppID     = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+		ownObjID     = "own-obj"
+		ownKeyID     = "key-1"
 		dnOld        = "old.ezca.io"
 		dnNew        = "new.ezca.io"
 		dnRenew      = "renew.ezca.io"
@@ -253,6 +255,15 @@ var _ = Describe("ManagedCredential Controller", func() {
 		}
 	}
 
+	// secretLeaf returns the active certificate stored in the named Secret.
+	secretLeaf := func(name string) *x509.Certificate {
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &secret)).To(Succeed())
+		chain, _, err := parseSecret(&secret)
+		Expect(err).NotTo(HaveOccurred())
+		return chain[0]
+	}
+
 	reconcileMC := func(name string) reconcile.Result {
 		res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
 		Expect(err).NotTo(HaveOccurred())
@@ -351,6 +362,119 @@ var _ = Describe("ManagedCredential Controller", func() {
 		// The issued cert matches the full spec, so the credential is Available.
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-opts"}, mc)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+	})
+
+	It("registers an issued certificate on the additional apps and retries a failed one", func() {
+		const (
+			extraAppID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+			extraObjID = "extra-obj"
+		)
+		createParent("mcp-extra", "mcp-extra-sec")
+		_, _, issued := genCertSANs("extra.ezca.io", []string{"extra.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+
+		// The additional app was bootstrapped with the identityRef's certificate.
+		extra := &trustingEntra{fakeEntra: &fakeEntra{}, trusted: map[string]bool{pki.Thumbprint(secretLeaf("mcp-extra-sec")): true}}
+		reconciler.NewEntraClient = func(_, appID string, _ entra.Cloud, cert *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+			if appID == extraAppID {
+				return extra.as(cert), nil
+			}
+			return entraClient, nil
+		}
+
+		mc := newManagedCredential("mc-extra", "mc-extra-sec", "mcp-extra", "CN=extra.ezca.io", []string{"extra.ezca.io"})
+		tnt, app, obj := ownTntID, ownAppID, ownObjID
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		mc.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID, AppObjectID: extraObjID}}
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		name := types.NamespacedName{Namespace: namespace, Name: "mc-extra"}
+
+		// The additional app rejects the registration: the issued certificate is
+		// stored and on the primary app, but the credential must not settle.
+		extra.addErr = errors.New("graph is down")
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).To(HaveOccurred())
+		Expect(entraClient.added).To(HaveLen(1))
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeFalse())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
+
+		// The app recovers: the next pass completes the missing registration
+		// without issuing a new certificate, and the credential settles.
+		extra.addErr = nil
+		issuerClient.called = false
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(issuerClient.called).To(BeFalse(), "must complete the registration, not issue a new certificate")
+		Expect(extra.added).To(HaveLen(1))
+		Expect(extra.added[0]).To(Equal(issued.Raw))
+
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(mc.Status.ManagedKeyCredentials).To(HaveLen(1))
+		Expect(mc.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(1))
+		Expect(mc.Status.ManagedKeyCredentials[0].AdditionalKeys[0].AppObjectID).To(Equal(extraObjID))
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		Expect(extra.trusted).To(HaveKey(pki.Thumbprint(issued)))
+	})
+
+	It("renews when an additional app was bootstrapped with the credential's own certificate", func() {
+		const (
+			extraAppID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+			extraObjID = "self-obj"
+			dnSelf     = "self.ezca.io"
+		)
+		createParent("mcp-self", "mcp-self-sec")
+		// The active certificate is registered on the primary app and is due for
+		// renewal.
+		curPEM, curKeyPEM, curCert := genCertSANs(dnSelf, []string{dnSelf}, now.Add(-80*24*time.Hour), now.Add(10*24*time.Hour))
+		createSecret("mc-self-sec", curPEM, curKeyPEM)
+		_, _, renewed := genCertSANs(dnSelf, []string{dnSelf}, now, now.Add(90*24*time.Hour))
+		ezcaClient.newChain = []*x509.Certificate{renewed}
+
+		// The administrator trusted the credential's own certificate on the new
+		// app, not the identityRef's.
+		extra := &trustingEntra{fakeEntra: &fakeEntra{}, trusted: map[string]bool{pki.Thumbprint(curCert): true}}
+		reconciler.NewEntraClient = func(_, appID string, _ entra.Cloud, cert *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+			if appID == extraAppID {
+				return extra.as(cert), nil
+			}
+			return entraClient, nil
+		}
+
+		mc := newManagedCredential("mc-self", "mc-self-sec", "mcp-self", "CN="+dnSelf, []string{dnSelf})
+		tnt, app, obj := ownTntID, ownAppID, ownObjID
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		mc.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID, AppObjectID: extraObjID}}
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		name := types.NamespacedName{Namespace: namespace, Name: "mc-self"}
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+			Thumbprint: pki.Thumbprint(curCert),
+			KeyID:      ownKeyID,
+			NotAfter:   metav1.Time{Time: curCert.NotAfter},
+		}}
+		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
+
+		// The active certificate already authenticates as the additional app, so
+		// it is not re-registered there (with the identityRef's certificate, which
+		// that app does not trust); renewal goes ahead and the renewed
+		// certificate reaches the additional app, authenticated by the active one.
+		reconcileMC("mc-self")
+		Expect(ezcaClient.called).To(BeTrue())
+		Expect(extra.added).To(HaveLen(1))
+		Expect(extra.added[0]).To(Equal(renewed.Raw))
+		var secret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-self-sec"}, &secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKey(tlsCertPendingKey))
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(mc.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+		entry := managedCredentialFor(mc.StatusBase(), pki.Thumbprint(renewed))
+		Expect(entry).NotTo(BeNil())
+		Expect(entry.AdditionalKeys).To(ConsistOf(ezcav1.AdditionalAppKey{AppObjectID: extraObjID, AppID: extraAppID, KeyID: "new-key-id"}))
 	})
 
 	It("re-issues when the certificate drifts from the desired subject/domains", func() {
@@ -538,7 +662,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		issuerClient.chain = []*x509.Certificate{issued}
 
 		mc := newManagedCredential("mc-own", "mc-own-sec", "mcp-own", "CN=new.ezca.io", []string{dnNew})
-		tnt, app, obj := ownTntID, ownAppID, "own-obj"
+		tnt, app, obj := ownTntID, ownAppID, ownObjID
 		mc.Spec.TenantID = &tnt
 		mc.Spec.AppID = &app
 		mc.Spec.AppObjectID = &obj
@@ -548,7 +672,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-own"}, mc)).To(Succeed())
 		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
 			Thumbprint: pki.Thumbprint(oldCert),
-			KeyID:      "key-1",
+			KeyID:      ownKeyID,
 			NotAfter:   metav1.Time{Time: oldCert.NotAfter},
 		}}
 		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
@@ -598,7 +722,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-exp"}, mc)).To(Succeed())
 		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
 			Thumbprint: pki.Thumbprint(expCert),
-			KeyID:      "key-1",
+			KeyID:      ownKeyID,
 			NotAfter:   metav1.Time{Time: expCert.NotAfter},
 		}}
 		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())

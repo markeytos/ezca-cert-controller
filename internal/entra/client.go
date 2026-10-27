@@ -91,6 +91,24 @@ type httpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+// GraphError is a non-2xx response from Microsoft Graph.
+type GraphError struct {
+	URL        string
+	StatusCode int
+	Body       string
+}
+
+func (e *GraphError) Error() string {
+	return fmt.Sprintf("entra: Graph request to %s failed with status %d: %s", e.URL, e.StatusCode, e.Body)
+}
+
+// IsNotFound reports whether err is a Graph 404: the app registration (or the
+// keyCredential on it) does not exist.
+func IsNotFound(err error) bool {
+	var ge *GraphError
+	return errors.As(err, &ge) && ge.StatusCode == http.StatusNotFound
+}
+
 // Client talks to Microsoft Graph for a single app registration, authenticated
 // as that app with a client certificate.
 type Client struct {
@@ -264,7 +282,7 @@ func (c *Client) doJSON(ctx context.Context, method, reqURL string, body any, ou
 		return err
 	}
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("entra: Graph request to %s failed with status %d: %s", reqURL, res.StatusCode, string(resBytes))
+		return &GraphError{URL: reqURL, StatusCode: res.StatusCode, Body: string(resBytes)}
 	}
 	if out != nil && len(bytes.TrimSpace(resBytes)) > 0 {
 		return json.Unmarshal(resBytes, out)

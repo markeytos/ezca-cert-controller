@@ -97,11 +97,71 @@ func (f *fakeEntra) AddKey(_ context.Context, _ string, der []byte) (string, err
 }
 
 func (f *fakeEntra) RemoveKey(_ context.Context, _, keyID string) error {
-	if len(keyID) <= 0 {
+	if f.removeErr != nil {
 		return f.removeErr
+	}
+	if len(keyID) <= 0 {
+		return errors.New("fakeEntra: empty keyID")
 	}
 	f.removed = append(f.removed, keyID)
 	return nil
+}
+
+// trustingEntra models an app registration's keyCredentials: a client
+// certificate can authenticate (and sign addKey/removeKey proofs) only when its
+// thumbprint is in trusted, and AddKey trusts the added certificate.
+type trustingEntra struct {
+	*fakeEntra
+	trusted map[string]bool
+}
+
+// as returns a client for the app authenticated with cert, for a test's
+// NewEntraClient.
+func (t *trustingEntra) as(cert *x509.Certificate) entraManager {
+	return &trustingEntraConn{t: t, cert: cert}
+}
+
+type trustingEntraConn struct {
+	t    *trustingEntra
+	cert *x509.Certificate
+}
+
+func (c *trustingEntraConn) authErr() error {
+	if !c.t.trusted[pki.Thumbprint(c.cert)] {
+		return errors.New("AADSTS700027: client certificate is not registered on the app")
+	}
+	return nil
+}
+
+func (c *trustingEntraConn) VerifyCredential(ctx context.Context) error {
+	if err := c.authErr(); err != nil {
+		c.t.verifyCalls++
+		return err
+	}
+	return c.t.VerifyCredential(ctx)
+}
+
+func (c *trustingEntraConn) AddKey(ctx context.Context, objectID string, der []byte) (string, error) {
+	if err := c.authErr(); err != nil {
+		return "", err
+	}
+	keyID, err := c.t.AddKey(ctx, objectID, der)
+	if err != nil {
+		return "", err
+	}
+	added, err := x509.ParseCertificate(der)
+	if err != nil {
+		return "", err
+	}
+	c.t.trusted[pki.Thumbprint(added)] = true
+	return keyID, nil
+}
+
+func (c *trustingEntraConn) RemoveKey(ctx context.Context, objectID, keyID string) error {
+	if err := c.authErr(); err != nil {
+		return err
+	}
+	return c.t.RemoveKey(ctx, objectID, keyID)
 }
 
 type fakeKeyVault struct {
@@ -795,5 +855,271 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kvClient.imported).To(HaveLen(1), "must sync to Key Vault immediately, not defer on a recent LastRenewalTime")
+	})
+
+	Describe("additional apps", func() {
+		const (
+			extraAppID2 = "22222222-2222-2222-2222-222222222222"
+			extraObjID2 = "obj-2"
+			extraAppID3 = "33333333-3333-3333-3333-333333333333"
+			extraObjID3 = "obj-3"
+		)
+
+		var extra2, extra3 *fakeEntra
+
+		BeforeEach(func() {
+			extra2 = &fakeEntra{}
+			extra3 = &fakeEntra{}
+			reconciler.NewEntraClient = func(_, appID string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+				switch appID {
+				case extraAppID2:
+					return extra2, nil
+				case extraAppID3:
+					return extra3, nil
+				default:
+					return entraClient, nil
+				}
+			}
+		})
+
+		createMultiAppIdentity := func(name, secretName string) *ezcav1.ClusterCertIdentity {
+			ezcaURL := testEZCAURL
+			tenant := testUUID0
+			app := testUUID1
+			objectID := testObjectID
+			cci := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL:          &ezcaURL,
+						CertSecretName:   secretName,
+						Cloud:            ezcav1.CloudPublic,
+						RenewalThreshold: 20,
+						TenantID:         &tenant,
+						AppID:            &app,
+						AppObjectID:      &objectID,
+						AdditionalApps: []ezcav1.AdditionalAppSpec{
+							{AppID: extraAppID2, AppObjectID: extraObjID2},
+							{AppID: extraAppID3, AppObjectID: extraObjID3},
+						},
+					},
+					CertSecretNamespace: namespace,
+					AllowedNamespaces:   []string{namespace},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+			return cci
+		}
+
+		It("adds the renewed cert to every app and promotes only once all of them authenticate", func() {
+			certPEM, keyPEM, oldCert := genCert("multi.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("multi-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("multi-identity", "multi-secret")
+
+			_, _, parsedNew := genCert("multi.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			secretName := types.NamespacedName{Name: "multi-secret", Namespace: namespace}
+
+			// Renew: the certificate lands on the primary and both additional apps.
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entraClient.added).To(HaveLen(1))
+			Expect(extra2.added).To(HaveLen(1))
+			Expect(extra3.added).To(HaveLen(1))
+			Expect(extra2.added[0]).To(Equal(parsedNew.Raw))
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
+			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(2))
+
+			// Past the grace window, one additional app still cannot authenticate:
+			// the certificate must not be promoted.
+			clockNow = now.Add(propagationGrace + time.Minute)
+			extra3.verifyErr = errors.New("AADSTS700027: key not found")
+			res, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(propagationRequeue))
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			Expect(s.Data).To(HaveKey(tlsCertPendingKey))
+			chain, err := pki.ParseCertChainPEM(s.Data[tlsCertKey])
+			Expect(err).NotTo(HaveOccurred())
+			Expect(chain[0].Equal(oldCert)).To(BeTrue(), "must keep serving the old cert while an additional app cannot authenticate")
+
+			// Every app authenticates: promote and settle.
+			extra3.verifyErr = nil
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			Expect(s.Data).NotTo(HaveKey(tlsCertPendingKey))
+			chain, err = pki.ParseCertChainPEM(s.Data[tlsCertKey])
+			Expect(err).NotTo(HaveOccurred())
+			Expect(chain[0].Equal(parsedNew)).To(BeTrue())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+			// No duplicate additions across the whole flow.
+			Expect(entraClient.added).To(HaveLen(1))
+			Expect(extra2.added).To(HaveLen(1))
+			Expect(extra3.added).To(HaveLen(1))
+		})
+
+		It("stages on a partial additional-app failure and completes the registration before promoting", func() {
+			certPEM, keyPEM, _ := genCert("partial.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("partial-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("partial-identity", "partial-secret")
+
+			_, _, parsedNew := genCert("partial.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			secretName := types.NamespacedName{Name: "partial-secret", Namespace: namespace}
+
+			// One additional app rejects the addition: the renewed certificate is
+			// still staged (it is on the primary app) rather than thrown away and
+			// re-issued on the next pass.
+			extra3.addErr = errors.New("graph is down")
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ezcaClient.called).To(BeTrue())
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			Expect(s.Data).To(HaveKey(tlsCertPendingKey))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
+			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(1))
+
+			// The app recovers: the next pass completes the missing registration
+			// and (past the grace window, all apps authenticating) promotes.
+			extra3.addErr = nil
+			clockNow = now.Add(propagationGrace + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra3.added).To(HaveLen(1))
+			Expect(extra3.added[0]).To(Equal(parsedNew.Raw))
+			Expect(k8sClient.Get(ctx, secretName, &s)).To(Succeed())
+			Expect(s.Data).NotTo(HaveKey(tlsCertPendingKey))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(HaveLen(2))
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+		})
+
+		// seedExpiredKey records an expired certificate held by the primary app
+		// and by both additional apps.
+		seedExpiredKey := func(cci *ezcav1.ClusterCertIdentity) reconcile.Request {
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+				Thumbprint: "OLD",
+				KeyID:      "expired-key",
+				NotAfter:   metav1.Time{Time: now.Add(-time.Hour)},
+				AdditionalKeys: []ezcav1.AdditionalAppKey{
+					{AppObjectID: extraObjID2, AppID: extraAppID2, KeyID: "extra-key-2"},
+					{AppObjectID: extraObjID3, AppID: extraAppID3, KeyID: "extra-key-3"},
+				},
+			}}
+			Expect(k8sClient.Status().Update(ctx, cci)).To(Succeed())
+			return reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+		}
+
+		It("removes an expired certificate from every app, retrying only the removals that failed", func() {
+			certPEM, keyPEM, _ := genCert("multiclean.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("multiclean-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("multiclean-identity", "multiclean-secret")
+			req := seedExpiredKey(cci)
+
+			// One additional app fails the removal: the key still leaves the primary
+			// app and the other additional app, and only the failed one is retried.
+			extra3.removeErr = errors.New("graph is down")
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra2.removed).To(ConsistOf("extra-key-2"))
+			Expect(entraClient.removed).To(ConsistOf("expired-key"), "a failing additional app must not keep the expired key on the primary app")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(HaveLen(1))
+			Expect(cci.Status.ManagedKeyCredentials[0].KeyID).To(BeEmpty())
+			Expect(cci.Status.ManagedKeyCredentials[0].AdditionalKeys).To(ConsistOf(
+				ezcav1.AdditionalAppKey{AppObjectID: extraObjID3, AppID: extraAppID3, KeyID: "extra-key-3"},
+			))
+
+			// The app recovers: its key is removed and the entry dropped, without
+			// removing the primary key a second time.
+			extra3.removeErr = nil
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra3.removed).To(ConsistOf("extra-key-3"))
+			Expect(entraClient.removed).To(ConsistOf("expired-key"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+		})
+
+		It("treats an expired key already gone from an app as removed", func() {
+			certPEM, keyPEM, _ := genCert("gone.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("gone-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("gone-identity", "gone-secret")
+			req := seedExpiredKey(cci)
+
+			// The key was removed by hand from the primary app, and one additional
+			// app registration was deleted: Graph answers 404 for both.
+			notFound := &entra.GraphError{StatusCode: 404, Body: "Resource does not exist"}
+			entraClient.removeErr = notFound
+			extra3.removeErr = notFound
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra2.removed).To(ConsistOf("extra-key-2"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+		})
+
+		It("stops tracking an expired key on an app removed from additionalApps", func() {
+			certPEM, keyPEM, _ := genCert("dropped.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("dropped-secret", certPEM, keyPEM)
+			cci := createMultiAppIdentity("dropped-identity", "dropped-secret")
+			req := seedExpiredKey(cci)
+
+			// The administrator removes app 3. The active certificate was never added
+			// there, so the removal cannot authenticate; it is tried once, then the
+			// key is no longer tracked instead of being retried forever.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID2, AppObjectID: extraObjID2}}
+			Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+			extra3.removeErr = errors.New("AADSTS700027: client certificate is not registered on the app")
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extra2.removed).To(ConsistOf("extra-key-2"))
+			Expect(entraClient.removed).To(ConsistOf("expired-key"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.ManagedKeyCredentials).To(BeEmpty())
+		})
+
+		It("rejects additionalApps without the Entra app fields or repeating the primary app", func() {
+			ezcaURL := testEZCAURL
+			cci := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-additional"},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL:          &ezcaURL,
+						CertSecretName:   "invalid-additional-secret",
+						RenewalThreshold: 20,
+						AdditionalApps:   []ezcav1.AdditionalAppSpec{{AppID: extraAppID2, AppObjectID: extraObjID2}},
+					},
+					CertSecretNamespace: namespace,
+					AllowedNamespaces:   []string{namespace},
+				},
+			}
+			err := k8sClient.Create(ctx, cci)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("additionalApps requires the Entra app fields"))
+
+			tenant := testUUID0
+			app := testUUID1
+			objectID := testObjectID
+			cci.Spec.TenantID = &tenant
+			cci.Spec.AppID = &app
+			cci.Spec.AppObjectID = &objectID
+			cci.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID2, AppObjectID: testObjectID}}
+			err = k8sClient.Create(ctx, cci)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("must not repeat the primary appObjectID"))
+		})
 	})
 })

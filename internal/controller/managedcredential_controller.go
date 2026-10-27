@@ -191,14 +191,16 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 
 	// An issued app credential is persisted before it is registered on the app
 	// (see installIssuedCert), so a failed registration leaves a valid but
-	// unregistered certificate behind. Retry the registration here and stay
-	// Degraded until it succeeds; otherwise the steady-state path would report
-	// the credential Available and the certificate would silently stay off the
-	// app until renewal. Credentials without an identityRef are excluded: their
+	// unregistered certificate behind — on the primary app or on some of the
+	// additional apps. Retry the registration here and stay Degraded until it
+	// succeeds; otherwise the steady-state path would report the credential
+	// Available and the certificate would silently stay off the app until
+	// renewal. Credentials without an identityRef are excluded: their
 	// certificate is provisioned (and registered) externally, and there is no
 	// identity to authenticate a registration with.
-	if appConfigured(mc) && canSelfBootstrap(mc) && !hasPendingCert(&secret) && !leafRegisteredInEntra(mc, chain[0]) {
-		authCert, authKey, err := r.appAuthCert(ctx, mc, chain[0], key, now)
+	if appConfigured(mc) && canSelfBootstrap(mc) && !hasPendingCert(&secret) &&
+		(!leafRegisteredInEntra(mc, chain[0]) || r.additionalAppsNeedRegistration(ctx, mc, chain[0], key, now)) {
+		authCert, authKey, err := r.registrationAuthCert(ctx, mc, chain[0], key, now)
 		if err != nil {
 			tel.TrackError(err, "Failed to obtain a credential to register the certificate on the app", identityProps(mc))
 			setDegraded(mc, "AppAuthUnavailable", fmt.Sprintf("Could not obtain a credential to register the certificate on the app registration: %v", err))
@@ -208,7 +210,7 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
 			return ctrl.Result{}, err
 		}
-		logf.FromContext(ctx).Info("Registered the active certificate on the app registration",
+		logf.FromContext(ctx).Info("Registered the active certificate on the app registrations",
 			"thumbprint", pki.Thumbprint(chain[0]))
 	}
 
@@ -346,8 +348,15 @@ func (r *ManagedCredentialReconciler) installIssuedCert(ctx context.Context, mc 
 	}
 
 	if err := manageApp(ctx, r, mc, authCert, authKey, newLeaf, tel, now); err != nil {
-		setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
-		return ctrl.Result{}, err
+		// Tolerate a failure limited to the additional apps when a certificate is
+		// already being served: the issued certificate is on the primary app and
+		// recorded in status, so stage it and let the promotion flow retry the
+		// missing additional registrations instead of re-issuing on every pass.
+		if currentLeaf == nil || managedCredentialFor(mc.StatusBase(), pki.Thumbprint(newLeaf)) == nil {
+			setDegraded(mc, "AppRotationFailed", fmt.Sprintf("Failed to add issued certificate to app registration: %v", err))
+			return ctrl.Result{}, err
+		}
+		log.Error(err, "Issued certificate is missing from some additional app registrations; staging it and retrying them")
 	}
 
 	// If a certificate was already being served, keep serving it and stage the new
@@ -405,6 +414,49 @@ func (r *ManagedCredentialReconciler) appAuthCert(ctx context.Context, mc *ezcav
 	}
 	cert, key, _, err := r.identityRefCertKey(ctx, mc)
 	return cert, key, err
+}
+
+// registrationAuthCert returns the certificate and key used to retry
+// registering the active certificate on the app registrations. It prefers the
+// referenced master identity's certificate: Graph's addKey proof must be signed
+// by a key the target app already trusts, and during bootstrap the identityRef's
+// certificate is the one credential trusted on the primary and every additional
+// app. When the identityRef cannot be resolved (for example its Secret was
+// removed after bootstrap), it falls back to the credential's own certificate.
+func (r *ManagedCredentialReconciler) registrationAuthCert(ctx context.Context, mc *ezcav1.ManagedCredential, currentLeaf *x509.Certificate, currentKey *rsa.PrivateKey, now time.Time) (*x509.Certificate, *rsa.PrivateKey, error) {
+	cert, key, _, err := r.identityRefCertKey(ctx, mc)
+	if err == nil {
+		return cert, key, nil
+	}
+	if currentKey != nil && currentCertUsable(mc, currentLeaf, now) {
+		return currentLeaf, currentKey, nil
+	}
+	return nil, nil, err
+}
+
+// additionalAppsNeedRegistration reports whether the active certificate still
+// has to be registered on some of spec.additionalApps. An additional app it is
+// not recorded on, but can already authenticate as, needs nothing: the
+// administrator bootstrapped that app with the credential's own certificate.
+// Retrying the registration there would authenticate with the identityRef's
+// certificate (see registrationAuthCert), which that app need not trust, and
+// fail on every pass — blocking renewal until the certificate expires.
+func (r *ManagedCredentialReconciler) additionalAppsNeedRegistration(ctx context.Context, mc *ezcav1.ManagedCredential, leaf *x509.Certificate, key *rsa.PrivateKey, now time.Time) bool {
+	missing := missingAdditionalApps(mc, pki.Thumbprint(leaf))
+	if len(missing) == 0 {
+		return false
+	}
+	if !currentCertUsable(mc, leaf, now) {
+		return true
+	}
+	spec := mc.SpecBase()
+	for _, app := range missing {
+		cl, err := r.newEntraClient(*spec.TenantID, app.AppID, cloudFor(spec.Cloud), leaf, key)
+		if err != nil || cl.VerifyCredential(ctx) != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // storeIssuedCert writes the issued chain and key into the credential's Secret,
