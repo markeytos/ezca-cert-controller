@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -94,7 +95,7 @@ func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the CertIdentity watch.
 	if !equality.Semantic.DeepEqual(originalStatus, &ci.Status) {
-		if err := r.Status().Update(ctx, &ci); err != nil {
+		if err := updateStatus(ctx, r.Client, &ci); err != nil {
 			log.Error(err, "Failed to update CertIdentity status")
 			if reconcileErr == nil {
 				reconcileErr = err
@@ -146,7 +147,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 // SetupWithManager sets up the controller with the Manager.
 func (r *CertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ezcav1.CertIdentity{}).
+		For(&ezcav1.CertIdentity{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("certidentity").
 		Complete(r)

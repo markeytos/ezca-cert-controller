@@ -102,6 +102,10 @@ controller:
       tag: ""
       pullPolicy: IfNotPresent
 
+    ## Tune how long a renewed certificate is given to propagate across Entra ID
+    ## before it is promoted into the Secret (defaults shown), e.g.:
+    ##   - --propagation-grace=1h
+    ##   - --propagation-timeout=2h
     args:
       - --leader-elect
 

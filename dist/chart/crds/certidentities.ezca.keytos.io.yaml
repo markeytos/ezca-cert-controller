@@ -1,3 +1,4 @@
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -53,6 +54,52 @@ spec:
           spec:
             description: spec defines the desired state of CertIdentity
             properties:
+              additionalApps:
+                description: |-
+                  additionalApps are extra Entra ID app registrations (in the same tenant
+                  and cloud as the primary app) that share this identity's certificate. On
+                  every rotation the renewed certificate is added to the primary app and to
+                  every additional app, and it is not promoted into the Secret (and the
+                  identity does not report Available) until every one of those apps can
+                  authenticate with it. Once the active certificate has expired, only the
+                  primary app has to authenticate: the renewed certificate is promoted and
+                  the identity reports Degraded (AdditionalAppRotationFailed) for the
+                  additional apps that do not hold it, which then need it added again by
+                  an administrator. Graph's addKey requires a proof of possession
+                  signed by a certificate the target app already trusts, so each
+                  additional app must be bootstrapped with the identity's certificate (for
+                  a ManagedCredential, the identityRef's certificate also works) before it
+                  is listed here; the controller maintains the credential from then on.
+                items:
+                  description: |-
+                    AdditionalAppSpec identifies one extra Entra ID app registration that shares
+                    the identity's certificate (spec.additionalApps). It lives in the same tenant
+                    and cloud as the primary app.
+                  properties:
+                    appID:
+                      description: |-
+                        appID is the application (client) ID of the additional app registration.
+                        The controller authenticates as this app with the shared certificate to
+                        manage its credentials and to verify the certificate is usable.
+                      maxLength: 100
+                      minLength: 1
+                      type: string
+                    appObjectID:
+                      description: |-
+                        appObjectID is the Entra ID directory object ID of the additional app
+                        registration (the "id" of the application object, not the appId).
+                      maxLength: 100
+                      minLength: 1
+                      type: string
+                  required:
+                  - appID
+                  - appObjectID
+                  type: object
+                maxItems: 50
+                type: array
+                x-kubernetes-list-map-keys:
+                - appObjectID
+                x-kubernetes-list-type: map
               appID:
                 description: |-
                   appID is the Entra ID (Azure AD) application (client) ID whose
@@ -149,6 +196,12 @@ spec:
             - message: keyVault requires the Entra app fields (tenantID, appID, appObjectID);
                 the certificate authenticates to Key Vault as that app
               rule: '!has(self.keyVault) || has(self.appID)'
+            - message: additionalApps requires the Entra app fields (tenantID, appID,
+                appObjectID)
+              rule: '!has(self.additionalApps) || has(self.appID)'
+            - message: additionalApps must not repeat the primary appObjectID
+              rule: '!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a,
+                a.appObjectID != self.appObjectID)'
           status:
             description: status defines the observed state of CertIdentity
             properties:
@@ -243,9 +296,54 @@ spec:
                         days (a certificate registered after issuance).
                       format: date-time
                       type: string
+                    additionalKeys:
+                      description: |-
+                        additionalKeys are the keyCredentials this certificate was assigned on
+                        each additional app registration (spec.additionalApps), tracked so they
+                        can be removed from those apps when the certificate expires.
+                      items:
+                        description: |-
+                          AdditionalAppKey records the keyCredential a managed certificate received on
+                          one additional app registration (spec.additionalApps), so it can be removed
+                          from that app once the certificate expires.
+                        properties:
+                          addedAt:
+                            description: |-
+                              addedAt is when the key was added to this app registration. Entra
+                              propagation for this app is measured from this time.
+                            format: date-time
+                            type: string
+                          appID:
+                            description: |-
+                              appID is the application (client) ID of that app registration, kept so the
+                              controller can authenticate as the app to remove the key after the
+                              certificate expires.
+                            type: string
+                          appObjectID:
+                            description: |-
+                              appObjectID is the directory object ID of the additional app registration
+                              holding the key.
+                            type: string
+                          keyID:
+                            description: keyID is the keyCredential identifier assigned
+                              by Microsoft Graph.
+                            type: string
+                        required:
+                        - appID
+                        - appObjectID
+                        - keyID
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - appObjectID
+                      x-kubernetes-list-type: map
                     keyID:
-                      description: keyID is the keyCredential identifier assigned
-                        by Microsoft Graph.
+                      description: |-
+                        keyID is the keyCredential identifier assigned by Microsoft Graph. It is
+                        empty when there is no primary key for the controller to remove: the
+                        expired key was already removed from the primary app while its removal
+                        from some additional apps is still being retried, or the certificate was
+                        found already registered on the primary app without its keyID recorded.
                       type: string
                     notAfter:
                       description: |-
@@ -276,6 +374,11 @@ spec:
                   window.
                 format: date-time
                 type: string
+              pendingLastVerified:
+                description: pendingLastVerified is when the pending certificate was
+                  last checked.
+                format: date-time
+                type: string
               pendingSince:
                 description: |-
                   pendingSince is when the pending certificate was added, used to bound how
@@ -288,6 +391,14 @@ spec:
                   that has been added to the app registration and is awaiting propagation
                   in Entra ID before it is promoted into the Secret.
                 type: string
+              pendingVerifications:
+                description: |-
+                  pendingVerifications counts the consecutive checks, spread across the
+                  propagation grace, in which the pending certificate authenticated as the
+                  primary app and as every additional app. It is promoted only once enough
+                  checks have succeeded; a failed check resets the count.
+                format: int32
+                type: integer
               thumbprint:
                 description: thumbprint is the SHA-1 thumbprint (hex) of the current
                   certificate.

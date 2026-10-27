@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -93,7 +94,7 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the ClusterCertIdentity watch.
 	if !equality.Semantic.DeepEqual(originalStatus, &cci.Status) {
-		if err := r.Status().Update(ctx, &cci); err != nil {
+		if err := updateStatus(ctx, r.Client, &cci); err != nil {
 			log.Error(err, "Failed to update ClusterCertIdentity status")
 			if reconcileErr == nil {
 				reconcileErr = err
@@ -151,7 +152,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterCertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ezcav1.ClusterCertIdentity{}).
+		For(&ezcav1.ClusterCertIdentity{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
 		Named("clustercertidentity").
 		Complete(r)

@@ -33,13 +33,13 @@ func TestPropagationRequeueAfter(t *testing.T) {
 	}{
 		// Inside the grace window: wait out the remainder in one go rather than
 		// polling, since authenticating with the certificate cannot succeed yet.
-		"just staged":          {at(0), propagationGrace},
-		"partway through":      {at(-2 * time.Minute), propagationGrace - 2*time.Minute},
-		"one second remaining": {at(-propagationGrace + time.Second), time.Second},
+		"just staged":          {at(0), DefaultPropagationGrace},
+		"partway through":      {at(-2 * time.Minute), DefaultPropagationGrace - 2*time.Minute},
+		"one second remaining": {at(-DefaultPropagationGrace + time.Second), time.Second},
 
 		// Grace elapsed: poll at the propagation interval.
-		"exactly at grace": {at(-propagationGrace), propagationRequeue},
-		"past grace":       {at(-6 * time.Minute), propagationRequeue},
+		"exactly at grace": {at(-DefaultPropagationGrace), propagationRequeue},
+		"past grace":       {at(-DefaultPropagationGrace - time.Minute), propagationRequeue},
 		"long past grace":  {at(-10 * 24 * time.Hour), propagationRequeue},
 
 		// No reference time recorded (e.g. staged by an older version): fall back
@@ -47,7 +47,7 @@ func TestPropagationRequeueAfter(t *testing.T) {
 		"nil since": {nil, propagationRequeue},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got := propagationRequeueAfter(now, v.since)
+			got := propagationRequeueAfter(now, v.since, DefaultPropagationGrace)
 			if got != v.want {
 				t.Errorf("propagationRequeueAfter() = %v, want %v", got, v.want)
 			}
@@ -55,6 +55,25 @@ func TestPropagationRequeueAfter(t *testing.T) {
 			// controller-runtime, which would strand the certificate forever.
 			if got <= 0 {
 				t.Errorf("propagationRequeueAfter() = %v, must always be positive", got)
+			}
+		})
+	}
+}
+
+func TestPropagationTimingValidate(t *testing.T) {
+	for name, v := range map[string]struct {
+		timing  PropagationTiming
+		wantErr bool
+	}{
+		"defaults":                {PropagationTiming{Grace: DefaultPropagationGrace, Timeout: DefaultPropagationTimeout}, false},
+		"zero grace":              {PropagationTiming{Grace: 0, Timeout: time.Hour}, true},
+		"negative grace":          {PropagationTiming{Grace: -time.Minute, Timeout: time.Hour}, true},
+		"timeout equals grace":    {PropagationTiming{Grace: time.Hour, Timeout: time.Hour}, true},
+		"timeout below the grace": {PropagationTiming{Grace: time.Hour, Timeout: 30 * time.Minute}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := v.timing.Validate(); (err != nil) != v.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, v.wantErr)
 			}
 		})
 	}
