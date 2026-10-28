@@ -167,9 +167,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 
 	r.syncSecretReplicas(ctx, cci, secretName, tel, rs)
 	reportSecretReplicas(ctx, cci, rs, tel, &result)
-	if cci.Spec.KeyVault != nil {
-		syncKeyVaultBestEffort(ctx, r, cci, &secret, now, tel, &result, coreErr)
-	}
+	syncKeyVaultBestEffort(ctx, r, cci, &secret, now, tel, &result, coreErr)
 	return result, coreErr
 }
 

@@ -262,6 +262,15 @@ func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, bundle []b
 	return nil
 }
 
+// fakeKeyVaultCredential opens every vault through open.
+type fakeKeyVaultCredential struct {
+	open func(vaultName string) *fakeKeyVault
+}
+
+func (f fakeKeyVaultCredential) vaultClient(vaultName string) (keyVaultManager, error) {
+	return f.open(vaultName), nil
+}
+
 func genCert(cn string, notBefore, notAfter time.Time) (certPEM, keyPEM []byte, cert *x509.Certificate) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	Expect(err).NotTo(HaveOccurred())
@@ -293,7 +302,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		ezcaClient  *fakeEZCA
 		entraClient *fakeEntra
 		kvClient    *fakeKeyVault
-		clockNow    time.Time
+		// kvCredBuilds counts the Key Vault credentials the reconciler built.
+		kvCredBuilds int
+		clockNow     time.Time
 	)
 
 	newReconciler := func() *ClusterCertIdentityReconciler {
@@ -306,8 +317,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 					return entraClient, nil
 				},
-				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-					return kvClient, nil
+				NewKeyVaultCredential: func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+					kvCredBuilds++
+					return fakeKeyVaultCredential{open: func(string) *fakeKeyVault { return kvClient }}, nil
 				},
 			},
 			DefaultNamespace: namespace,
@@ -355,6 +367,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		ezcaClient = &fakeEZCA{}
 		entraClient = &fakeEntra{}
 		kvClient = &fakeKeyVault{}
+		kvCredBuilds = 0
 		reconciler = newReconciler()
 	})
 
@@ -888,11 +901,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					CertSecretName:   "kv-secret",
 					Cloud:            ezcav1.CloudPublic,
 					RenewalThreshold: 20,
-					// keyVault requires the app fields (cert authenticates as the app).
+					// keyVaults requires the app fields (cert authenticates as the app).
 					TenantID:    &tenant,
 					AppID:       &app,
 					AppObjectID: &objectID,
-					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:   []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -909,11 +922,186 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(string(kvClient.imported[0])).To(ContainSubstring("BEGIN CERTIFICATE"))
 		Expect(string(kvClient.imported[0])).To(ContainSubstring("PRIVATE KEY"))
 
-		// Key Vault already matches -> no further import.
-		kvClient.matches = true
+		// Status now records the vault as holding the certificate, so the next
+		// reconcile does not contact Key Vault at all.
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+		Expect(cci.Status.KeyVaults).To(HaveLen(1))
+		Expect(cci.Status.KeyVaults[0].Thumbprint).To(Equal(cci.Status.Thumbprint))
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.matchCalls).To(Equal(1))
 		Expect(kvClient.imported).To(HaveLen(1))
+	})
+
+	It("syncs every Key Vault independently with one credential and retries only the failing ones", func() {
+		certPEM, keyPEM, leaf := genCert("kvmulti.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret("kvmulti-secret", certPEM, keyPEM)
+		thumbprint := pki.Thumbprint(leaf)
+
+		// One fake per vault, so a failure in one is visible as such.
+		vaults := map[string]*fakeKeyVault{
+			"vault-prod": {},
+			"vault-test": {},
+			"vault-dr":   {matchErr: errors.New("Forbidden: missing get permission")},
+		}
+		reconciler.NewKeyVaultCredential = func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+			kvCredBuilds++
+			return fakeKeyVaultCredential{open: func(name string) *fakeKeyVault { return vaults[name] }}, nil
+		}
+
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kvmulti-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kvmulti-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVaults: []ezcav1.KeyVaultSpec{
+						{VaultName: "vault-prod", CertName: certName},
+						{VaultName: "vault-dr", CertName: certName},
+						{VaultName: "vault-test", CertName: certName},
+					},
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+		syncedVaults := func() []string {
+			ExpectWithOffset(1, k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+			names := make([]string, 0, len(cci.Status.KeyVaults))
+			for _, kv := range cci.Status.KeyVaults {
+				ExpectWithOffset(1, kv.Thumbprint).To(Equal(thumbprint))
+				names = append(names, kv.VaultName)
+			}
+			return names
+		}
+
+		// The failing vault (listed between the other two) must not stop them
+		// from being synced, and all three share one credential.
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(time.Minute))
+		Expect(kvCredBuilds).To(Equal(1))
+		Expect(vaults["vault-prod"].imported).To(HaveLen(1))
+		Expect(vaults["vault-test"].imported).To(HaveLen(1))
+		Expect(vaults["vault-dr"].imported).To(BeEmpty())
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-test"))
+
+		degraded := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+		Expect(degraded.Reason).To(Equal("KeyVaultSyncFailed"))
+		Expect(degraded.Message).To(ContainSubstring("vault-dr/" + certName))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-prod"))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-test"))
+
+		// A retry contacts only the vault that failed.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults["vault-prod"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-test"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-dr"].matchCalls).To(Equal(2))
+
+		// Once the failing vault is fixed it is imported too.
+		vaults["vault-dr"].matchErr = nil
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults["vault-dr"].imported).To(HaveLen(1))
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-dr", "vault-test"))
+
+		// Steady state: no credential, no Key Vault calls, no status write.
+		builds := kvCredBuilds
+		rv := cci.ResourceVersion
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvCredBuilds).To(Equal(builds))
+		for name, v := range vaults {
+			Expect(v.imported).To(HaveLen(1), name)
+		}
+		Expect(vaults["vault-prod"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-dr"].matchCalls).To(Equal(3))
+		Expect(syncedVaults()).To(HaveLen(3))
+		Expect(cci.ResourceVersion).To(Equal(rv), "steady-state reconcile must not bump the object")
+
+		// A vault removed from the spec is dropped from status, without
+		// contacting any vault.
+		cci.Spec.KeyVaults = cci.Spec.KeyVaults[:2]
+		Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvCredBuilds).To(Equal(builds))
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-dr"))
+	})
+
+	It("rejects keyVaults without the Entra app fields", func() {
+		ezcaURL := testEZCAURL
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv-noapp-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv-noapp-secret",
+					RenewalThreshold: 20,
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, cci)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("keyVaults requires the Entra app fields"))
+	})
+
+	It("accepts 200 keyVaults and 200 secretReplicas, and rejects more", func() {
+		// Both lists can grow together (every private instance needs a copy and
+		// a vault entry); this also proves the CEL cost estimate for the
+		// secretReplicas rule fits at that size, since the CRD would not have
+		// installed otherwise.
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		build := func(name string, n int) *ezcav1.ClusterCertIdentity {
+			cci := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL:          &ezcaURL,
+						CertSecretName:   name + "-secret",
+						RenewalThreshold: 20,
+						TenantID:         &tenant,
+						AppID:            &app,
+						AppObjectID:      &objectID,
+					},
+					CertSecretNamespace: namespace,
+				},
+			}
+			for i := range n {
+				cci.Spec.KeyVaults = append(cci.Spec.KeyVaults, ezcav1.KeyVaultSpec{
+					VaultName: fmt.Sprintf("vault-%03d", i), CertName: certName,
+				})
+				cci.Spec.SecretReplicas = append(cci.Spec.SecretReplicas, ezcav1.SecretReplica{
+					Namespace: fmt.Sprintf("instance-%03d", i), Name: "app-cert",
+				})
+			}
+			return cci
+		}
+
+		Expect(k8sClient.Create(ctx, build("max-lists-identity", 200))).To(Succeed())
+
+		err := k8sClient.Create(ctx, build("over-lists-identity", 201))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.keyVaults"))
+		Expect(err.Error()).To(ContainSubstring("spec.secretReplicas"))
 	})
 
 	It("defers Key Vault sync (no error) while the certificate is still propagating", func() {
@@ -938,7 +1126,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -990,7 +1178,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -1065,7 +1253,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},

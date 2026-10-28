@@ -119,6 +119,13 @@ type keyVaultManager interface {
 	ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error
 }
 
+// keyVaultCredential opens the Key Vaults an identity syncs to, all
+// authenticating as the identity's app with one shared credential (and so one
+// cached token). Satisfied by azureKeyVaultCredential; overridable in tests.
+type keyVaultCredential interface {
+	vaultClient(vaultName string) (keyVaultManager, error)
+}
+
 // certIdentity is the shared behavior of the certificate-identity kinds
 // (ClusterCertIdentity, CertIdentity, and ManagedCredential). Exposing the
 // embedded base spec and status lets the renewal/rotation/Key Vault state
@@ -137,7 +144,7 @@ type reconcilerDeps interface {
 	now() time.Time
 	newEZCAClient(ezcaURL string) (ezcaRenewer, error)
 	newEntraClient(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
-	newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
+	newKeyVaultCredential(tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultCredential, error)
 	propagation() PropagationTiming
 	holdIssued(uid types.UID, replaces string, chain []*x509.Certificate, key *rsa.PrivateKey)
 	heldIssued(uid types.UID, replaces string, now time.Time) ([]*x509.Certificate, *rsa.PrivateKey, bool)
@@ -1037,12 +1044,38 @@ func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Cer
 }
 
 // syncKeyVaultBestEffort runs the Key Vault sync without letting it override a
-// successful core result. It defers while a freshly changed certificate is
-// still propagating across Entra ID token replicas, and treats the
-// "certificate not yet registered" auth error as a quiet, transient retry
-// rather than a hard failure.
+// successful core result. Vaults status already records as holding the active
+// certificate are skipped, so a steady-state reconcile makes no Key Vault
+// calls. It defers while a freshly changed certificate is still propagating
+// across Entra ID token replicas, and treats the "certificate not yet
+// registered" auth error as a quiet, transient retry rather than a hard
+// failure.
 func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, now time.Time, tel *telemetry.Telemetry, result *ctrl.Result, coreErr error) {
 	log := logf.FromContext(ctx)
+	spec := obj.SpecBase()
+	status := obj.StatusBase()
+
+	pruneKeyVaultStatus(spec, status)
+	if len(spec.KeyVaults) == 0 {
+		return
+	}
+
+	chain, key, err := parseSecret(secret)
+	if err != nil {
+		log.Error(err, "Failed to read certificate for Key Vault sync")
+		reportKeyVaultFailure(obj, result, coreErr, err.Error())
+		return
+	}
+	thumbprint := pki.Thumbprint(chain[0])
+	var pending []ezcav1.KeyVaultSpec
+	for _, kv := range spec.KeyVaults {
+		if !keyVaultHolds(status, kv, thumbprint) {
+			pending = append(pending, kv)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
 
 	// A freshly registered active certificate may not yet be usable on every
 	// AAD token replica; give it the propagation grace before authenticating to
@@ -1060,63 +1093,134 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 		return
 	}
 
-	kvErr := syncKeyVault(ctx, d, obj, secret, tel)
-	if kvErr == nil {
+	// Every vault is reached as the same app with the same certificate, so one
+	// credential (and its cached token) serves them all.
+	cred, err := d.newKeyVaultCredential(*spec.TenantID, *spec.AppID, keyVaultCloudFor(spec.Cloud), chain[0], key)
+	if err != nil {
+		log.Error(err, "Failed to build Key Vault credential")
+		tel.TrackError(err, "Failed to build Key Vault credential", identityProps(obj))
+		reportKeyVaultFailure(obj, result, coreErr, err.Error())
 		return
 	}
-	// Transient: the certificate is correct but not yet on the replica we
-	// reached. Poll quietly until the propagation timeout; past that it is no
-	// longer plausibly propagation, so fall through and report it as a failure.
-	if isCredentialPropagating(kvErr) &&
-		(since == nil || now.Sub(since.Time) <= timing.Timeout) {
+	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
+	if err != nil {
+		log.Error(err, "Failed to encode private key for Key Vault sync")
+		reportKeyVaultFailure(obj, result, coreErr, err.Error())
+		return
+	}
+	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
+
+	// Each vault is synced independently: a vault that cannot be reached (for
+	// example one whose access policy is missing) must not hold back the
+	// others. Every failure is reported, not just the first. Only a vault that
+	// succeeds is recorded, so a failing one is retried on its own.
+	propagating := false
+	var failed []string
+	for _, kv := range pending {
+		kvErr := syncKeyVault(ctx, cred, obj, kv, thumbprint, bundle, tel)
+		if kvErr == nil {
+			setKeyVaultSynced(status, kv, thumbprint, now)
+			continue
+		}
+		// Transient: the certificate is correct but not yet on the replica we
+		// reached. Poll quietly until the propagation timeout; past that it is no
+		// longer plausibly propagation, so fall through and report it as a failure.
+		if isCredentialPropagating(kvErr) &&
+			(since == nil || now.Sub(since.Time) <= timing.Timeout) {
+			propagating = true
+			continue
+		}
+		log.Error(kvErr, "Failed to sync certificate to Key Vault", "vault", kv.VaultName, "certName", kv.CertName)
+		tel.TrackError(kvErr, "Failed to sync certificate to Key Vault", identityPropsForVault(obj, kv))
+		failed = append(failed, fmt.Sprintf("%s/%s: %v", kv.VaultName, kv.CertName, kvErr))
+	}
+	if propagating {
 		log.Info("Deferring Key Vault sync: certificate still propagating in Entra ID")
 		requeueAtMost(result, propagationRequeue)
-		return
 	}
-	log.Error(kvErr, "Failed to sync certificate to Key Vault")
-	tel.TrackError(kvErr, "Failed to sync certificate to Key Vault", identityProps(obj))
-	if coreErr == nil {
-		setDegraded(obj, "KeyVaultSyncFailed", fmt.Sprintf("Failed to sync certificate to Key Vault: %v", kvErr))
-		requeueAtMost(result, time.Minute)
+	if len(failed) > 0 {
+		reportKeyVaultFailure(obj, result, coreErr, strings.Join(failed, "; "))
 	}
 }
 
-// syncKeyVault ensures the configured Key Vault certificate matches the active
-// Secret certificate, importing the current chain and key when they differ. It
-// authenticates to the vault as the identity's app using that certificate, so
-// keyVault requires the app fields (enforced by CRD validation).
-func syncKeyVault(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, tel *telemetry.Telemetry) error {
-	spec := obj.SpecBase()
-	chain, key, err := parseSecret(secret)
-	if err != nil {
-		return err
+// reportKeyVaultFailure reports a failed Key Vault sync as Degraded and retries
+// it soon, unless the core reconcile already failed with its own reason.
+func reportKeyVaultFailure(obj certIdentity, result *ctrl.Result, coreErr error, message string) {
+	if coreErr != nil {
+		return
 	}
-	leaf := chain[0]
+	setDegraded(obj, "KeyVaultSyncFailed", "Failed to sync certificate to Key Vault: "+message)
+	requeueAtMost(result, time.Minute)
+}
 
-	cl, err := d.newKeyVaultClient(spec.KeyVault.VaultName, *spec.TenantID, *spec.AppID, keyVaultCloudFor(spec.Cloud), leaf, key)
+// syncKeyVault ensures one configured Key Vault certificate matches the active
+// Secret certificate (thumbprint), importing bundle (its chain and key) when
+// they differ. It authenticates to the vault as the identity's app using that
+// certificate, so keyVaults requires the app fields (enforced by CRD
+// validation).
+func syncKeyVault(ctx context.Context, cred keyVaultCredential, obj certIdentity, kv ezcav1.KeyVaultSpec, thumbprint string, bundle []byte, tel *telemetry.Telemetry) error {
+	cl, err := cred.vaultClient(kv.VaultName)
 	if err != nil {
 		return err
 	}
-	match, err := cl.CertificateMatches(ctx, spec.KeyVault.CertName, pki.Thumbprint(leaf))
+	match, err := cl.CertificateMatches(ctx, kv.CertName, thumbprint)
 	if err != nil {
 		return err
 	}
 	if match {
 		return nil
 	}
-
-	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
-	if err != nil {
-		return err
-	}
-	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
-	if err := cl.ImportCertificate(ctx, spec.KeyVault.CertName, bundle); err != nil {
+	if err := cl.ImportCertificate(ctx, kv.CertName, bundle); err != nil {
 		return err
 	}
 	logf.FromContext(ctx).Info("Updated Key Vault certificate",
-		"vault", spec.KeyVault.VaultName, "certName", spec.KeyVault.CertName, "thumbprint", pki.Thumbprint(leaf))
-	tel.TrackEvent("KeyVaultCertificateUpdated", identityProps(obj))
+		"vault", kv.VaultName, "certName", kv.CertName, "thumbprint", thumbprint)
+	tel.TrackEvent("KeyVaultCertificateUpdated", identityPropsForVault(obj, kv))
 	return nil
+}
+
+// keyVaultHolds reports whether status records the vault certificate kv as
+// holding the certificate with the given thumbprint.
+func keyVaultHolds(status *ezcav1.CertIdentityStatusBase, kv ezcav1.KeyVaultSpec, thumbprint string) bool {
+	for _, s := range status.KeyVaults {
+		if s.VaultName == kv.VaultName && s.CertName == kv.CertName {
+			return s.Thumbprint == thumbprint
+		}
+	}
+	return false
+}
+
+// setKeyVaultSynced records that the vault certificate kv holds the
+// certificate with the given thumbprint.
+func setKeyVaultSynced(status *ezcav1.CertIdentityStatusBase, kv ezcav1.KeyVaultSpec, thumbprint string, now time.Time) {
+	entry := ezcav1.KeyVaultSyncStatus{
+		VaultName:  kv.VaultName,
+		CertName:   kv.CertName,
+		Thumbprint: thumbprint,
+		SyncedAt:   &metav1.Time{Time: now},
+	}
+	for i := range status.KeyVaults {
+		if status.KeyVaults[i].VaultName == kv.VaultName && status.KeyVaults[i].CertName == kv.CertName {
+			status.KeyVaults[i] = entry
+			return
+		}
+	}
+	status.KeyVaults = append(status.KeyVaults, entry)
+}
+
+// pruneKeyVaultStatus drops the records of vaults no longer listed in
+// spec.keyVaults, so a vault removed and added back is synced afresh.
+func pruneKeyVaultStatus(spec *ezcav1.CertIdentitySpecBase, status *ezcav1.CertIdentityStatusBase) {
+	var kept []ezcav1.KeyVaultSyncStatus
+	for _, s := range status.KeyVaults {
+		for _, kv := range spec.KeyVaults {
+			if s.VaultName == kv.VaultName && s.CertName == kv.CertName {
+				kept = append(kept, s)
+				break
+			}
+		}
+	}
+	status.KeyVaults = kept
 }
 
 // requeueAtMost lowers result.RequeueAfter to d if it is currently unset or
@@ -1289,5 +1393,14 @@ func identityProps(obj certIdentity) map[string]string {
 func identityPropsForApp(obj certIdentity, appID string) map[string]string {
 	props := identityProps(obj)
 	props["targetAppID"] = appID
+	return props
+}
+
+// identityPropsForVault extends identityProps with the Key Vault certificate an
+// operation targeted.
+func identityPropsForVault(obj certIdentity, kv ezcav1.KeyVaultSpec) map[string]string {
+	props := identityProps(obj)
+	props["vault"] = kv.VaultName
+	props["certName"] = kv.CertName
 	return props
 }

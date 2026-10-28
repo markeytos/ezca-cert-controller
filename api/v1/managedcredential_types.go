@@ -70,7 +70,7 @@ const (
 // ManagedCredentialSpec defines the desired state of ManagedCredential.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
-// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.keyVaults) || size(self.keyVaults) == 0 || has(self.appID)",message="keyVaults requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
 // +kubebuilder:validation:XValidation:rule="!has(self.identityRef) || (has(self.subjectName) && has(self.caID) && has(self.templateID))",message="subjectName, caID, and templateID are required when identityRef is set; they define what identityRef issues"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"

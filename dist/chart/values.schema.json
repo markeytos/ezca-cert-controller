@@ -29,6 +29,9 @@
         "certSecretNamespace": {
           "type": "string"
         },
+        "keyVaults": {
+          "type": "array"
+        },
         "name": {
           "type": "string"
         },
@@ -390,26 +393,31 @@
             ]
           }
         },
-        "keyVault": {
-          "description": "Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.",
-          "type": "object",
-          "properties": {
-            "certName": {
-              "type": "string"
-            },
-            "vaultName": {
-              "description": "Vault name, not the full URL.",
-              "type": "string"
-            }
-          },
-          "additionalProperties": false,
-          "dependentRequired": {
-            "certName": [
-              "vaultName"
-            ],
-            "vaultName": [
+        "keyVaults": {
+          "description": "Optional Key Vault certificates to keep in sync with the Secret, each synced independently. Needs the Entra app fields, which the chart checks while rendering; the app needs get and import permission on every vault.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "required": [
+              "vaultName",
               "certName"
-            ]
+            ],
+            "properties": {
+              "certName": {
+                "description": "Certificate name in that vault.",
+                "type": "string",
+                "maxLength": 127,
+                "minLength": 1
+              },
+              "vaultName": {
+                "description": "Vault name, not the full URL.",
+                "type": "string",
+                "maxLength": 24,
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
           }
         },
         "name": {
@@ -499,26 +507,31 @@
           "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
           "maxLength": 63
         },
-        "keyVault": {
-          "description": "Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.",
-          "type": "object",
-          "properties": {
-            "certName": {
-              "type": "string"
-            },
-            "vaultName": {
-              "description": "Vault name, not the full URL.",
-              "type": "string"
-            }
-          },
-          "additionalProperties": false,
-          "dependentRequired": {
-            "certName": [
-              "vaultName"
-            ],
-            "vaultName": [
+        "keyVaults": {
+          "description": "Optional Key Vault certificates to keep in sync with the Secret, each synced independently. Needs the Entra app fields, which the chart checks while rendering; the app needs get and import permission on every vault.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "required": [
+              "vaultName",
               "certName"
-            ]
+            ],
+            "properties": {
+              "certName": {
+                "description": "Certificate name in that vault.",
+                "type": "string",
+                "maxLength": 127,
+                "minLength": 1
+              },
+              "vaultName": {
+                "description": "Vault name, not the full URL.",
+                "type": "string",
+                "maxLength": 24,
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
           }
         },
         "name": {
@@ -536,7 +549,7 @@
         "secretReplicas": {
           "description": "Read-only copies of the certificate Secret, kept in sync by the controller for workloads in other namespaces that share this certificate. Each copy holds the private key. A copy removed from the list is deleted.",
           "type": "array",
-          "maxItems": 50,
+          "maxItems": 200,
           "items": {
             "type": "object",
             "required": [

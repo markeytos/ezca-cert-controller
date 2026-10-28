@@ -61,6 +61,14 @@ clusterIdentity:
   #   name: my-app-cert
   # - namespace: my-app-test-slot
   #   name: my-app-cert
+  ## Key Vault certificates to keep in sync with the Secret, each synced
+  ## independently. Needs appID/appObjectID and global.tenantID: the controller
+  ## authenticates to every vault as this app, which needs get + import on each.
+  keyVaults: []
+  # - vaultName: my-vault-prod
+  #   certName: cluster-cert-identity
+  # - vaultName: my-vault-test
+  #   certName: cluster-cert-identity
 
 ## One ManagedCredential per entry — your application certificates.
 ## Fields: schemas/app-cert.schema.yaml
@@ -80,6 +88,11 @@ appCerts: []
 #   renewalThreshold: 20
 #   appID: ""                           # optional per-item Entra app
 #   appObjectID: ""
+#   keyVaults:                          # optional; needs appID/appObjectID
+#     - vaultName: my-vault-prod
+#       certName: web-frontend-cert
+#     - vaultName: my-vault-test
+#       certName: web-frontend-cert
 #   identityRef:                        # identity that bootstraps first issuance
 #     name: master-cert-identity-1
 #     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity
