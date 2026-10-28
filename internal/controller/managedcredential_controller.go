@@ -221,7 +221,7 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 
 	result, coreErr := reconcileCertState(ctx, r, mc, &secret, chain, key, now, tel)
 
-	if mc.Spec.KeyVault != nil {
+	if len(mc.Spec.KeyVaults) > 0 {
 		// Key Vault sync authenticates to the vault AS this credential's app using
 		// the active certificate, which only works once that certificate has been
 		// registered on the app registration (via addKey). If it is not registered
@@ -412,7 +412,7 @@ func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredentia
 	mc.Status.LastRenewalTime = &metav1.Time{Time: now}
 	clearPending(mc.StatusBase())
 	setAvailable(mc, successReason, "Certificate issued successfully")
-	if mc.Spec.KeyVault != nil {
+	if len(mc.Spec.KeyVaults) > 0 {
 		// Hand off to the steady-state path so the new certificate syncs to Key
 		// Vault once it is usable — that is, after its propagation grace, which
 		// the Key Vault sync measures from when the certificate was registered

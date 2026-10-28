@@ -26,10 +26,10 @@ Field ownership:
   - GLOBAL (from $root = .Values.global, never overridable per item): ezcaURL,
     cloud, tenantID, appInsightsConnString.
   - PER-ITEM (from $item): appID, appObjectID, certSecretName, renewalThreshold,
-    keyVault.
+    keyVaults.
 
 The CRD CEL rules require tenantID+appID+appObjectID to be set together, and
-keyVault requires the app fields. The global tenantID pairs with each item's own
+keyVaults requires the app fields. The global tenantID pairs with each item's own
 appID/appObjectID; the trio is emitted only when all three resolve, so the CEL
 constraint is always satisfied.
 */}}
@@ -54,17 +54,17 @@ appInsightsConnString: {{ $root.appInsightsConnString | quote }}
 certSecretName: {{ $item.certSecretName | quote }}
 {{- end }}
 renewalThreshold: {{ default 20 $item.renewalThreshold }}
-{{- if $item.keyVault }}
-{{- if and (or $item.keyVault.vaultName $item.keyVault.certName) (not (and $item.keyVault.vaultName $item.keyVault.certName)) }}
-{{- fail "keyVault needs both vaultName and certName; set both to enable Key Vault sync, or neither to disable it" }}
-{{- end }}
-{{- if and $item.keyVault.vaultName $item.keyVault.certName }}
+{{- if $item.keyVaults }}
 {{- if not (and $root.tenantID $item.appID $item.appObjectID) }}
-{{- fail "keyVault requires the Entra app fields (global.tenantID plus this item's appID/appObjectID); the certificate authenticates to Key Vault as that app" }}
+{{- fail "keyVaults requires the Entra app fields (global.tenantID plus this item's appID/appObjectID); the certificate authenticates to Key Vault as that app" }}
 {{- end }}
-keyVault:
-  vaultName: {{ $item.keyVault.vaultName | quote }}
-  certName: {{ $item.keyVault.certName | quote }}
+keyVaults:
+{{- range $item.keyVaults }}
+{{- if not (and .vaultName .certName) }}
+{{- fail "every keyVaults entry needs both vaultName and certName" }}
+{{- end }}
+  - vaultName: {{ .vaultName | quote }}
+    certName: {{ .certName | quote }}
 {{- end }}
 {{- end }}
 {{- end -}}

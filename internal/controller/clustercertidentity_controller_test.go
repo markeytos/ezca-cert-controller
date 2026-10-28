@@ -888,11 +888,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					CertSecretName:   "kv-secret",
 					Cloud:            ezcav1.CloudPublic,
 					RenewalThreshold: 20,
-					// keyVault requires the app fields (cert authenticates as the app).
+					// keyVaults requires the app fields (cert authenticates as the app).
 					TenantID:    &tenant,
 					AppID:       &app,
 					AppObjectID: &objectID,
-					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:   []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -914,6 +914,96 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kvClient.imported).To(HaveLen(1))
+	})
+
+	It("syncs every Key Vault independently and names the ones that fail", func() {
+		certPEM, keyPEM, _ := genCert("kvmulti.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret("kvmulti-secret", certPEM, keyPEM)
+
+		// One fake per vault, so a failure in one is visible as such.
+		vaults := map[string]*fakeKeyVault{
+			"vault-prod": {},
+			"vault-test": {},
+			"vault-dr":   {matchErr: errors.New("Forbidden: missing get permission")},
+		}
+		reconciler.NewKeyVaultClient = func(name, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
+			return vaults[name], nil
+		}
+
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kvmulti-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kvmulti-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVaults: []ezcav1.KeyVaultSpec{
+						{VaultName: "vault-prod", CertName: certName},
+						{VaultName: "vault-dr", CertName: certName},
+						{VaultName: "vault-test", CertName: certName},
+					},
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		// The failing vault (listed between the other two) must not stop them
+		// from being synced.
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(time.Minute))
+		Expect(vaults["vault-prod"].imported).To(HaveLen(1))
+		Expect(vaults["vault-test"].imported).To(HaveLen(1))
+		Expect(vaults["vault-dr"].imported).To(BeEmpty())
+
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+		degraded := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+		Expect(degraded.Reason).To(Equal("KeyVaultSyncFailed"))
+		Expect(degraded.Message).To(ContainSubstring("vault-dr/" + certName))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-prod"))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-test"))
+
+		// Once the failing vault is fixed it is imported too, and the vaults that
+		// already match are left alone.
+		vaults["vault-prod"].matches = true
+		vaults["vault-test"].matches = true
+		vaults["vault-dr"].matchErr = nil
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults["vault-prod"].imported).To(HaveLen(1))
+		Expect(vaults["vault-test"].imported).To(HaveLen(1))
+		Expect(vaults["vault-dr"].imported).To(HaveLen(1))
+	})
+
+	It("rejects keyVaults without the Entra app fields", func() {
+		ezcaURL := testEZCAURL
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv-noapp-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv-noapp-secret",
+					RenewalThreshold: 20,
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, cci)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("keyVaults requires the Entra app fields"))
 	})
 
 	It("defers Key Vault sync (no error) while the certificate is still propagating", func() {
@@ -938,7 +1028,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -990,7 +1080,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -1065,7 +1155,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},

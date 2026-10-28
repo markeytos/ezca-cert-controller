@@ -167,15 +167,22 @@ type CertIdentitySpecBase struct {
 	// +kubebuilder:validation:MinLength=1
 	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
 
-	// keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
-	// the Secret. On every reconcile the controller ensures the named vault
+	// keyVaults are Azure Key Vault certificates to keep in sync with the
+	// Secret. On every reconcile the controller ensures each named vault
 	// certificate matches the Secret, importing the current certificate (and
-	// key) whenever they differ. The controller authenticates to the vault as
-	// the identity's app using its certificate, so this requires the app fields
-	// (tenantID, appID, appObjectID) and the app service principal must have get
-	// and import permission on the vault.
+	// key) whenever they differ. Each vault is synced independently, so one
+	// failing vault does not hold back the others; the identity reports Degraded
+	// (KeyVaultSyncFailed) naming every vault that could not be synced. The
+	// controller authenticates to every vault as the identity's app using its
+	// certificate, so this requires the app fields (tenantID, appID,
+	// appObjectID) and the app service principal must have get and import
+	// permission on each vault. A vault removed from this list is left as it is.
 	// +optional
-	KeyVault *KeyVaultSpec `json:"keyVault,omitempty"`
+	// +listType=map
+	// +listMapKey=vaultName
+	// +listMapKey=certName
+	// +kubebuilder:validation:MaxItems=20
+	KeyVaults []KeyVaultSpec `json:"keyVaults,omitempty"`
 
 	// renewalThreshold is the percentage of the certificate's total lifetime
 	// remaining at or below which the certificate is renewed.
@@ -194,7 +201,7 @@ type CertIdentitySpecBase struct {
 // app is configured, rotates the renewed certificate onto the app registration.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
-// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.keyVaults) || size(self.keyVaults) == 0 || has(self.appID)",message="keyVaults requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
 // +kubebuilder:validation:XValidation:rule="!has(self.secretReplicas) || !has(self.certSecretNamespace) || self.secretReplicas.all(r, r.namespace != self.certSecretNamespace || r.name != self.certSecretName)",message="secretReplicas must not name the certificate Secret itself"
@@ -265,16 +272,18 @@ type SecretReplica struct {
 }
 
 // KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
-// the controller-managed certificate.
+// the controller-managed certificate (spec.keyVaults).
 type KeyVaultSpec struct {
 	// vaultName is the name of the Azure Key Vault (not the full URL).
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=24
 	VaultName string `json:"vaultName"`
 
 	// certName is the name of the certificate in the vault to keep in sync.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=127
 	CertName string `json:"certName"`
 }
 

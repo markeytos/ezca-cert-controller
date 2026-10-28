@@ -167,10 +167,10 @@ func (in *CertIdentitySpecBase) DeepCopyInto(out *CertIdentitySpecBase) {
 		*out = new(string)
 		**out = **in
 	}
-	if in.KeyVault != nil {
-		in, out := &in.KeyVault, &out.KeyVault
-		*out = new(KeyVaultSpec)
-		**out = **in
+	if in.KeyVaults != nil {
+		in, out := &in.KeyVaults, &out.KeyVaults
+		*out = make([]KeyVaultSpec, len(*in))
+		copy(*out, *in)
 	}
 }
 
