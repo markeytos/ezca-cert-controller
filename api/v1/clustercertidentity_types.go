@@ -19,6 +19,7 @@ package v1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -196,6 +197,7 @@ type CertIdentitySpecBase struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
+// +kubebuilder:validation:XValidation:rule="!has(self.secretReplicas) || !has(self.certSecretNamespace) || self.secretReplicas.all(r, r.namespace != self.certSecretNamespace || r.name != self.certSecretName)",message="secretReplicas must not name the certificate Secret itself"
 type ClusterCertIdentitySpec struct {
 	CertIdentitySpecBase `json:",inline"`
 
@@ -203,6 +205,7 @@ type ClusterCertIdentitySpec struct {
 	// empty it defaults to the namespace the controller runs in.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	CertSecretNamespace string `json:"certSecretNamespace,omitempty"`
 
 	// allowedNamespaces is the set of namespaces whose ManagedCredentials may
@@ -210,12 +213,55 @@ type ClusterCertIdentitySpec struct {
 	// their certificate. Because a ClusterCertIdentity is cluster-scoped, a
 	// reference lets the referencing ManagedCredential issue certificates as
 	// this identity's Entra app; this allowlist bounds which namespaces may do
-	// so. It is required and must be non-empty: a ClusterCertIdentity that lists
-	// no namespaces can be referenced by no one.
-	// +required
-	// +kubebuilder:validation:MinItems=1
+	// so. When empty, no ManagedCredential may reference this identity. It does
+	// not govern secretReplicas.
+	// +optional
 	// +kubebuilder:validation:items:MinLength=1
-	AllowedNamespaces []string `json:"allowedNamespaces"`
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
+
+	// secretReplicas are Secrets the controller keeps as read-only copies of
+	// the certificate Secret, for workloads in other namespaces that use the
+	// same certificate. Each copy is a kubernetes.io/tls Secret holding only the
+	// active tls.crt and tls.key; a renewed certificate reaches the copies once
+	// it is promoted into the certificate Secret. The copies are never renewed
+	// or rotated on their own: this identity remains the only one renewing the
+	// certificate, rotating it onto the app registrations, and syncing Key
+	// Vault.
+	//
+	// A copy holds the identity's private key, so listing a namespace here
+	// gives that namespace the identity itself. The controller creates each
+	// copy and never overwrites a Secret that is not a kubernetes.io/tls copy
+	// it wrote. It takes over a copy written for another ClusterCertIdentity
+	// only once that identity no longer lists it (for example after a rename).
+	// A copy removed from this list is deleted, unless it was unmarked or
+	// replaced since, in which case it is left alone. Deleting the
+	// ClusterCertIdentity leaves its copies in place. No identity may use a
+	// copy as its own certificate Secret. The SecretReplicasSynced condition
+	// reports whether every copy is up to date.
+	// +optional
+	// +listType=map
+	// +listMapKey=namespace
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=50
+	SecretReplicas []SecretReplica `json:"secretReplicas,omitempty"`
+}
+
+// SecretReplica names one Secret kept as a copy of a ClusterCertIdentity's
+// certificate Secret (spec.secretReplicas).
+type SecretReplica struct {
+	// namespace is the namespace of the copy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace string `json:"namespace"`
+
+	// name is the name of the copy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	Name string `json:"name"`
 }
 
 // KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
@@ -319,6 +365,30 @@ type ClusterCertIdentityStatus struct {
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
 	CertIdentityStatusBase `json:",inline"`
+
+	// secretReplicas are the copies of the certificate Secret the controller
+	// wrote for spec.secretReplicas, by UID. Only a Secret recorded here is
+	// ever deleted, and only while it still has the recorded UID.
+	// +listType=map
+	// +listMapKey=namespace
+	// +listMapKey=name
+	// +optional
+	SecretReplicas []SecretReplicaStatus `json:"secretReplicas,omitempty"`
+}
+
+// SecretReplicaStatus records one Secret replica the controller wrote.
+type SecretReplicaStatus struct {
+	// namespace is the namespace of the copy.
+	// +required
+	Namespace string `json:"namespace"`
+
+	// name is the name of the copy.
+	// +required
+	Name string `json:"name"`
+
+	// uid is the UID of the copy the controller wrote.
+	// +required
+	UID types.UID `json:"uid"`
 }
 
 // +kubebuilder:object:root=true
@@ -327,6 +397,7 @@ type ClusterCertIdentityStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
 // +kubebuilder:printcolumn:name="Expiration",type=string,JSONPath=".status.notAfter"
 // +kubebuilder:printcolumn:name="Thumbprint",type=string,JSONPath=".status.thumbprint"
+// +kubebuilder:printcolumn:name="Replicas",type=string,JSONPath=".status.conditions[?(@.type=='SecretReplicasSynced')].status"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // ClusterCertIdentity is the Schema for the clustercertidentities API

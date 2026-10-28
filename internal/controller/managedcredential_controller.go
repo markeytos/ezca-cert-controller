@@ -162,6 +162,10 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 		}
 		return ctrl.Result{}, err
 	}
+	if isSecretReplica(&secret) {
+		refuseReplicaSecret(mc, &secret)
+		return ctrl.Result{}, nil
+	}
 
 	// Tolerate an empty Secret (present but without certificate material) as a
 	// bootstrap trigger, unless a rotation is already staged in it.
@@ -620,6 +624,9 @@ func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc
 	var s corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: secretNS, Name: base.CertSecretName}, &s); err != nil {
 		return nil, nil, nil, fmt.Errorf("getting referenced identity's Secret: %w", err)
+	}
+	if isSecretReplica(&s) {
+		return nil, nil, nil, fmt.Errorf("referenced identity %q uses Secret %s/%s, a copy kept by ClusterCertIdentity %q, as its certificate Secret", ref.Name, s.Namespace, s.Name, s.Annotations[secretReplicaOfAnnotation])
 	}
 	chain, key, err := parseSecret(&s)
 	if err != nil {

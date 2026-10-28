@@ -49,6 +49,26 @@ properties:
       type: string
       minLength: 1
 
+  secretReplicas:
+    description: Read-only copies of the certificate Secret, kept in sync by the controller for workloads in other namespaces that share this certificate. Each copy holds the private key. A copy removed from the list is deleted.
+    type: array
+    maxItems: 50
+    items:
+      type: object
+      additionalProperties: false
+      required: [namespace, name]
+      properties:
+        namespace:
+          description: Namespace of the copy.
+          type: string
+          maxLength: 63
+          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+        name:
+          description: Name of the copy.
+          type: string
+          maxLength: 253
+          pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+
   keyVault:
     description: Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.
     type: object

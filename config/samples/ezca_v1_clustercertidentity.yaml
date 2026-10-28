@@ -18,11 +18,21 @@ spec:
   # (tls.key). certSecretNamespace defaults to the controller's namespace.
   certSecretName: cluster-cert-identity
   # certSecretNamespace: ezca-cert-controller-system
-  # Required: namespaces whose ManagedCredentials may reference this
+  # Optional: namespaces whose ManagedCredentials may reference this
   # ClusterCertIdentity to bootstrap (and thereby issue certificates as this
-  # identity's Entra app). Must list at least one namespace.
+  # identity's Entra app). When omitted, no ManagedCredential may reference it.
   allowedNamespaces:
     - default
+  # Optional: read-only copies of the certificate Secret for workloads in other
+  # namespaces that share this certificate. This identity alone renews the
+  # certificate, rotates it onto the app, and syncs Key Vault; the copies only
+  # follow the active certificate. Each copy holds the private key. A copy removed from this list
+  # is deleted.
+  # secretReplicas:
+  #   - namespace: my-app-prod
+  #     name: my-app-cert
+  #   - namespace: my-app-test-slot
+  #     name: my-app-cert
   # Optional Entra ID app registration to rotate the certificate onto. tenantID,
   # appID, and appObjectID must be set together; omit all three for a
   # certificate-only identity. appObjectID is the app registration's directory
