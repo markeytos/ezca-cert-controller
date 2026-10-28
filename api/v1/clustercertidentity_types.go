@@ -96,6 +96,42 @@ type CertIdentityStatusBase struct {
 	// +listMapKey=thumbprint
 	// +optional
 	ManagedKeyCredentials []ManagedKeyCredential `json:"managedKeyCredentials,omitempty"`
+
+	// keyVaults records, for each spec.keyVaults entry, the certificate the
+	// vault was last confirmed to hold. A vault already recorded with the
+	// active certificate is not contacted again until that certificate
+	// changes, so a steady-state reconcile makes no Key Vault calls, and a
+	// failing vault is the only one retried. A vault certificate changed
+	// outside the controller is therefore not corrected until the next
+	// renewal; remove its entry from spec.keyVaults and add it back to force a
+	// sync.
+	// +listType=map
+	// +listMapKey=vaultName
+	// +listMapKey=certName
+	// +optional
+	KeyVaults []KeyVaultSyncStatus `json:"keyVaults,omitempty"`
+}
+
+// KeyVaultSyncStatus records the certificate last synced to one Key Vault
+// certificate (spec.keyVaults).
+type KeyVaultSyncStatus struct {
+	// vaultName is the name of the Azure Key Vault.
+	// +required
+	VaultName string `json:"vaultName"`
+
+	// certName is the name of the certificate in that vault.
+	// +required
+	CertName string `json:"certName"`
+
+	// thumbprint is the SHA-1 thumbprint (hex) of the certificate the vault
+	// was last confirmed to hold.
+	// +required
+	Thumbprint string `json:"thumbprint"`
+
+	// syncedAt is when the vault was confirmed to hold that certificate,
+	// either by importing it or by finding it already there.
+	// +optional
+	SyncedAt *metav1.Time `json:"syncedAt,omitempty"`
 }
 
 type CertIdentitySpecBase struct {
@@ -181,7 +217,7 @@ type CertIdentitySpecBase struct {
 	// +listType=map
 	// +listMapKey=vaultName
 	// +listMapKey=certName
-	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:MaxItems=200
 	KeyVaults []KeyVaultSpec `json:"keyVaults,omitempty"`
 
 	// renewalThreshold is the percentage of the certificate's total lifetime
@@ -249,7 +285,7 @@ type ClusterCertIdentitySpec struct {
 	// +listType=map
 	// +listMapKey=namespace
 	// +listMapKey=name
-	// +kubebuilder:validation:MaxItems=50
+	// +kubebuilder:validation:MaxItems=200
 	SecretReplicas []SecretReplica `json:"secretReplicas,omitempty"`
 }
 

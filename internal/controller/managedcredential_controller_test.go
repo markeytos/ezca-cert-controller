@@ -157,8 +157,8 @@ var _ = Describe("ManagedCredential Controller", func() {
 				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 					return entraClient, nil
 				},
-				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-					return kvClient, nil
+				NewKeyVaultCredential: func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+					return fakeKeyVaultCredential{open: func(string) *fakeKeyVault { return kvClient }}, nil
 				},
 			},
 			DefaultNamespace: namespace,

@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package keyvault keeps a certificate in an Azure Key Vault in sync with the
+// Package keyvault keeps certificates in Azure Key Vaults in sync with the
 // controller-managed certificate. It authenticates as the identity's Entra app
 // using that identity's certificate (client-certificate credential), so the app
 // service principal — not the controller — must have get and import permissions
-// on the vault.
+// on each vault.
 package keyvault
 
 import (
@@ -74,10 +74,18 @@ type Client struct {
 	certs certOps
 }
 
-// NewClient builds a Key Vault certificate client for the named vault in the
-// given cloud, authenticating as the Entra app (tenantID/appID) with the
-// identity's certificate and RSA private key.
-func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (*Client, error) {
+// Credential authenticates to Azure Key Vaults as one Entra app. It caches its
+// access token, and the token is not specific to a vault, so a single
+// Credential serves every vault the app syncs to.
+type Credential struct {
+	cred azcore.TokenCredential
+	cfg  cloudConfig
+}
+
+// NewCredential builds a Key Vault credential for the given cloud,
+// authenticating as the Entra app (tenantID/appID) with the identity's
+// certificate and RSA private key.
+func NewCredential(tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (*Credential, error) {
 	cfg, ok := cloudConfigs[cl]
 	if !ok {
 		return nil, fmt.Errorf("keyvault: unknown cloud %q", cl)
@@ -94,9 +102,15 @@ func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certifica
 	if err != nil {
 		return nil, err
 	}
-	vaultURL := fmt.Sprintf("https://%s.%s", vaultName, cfg.vaultSuffix)
-	certs, err := azcertificates.NewClient(vaultURL, cred, &azcertificates.ClientOptions{
-		ClientOptions: azcore.ClientOptions{Cloud: cfg.azureCloud},
+	return &Credential{cred: cred, cfg: cfg}, nil
+}
+
+// NewClient builds a Key Vault certificate client for the named vault that
+// authenticates with this credential.
+func (c *Credential) NewClient(vaultName string) (*Client, error) {
+	vaultURL := fmt.Sprintf("https://%s.%s", vaultName, c.cfg.vaultSuffix)
+	certs, err := azcertificates.NewClient(vaultURL, c.cred, &azcertificates.ClientOptions{
+		ClientOptions: azcore.ClientOptions{Cloud: c.cfg.azureCloud},
 	})
 	if err != nil {
 		return nil, err

@@ -142,9 +142,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 
 	result, coreErr := reconcileCertState(ctx, r, ci, &secret, chain, key, now, tel)
 
-	if len(ci.Spec.KeyVaults) > 0 {
-		syncKeyVaultBestEffort(ctx, r, ci, &secret, now, tel, &result, coreErr)
-	}
+	syncKeyVaultBestEffort(ctx, r, ci, &secret, now, tel, &result, coreErr)
 	return result, coreErr
 }
 

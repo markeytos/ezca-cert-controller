@@ -221,23 +221,21 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 
 	result, coreErr := reconcileCertState(ctx, r, mc, &secret, chain, key, now, tel)
 
-	if len(mc.Spec.KeyVaults) > 0 {
-		// Key Vault sync authenticates to the vault AS this credential's app using
-		// the active certificate, which only works once that certificate has been
-		// registered on the app registration (via addKey). If it is not registered
-		// yet, syncing would just fail vault authentication on every reconcile, so
-		// skip it and surface the real reason instead of a misleading Key Vault
-		// error that masks the missing registration.
-		if appConfigured(mc) && !leafRegisteredInEntra(mc, chain[0]) {
-			logf.FromContext(ctx).Info("Skipping Key Vault sync: certificate is not registered on the app registration",
-				"thumbprint", pki.Thumbprint(chain[0]), "appID", *mc.Spec.AppID)
-			if coreErr == nil {
-				setDegraded(mc, "CertificateNotRegisteredOnApp",
-					"Certificate is not registered on the app registration, so it cannot authenticate to Key Vault; the app registration (addKey) must succeed first")
-			}
-		} else {
-			syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
+	// Key Vault sync authenticates to the vault AS this credential's app using
+	// the active certificate, which only works once that certificate has been
+	// registered on the app registration (via addKey). If it is not registered
+	// yet, syncing would just fail vault authentication on every reconcile, so
+	// skip it and surface the real reason instead of a misleading Key Vault
+	// error that masks the missing registration.
+	if len(mc.Spec.KeyVaults) > 0 && appConfigured(mc) && !leafRegisteredInEntra(mc, chain[0]) {
+		logf.FromContext(ctx).Info("Skipping Key Vault sync: certificate is not registered on the app registration",
+			"thumbprint", pki.Thumbprint(chain[0]), "appID", *mc.Spec.AppID)
+		if coreErr == nil {
+			setDegraded(mc, "CertificateNotRegisteredOnApp",
+				"Certificate is not registered on the app registration, so it cannot authenticate to Key Vault; the app registration (addKey) must succeed first")
 		}
+	} else {
+		syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
 	}
 	return result, coreErr
 }

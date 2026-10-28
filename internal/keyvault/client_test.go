@@ -129,7 +129,7 @@ func TestNewClient(t *testing.T) {
 	}
 
 	t.Run("unknown cloud", func(t *testing.T) {
-		if _, err := NewClient("vault", "tenant", "app", Cloud("Mars"), cert, key); err == nil {
+		if _, err := NewCredential("tenant", "app", Cloud("Mars"), cert, key); err == nil {
 			t.Fatalf("expected error for unknown cloud")
 		}
 	})
@@ -138,12 +138,19 @@ func TestNewClient(t *testing.T) {
 		t.Run(string(cl), func(t *testing.T) {
 			// Credential and client construction are offline, so this must
 			// succeed without contacting Azure.
-			c, err := NewClient("vault", "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000", cl, cert, key)
+			cred, err := NewCredential("00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000000", cl, cert, key)
 			if err != nil {
-				t.Fatalf("NewClient(%s): %v", cl, err)
+				t.Fatalf("NewCredential(%s): %v", cl, err)
 			}
-			if c == nil || c.certs == nil {
-				t.Fatalf("NewClient(%s) returned an incomplete client", cl)
+			// One credential opens any number of vaults.
+			for _, vault := range []string{"vault-a", "vault-b"} {
+				c, err := cred.NewClient(vault)
+				if err != nil {
+					t.Fatalf("NewClient(%s, %s): %v", cl, vault, err)
+				}
+				if c == nil || c.certs == nil {
+					t.Fatalf("NewClient(%s, %s) returned an incomplete client", cl, vault)
+				}
 			}
 		})
 	}
