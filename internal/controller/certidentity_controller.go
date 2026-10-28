@@ -127,6 +127,10 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 		}
 		return ctrl.Result{}, err
 	}
+	if isSecretReplica(&secret) {
+		refuseReplicaSecret(ci, &secret)
+		return ctrl.Result{}, nil
+	}
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {

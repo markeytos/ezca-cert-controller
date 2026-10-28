@@ -34,6 +34,9 @@
         },
         "renewalThreshold": {
           "type": "integer"
+        },
+        "secretReplicas": {
+          "type": "array"
         }
       }
     },
@@ -529,6 +532,33 @@
           "type": "integer",
           "maximum": 99,
           "minimum": 1
+        },
+        "secretReplicas": {
+          "description": "Read-only copies of the certificate Secret, kept in sync by the controller for workloads in other namespaces that share this certificate. Each copy holds the private key. A copy removed from the list is deleted.",
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "required": [
+              "namespace",
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "description": "Name of the copy.",
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+                "maxLength": 253
+              },
+              "namespace": {
+                "description": "Namespace of the copy.",
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "maxLength": 63
+              }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false,
