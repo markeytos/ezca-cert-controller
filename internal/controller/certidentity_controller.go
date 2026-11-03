@@ -127,6 +127,10 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 		}
 		return ctrl.Result{}, err
 	}
+	if isSecretReplica(&secret) {
+		refuseReplicaSecret(ci, &secret)
+		return ctrl.Result{}, nil
+	}
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {
@@ -138,9 +142,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 
 	result, coreErr := reconcileCertState(ctx, r, ci, &secret, chain, key, now, tel)
 
-	if ci.Spec.KeyVault != nil {
-		syncKeyVaultBestEffort(ctx, r, ci, &secret, now, tel, &result, coreErr)
-	}
+	syncKeyVaultBestEffort(ctx, r, ci, &secret, now, tel, &result, coreErr)
 	return result, coreErr
 }
 

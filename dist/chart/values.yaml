@@ -49,8 +49,26 @@ clusterIdentity:
   certSecretNamespace: ""
   ## Percent of lifetime remaining at/below which to renew (1-99).
   renewalThreshold: 20
-  ## Namespaces allowed to reference this identity. Blank -> [release namespace].
+  ## Namespaces whose ManagedCredentials may reference this identity.
+  ## Blank -> [release namespace].
   allowedNamespaces: []
+  ## Read-only copies of the certificate Secret for workloads in other
+  ## namespaces that share this certificate. This identity alone renews it,
+  ## rotates it onto the app, and syncs Key Vault; the copies only follow. Each
+  ## copy holds the private key. A copy removed from this list is deleted.
+  secretReplicas: []
+  # - namespace: my-app-prod
+  #   name: my-app-cert
+  # - namespace: my-app-test-slot
+  #   name: my-app-cert
+  ## Key Vault certificates to keep in sync with the Secret, each synced
+  ## independently. Needs appID/appObjectID and global.tenantID: the controller
+  ## authenticates to every vault as this app, which needs get + import on each.
+  keyVaults: []
+  # - vaultName: my-vault-prod
+  #   certName: cluster-cert-identity
+  # - vaultName: my-vault-test
+  #   certName: cluster-cert-identity
 
 ## One ManagedCredential per entry — your application certificates.
 ## Fields: schemas/app-cert.schema.yaml
@@ -70,6 +88,11 @@ appCerts: []
 #   renewalThreshold: 20
 #   appID: ""                           # optional per-item Entra app
 #   appObjectID: ""
+#   keyVaults:                          # optional; needs appID/appObjectID
+#     - vaultName: my-vault-prod
+#       certName: web-frontend-cert
+#     - vaultName: my-vault-test
+#       certName: web-frontend-cert
 #   identityRef:                        # identity that bootstraps first issuance
 #     name: master-cert-identity-1
 #     kind: ClusterCertIdentity         # ClusterCertIdentity or CertIdentity

@@ -12,6 +12,13 @@ that do not yet exist, e.g.:
   kubectl -n {{ .Release.Namespace }} create secret tls {{ .Values.clusterIdentity.certSecretName | default "cluster-cert-identity" }} \
     --cert=tls.crt --key=tls.key
 
+UPGRADING: Helm installs the CRDs in this chart's crds/ directory on first install
+only and never updates them. After `helm upgrade`, apply them yourself, or fields
+added in the new version (such as clusterIdentity.secretReplicas) are silently
+dropped by the API server:
+
+  kubectl apply --server-side -f <path-to-chart>/crds/
+
 To verify the installation:
 
   kubectl get pods -n {{ .Release.Namespace }}

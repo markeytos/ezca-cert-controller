@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package keyvault keeps a certificate in an Azure Key Vault in sync with the
+// Package keyvault keeps certificates in Azure Key Vaults in sync with the
 // controller-managed certificate. It authenticates as the identity's Entra app
 // using that identity's certificate (client-certificate credential), so the app
 // service principal — not the controller — must have get and import permissions
-// on the vault.
+// on each vault.
 package keyvault
 
 import (
@@ -38,9 +38,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
-const pemContentType = "application/x-pem-file"
+const pkcs12ContentType = "application/x-pkcs12"
 
 // Cloud selects the Azure sovereign cloud.
 type Cloud string
@@ -74,10 +75,18 @@ type Client struct {
 	certs certOps
 }
 
-// NewClient builds a Key Vault certificate client for the named vault in the
-// given cloud, authenticating as the Entra app (tenantID/appID) with the
-// identity's certificate and RSA private key.
-func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (*Client, error) {
+// Credential authenticates to Azure Key Vaults as one Entra app. It caches its
+// access token, and the token is not specific to a vault, so a single
+// Credential serves every vault the app syncs to.
+type Credential struct {
+	cred azcore.TokenCredential
+	cfg  cloudConfig
+}
+
+// NewCredential builds a Key Vault credential for the given cloud,
+// authenticating as the Entra app (tenantID/appID) with the identity's
+// certificate and RSA private key.
+func NewCredential(tenantID, appID string, cl Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (*Credential, error) {
 	cfg, ok := cloudConfigs[cl]
 	if !ok {
 		return nil, fmt.Errorf("keyvault: unknown cloud %q", cl)
@@ -94,9 +103,15 @@ func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certifica
 	if err != nil {
 		return nil, err
 	}
-	vaultURL := fmt.Sprintf("https://%s.%s", vaultName, cfg.vaultSuffix)
-	certs, err := azcertificates.NewClient(vaultURL, cred, &azcertificates.ClientOptions{
-		ClientOptions: azcore.ClientOptions{Cloud: cfg.azureCloud},
+	return &Credential{cred: cred, cfg: cfg}, nil
+}
+
+// NewClient builds a Key Vault certificate client for the named vault that
+// authenticates with this credential.
+func (c *Credential) NewClient(vaultName string) (*Client, error) {
+	vaultURL := fmt.Sprintf("https://%s.%s", vaultName, c.cfg.vaultSuffix)
+	certs, err := azcertificates.NewClient(vaultURL, c.cred, &azcertificates.ClientOptions{
+		ClientOptions: azcore.ClientOptions{Cloud: c.cfg.azureCloud},
 	})
 	if err != nil {
 		return nil, err
@@ -105,7 +120,10 @@ func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certifica
 }
 
 // CertificateMatches reports whether the vault's current certificate has the
-// given SHA-1 thumbprint (uppercase hex). A missing certificate reports false.
+// given SHA-1 thumbprint (uppercase hex) and is stored as PKCS#12. A
+// certificate stored in another format (PEM, from earlier controller versions)
+// reports false so the sync re-imports it as PFX. A missing certificate reports
+// false.
 func (c *Client) CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error) {
 	resp, err := c.certs.GetCertificate(ctx, certName, "", nil)
 	if err != nil {
@@ -119,15 +137,46 @@ func (c *Client) CertificateMatches(ctx context.Context, certName, thumbprint st
 		return false, nil
 	}
 	sum := sha1.Sum(resp.CER)
-	return strings.EqualFold(thumbprint, hex.EncodeToString(sum[:])), nil
+	if !strings.EqualFold(thumbprint, hex.EncodeToString(sum[:])) {
+		return false, nil
+	}
+	// An unreported content type is taken as current, so a vault that omits it
+	// is not re-imported on every sync.
+	ct := secretContentType(resp.Certificate)
+	return ct == "" || strings.EqualFold(ct, pkcs12ContentType), nil
 }
 
-// ImportCertificate imports a PEM bundle (certificate chain plus private key)
-// into the vault under certName, creating or updating it.
-func (c *Client) ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error {
-	b64 := base64.StdEncoding.EncodeToString(pemBundle)
-	contentType := pemContentType
-	_, err := c.certs.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
+// secretContentType returns the content type of the certificate's secret, from
+// the certificate itself or else its policy, or "" when the vault reports
+// neither.
+func secretContentType(cert azcertificates.Certificate) string {
+	if cert.ContentType != nil {
+		return *cert.ContentType
+	}
+	if cert.Policy != nil && cert.Policy.SecretProperties != nil && cert.Policy.SecretProperties.ContentType != nil {
+		return *cert.Policy.SecretProperties.ContentType
+	}
+	return ""
+}
+
+// ImportCertificate imports the certificate chain (leaf first) and its private
+// key into the vault under certName as a PKCS#12 (PFX) bundle, creating or
+// updating it. PFX is the format Azure consumers of vault certificates (App
+// Service, Application Gateway) require.
+func (c *Client) ImportCertificate(ctx context.Context, certName string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if len(chain) == 0 {
+		return errors.New("keyvault: empty certificate chain")
+	}
+	// Key Vault does not keep the import password and exports the secret with
+	// an empty one, so the bundle uses an empty password too. LegacyDES is the
+	// encoding the widest range of PFX readers accept.
+	pfx, err := pkcs12.LegacyDES.Encode(key, chain[0], chain[1:], "")
+	if err != nil {
+		return fmt.Errorf("keyvault: encode PFX: %w", err)
+	}
+	b64 := base64.StdEncoding.EncodeToString(pfx)
+	contentType := pkcs12ContentType
+	_, err = c.certs.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
 		Base64EncodedCertificate: &b64,
 		CertificatePolicy: &azcertificates.CertificatePolicy{
 			SecretProperties: &azcertificates.SecretProperties{ContentType: &contentType},

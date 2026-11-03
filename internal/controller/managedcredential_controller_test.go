@@ -157,8 +157,8 @@ var _ = Describe("ManagedCredential Controller", func() {
 				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 					return entraClient, nil
 				},
-				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-					return kvClient, nil
+				NewKeyVaultCredential: func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+					return fakeKeyVaultCredential{open: func(string) *fakeKeyVault { return kvClient }}, nil
 				},
 			},
 			DefaultNamespace: namespace,
@@ -1032,7 +1032,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		mc.Spec.TenantID = &tnt
 		mc.Spec.AppID = &app
 		mc.Spec.AppObjectID = &obj
-		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		mc.Spec.KeyVaults = []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}}
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 
 		// Reconcile #1 registers the certificate on the app; Key Vault must then
@@ -1072,7 +1072,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		mc.Spec.TenantID = &tnt
 		mc.Spec.AppID = &app
 		mc.Spec.AppObjectID = &obj
-		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		mc.Spec.KeyVaults = []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}}
 		// Externally provisioned: with an identityRef the controller would register
 		// the certificate itself (see the registration-retry spec) and then sync.
 		mc.Spec.IdentityRef = nil
@@ -1101,7 +1101,7 @@ var _ = Describe("ManagedCredential Controller", func() {
 		mc.Spec.TenantID = &tnt
 		mc.Spec.AppID = &app
 		mc.Spec.AppObjectID = &obj
-		mc.Spec.KeyVault = &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName}
+		mc.Spec.KeyVaults = []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}}
 		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
 
 		// Record the active cert as registered on the app.

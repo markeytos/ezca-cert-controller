@@ -9,9 +9,13 @@ metadata:
 spec:
   {{- include "ezca.baseSpec" (dict "item" . "root" $.Values.global) | nindent 2 }}
   certSecretNamespace: {{ .certSecretNamespace | default $.Release.Namespace | quote }}
-  {{- /* allowedNamespaces is required (MinItems=1); default to the release namespace. */}}
+  {{- /* allowedNamespaces is optional in the CRD; default it to the release namespace, where this chart's appCerts live. */}}
   allowedNamespaces:
     {{- $allowed := .allowedNamespaces | default (list $.Release.Namespace) }}
     {{- toYaml $allowed | nindent 4 }}
+  {{- with .secretReplicas }}
+  secretReplicas:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}
 {{- end }}

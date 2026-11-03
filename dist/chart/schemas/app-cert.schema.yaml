@@ -126,19 +126,25 @@ properties:
     description: Entra directory object ID of that app registration.
     type: string
 
-  keyVault:
-    description: Optional Key Vault certificate to keep in sync with the Secret. Needs the Entra app fields, which the chart checks while rendering.
-    type: object
-    additionalProperties: false
-    properties:
-      vaultName:
-        description: Vault name, not the full URL.
-        type: string
-      certName:
-        type: string
-    dependentRequired:
-      vaultName: [certName]
-      certName: [vaultName]
+  keyVaults:
+    description: Optional Key Vault certificates to keep in sync with the Secret, each synced independently. Needs the Entra app fields, which the chart checks while rendering; the app needs get and import permission on every vault.
+    type: array
+    maxItems: 200
+    items:
+      type: object
+      additionalProperties: false
+      required: [vaultName, certName]
+      properties:
+        vaultName:
+          description: Vault name, not the full URL.
+          type: string
+          minLength: 1
+          maxLength: 24
+        certName:
+          description: Certificate name in that vault.
+          type: string
+          minLength: 1
+          maxLength: 127
 
   identityRef:
     description: Identity that bootstraps first issuance. Required only when issuing into an empty Secret.

@@ -34,9 +34,11 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -135,6 +137,53 @@ func (c secretWriteFailingClient) Update(ctx context.Context, obj client.Object,
 	return c.Client.Update(ctx, obj, opts...)
 }
 
+// staleSecretClient serves stale in place of the stored Secret on the second
+// Get of it, as a cache that has not yet seen the controller's own write would
+// to the replica sync that follows the state machine's read.
+type staleSecretClient struct {
+	client.Client
+	stale *corev1.Secret
+	reads *int
+}
+
+func (c staleSecretClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if s, ok := obj.(*corev1.Secret); ok && key == client.ObjectKeyFromObject(c.stale) {
+		*c.reads++
+		if *c.reads == 2 {
+			c.stale.DeepCopyInto(s)
+			return nil
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// notFoundSecretClient answers every Get of a Secret in namespace with
+// NotFound, as a cache that has not yet seen it would.
+type notFoundSecretClient struct {
+	client.Client
+	namespace string
+}
+
+func (c notFoundSecretClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok && key.Namespace == c.namespace {
+		return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// alreadyExistsClient answers every Secret create with AlreadyExists, as the
+// API server does when the cache has not yet seen a Secret that exists.
+type alreadyExistsClient struct {
+	client.Client
+}
+
+func (c alreadyExistsClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if s, ok := obj.(*corev1.Secret); ok {
+		return apierrors.NewAlreadyExists(corev1.Resource("secrets"), s.Name)
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
 // trustingEntra models an app registration's keyCredentials: a client
 // certificate can authenticate (and sign addKey/removeKey proofs) only when its
 // thumbprint is in trusted, and AddKey trusts the added certificate.
@@ -196,8 +245,13 @@ type fakeKeyVault struct {
 	matches    bool
 	matchErr   error
 	matchCalls int
-	imported   [][]byte
+	imported   []kvImport
 	importErr  error
+}
+
+type kvImport struct {
+	chain []*x509.Certificate
+	key   *rsa.PrivateKey
 }
 
 func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool, error) {
@@ -205,12 +259,21 @@ func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool,
 	return f.matches, f.matchErr
 }
 
-func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, bundle []byte) error {
-	if len(bundle) <= 0 {
+func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if len(chain) <= 0 {
 		return f.importErr
 	}
-	f.imported = append(f.imported, bundle)
+	f.imported = append(f.imported, kvImport{chain: chain, key: key})
 	return nil
+}
+
+// fakeKeyVaultCredential opens every vault through open.
+type fakeKeyVaultCredential struct {
+	open func(vaultName string) *fakeKeyVault
+}
+
+func (f fakeKeyVaultCredential) vaultClient(vaultName string) (keyVaultManager, error) {
+	return f.open(vaultName), nil
 }
 
 func genCert(cn string, notBefore, notAfter time.Time) (certPEM, keyPEM []byte, cert *x509.Certificate) {
@@ -244,7 +307,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		ezcaClient  *fakeEZCA
 		entraClient *fakeEntra
 		kvClient    *fakeKeyVault
-		clockNow    time.Time
+		// kvCredBuilds counts the Key Vault credentials the reconciler built.
+		kvCredBuilds int
+		clockNow     time.Time
 	)
 
 	newReconciler := func() *ClusterCertIdentityReconciler {
@@ -257,8 +322,9 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 				NewEntraClient: func(_, _ string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
 					return entraClient, nil
 				},
-				NewKeyVaultClient: func(_, _, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultManager, error) {
-					return kvClient, nil
+				NewKeyVaultCredential: func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+					kvCredBuilds++
+					return fakeKeyVaultCredential{open: func(string) *fakeKeyVault { return kvClient }}, nil
 				},
 			},
 			DefaultNamespace: namespace,
@@ -306,6 +372,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		ezcaClient = &fakeEZCA{}
 		entraClient = &fakeEntra{}
 		kvClient = &fakeKeyVault{}
+		kvCredBuilds = 0
 		reconciler = newReconciler()
 	})
 
@@ -824,7 +891,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("imports the certificate into Key Vault when it differs, and skips when it matches", func() {
-		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*day), now.Add(90*day))
+		certPEM, keyPEM, cert := genCert("kv.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("kv-secret", certPEM, keyPEM)
 
 		ezcaURL := testEZCAURL
@@ -839,11 +906,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					CertSecretName:   "kv-secret",
 					Cloud:            ezcav1.CloudPublic,
 					RenewalThreshold: 20,
-					// keyVault requires the app fields (cert authenticates as the app).
+					// keyVaults requires the app fields (cert authenticates as the app).
 					TenantID:    &tenant,
 					AppID:       &app,
 					AppObjectID: &objectID,
-					KeyVault:    &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:   []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -852,19 +919,266 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
 
-		// Key Vault differs -> import a PEM bundle (cert chain + key).
+		// Key Vault differs -> import the Secret's cert chain and key.
 		kvClient.matches = false
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kvClient.imported).To(HaveLen(1))
-		Expect(string(kvClient.imported[0])).To(ContainSubstring("BEGIN CERTIFICATE"))
-		Expect(string(kvClient.imported[0])).To(ContainSubstring("PRIVATE KEY"))
+		Expect(kvClient.imported[0].chain).NotTo(BeEmpty())
+		Expect(kvClient.imported[0].chain[0].Equal(cert)).To(BeTrue())
+		Expect(kvClient.imported[0].key.PublicKey.Equal(cert.PublicKey)).To(BeTrue())
 
-		// Key Vault already matches -> no further import.
-		kvClient.matches = true
+		// Status now records the vault as holding the certificate, so the next
+		// reconcile does not contact Key Vault at all.
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+		Expect(cci.Status.KeyVaults).To(HaveLen(1))
+		Expect(cci.Status.KeyVaults[0].Thumbprint).To(Equal(cci.Status.Thumbprint))
 		_, err = reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(kvClient.matchCalls).To(Equal(1))
 		Expect(kvClient.imported).To(HaveLen(1))
+	})
+
+	It("syncs every Key Vault independently with one credential and retries only the failing ones", func() {
+		certPEM, keyPEM, leaf := genCert("kvmulti.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret("kvmulti-secret", certPEM, keyPEM)
+		thumbprint := pki.Thumbprint(leaf)
+
+		// One fake per vault, so a failure in one is visible as such.
+		vaults := map[string]*fakeKeyVault{
+			"vault-prod": {},
+			"vault-test": {},
+			"vault-dr":   {matchErr: errors.New("Forbidden: missing get permission")},
+		}
+		reconciler.NewKeyVaultCredential = func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+			kvCredBuilds++
+			return fakeKeyVaultCredential{open: func(name string) *fakeKeyVault { return vaults[name] }}, nil
+		}
+
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kvmulti-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kvmulti-secret",
+					Cloud:            ezcav1.CloudPublic,
+					RenewalThreshold: 20,
+					TenantID:         &tenant,
+					AppID:            &app,
+					AppObjectID:      &objectID,
+					KeyVaults: []ezcav1.KeyVaultSpec{
+						{VaultName: "vault-prod", CertName: certName},
+						{VaultName: "vault-dr", CertName: certName},
+						{VaultName: "vault-test", CertName: certName},
+					},
+				},
+				CertSecretNamespace: namespace,
+				AllowedNamespaces:   []string{namespace},
+			},
+		}
+		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+		syncedVaults := func() []string {
+			ExpectWithOffset(1, k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+			names := make([]string, 0, len(cci.Status.KeyVaults))
+			for _, kv := range cci.Status.KeyVaults {
+				ExpectWithOffset(1, kv.Thumbprint).To(Equal(thumbprint))
+				names = append(names, kv.VaultName)
+			}
+			return names
+		}
+
+		// The failing vault (listed between the other two) must not stop them
+		// from being synced, and all three share one credential.
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(time.Minute))
+		Expect(kvCredBuilds).To(Equal(1))
+		Expect(vaults["vault-prod"].imported).To(HaveLen(1))
+		Expect(vaults["vault-test"].imported).To(HaveLen(1))
+		Expect(vaults["vault-dr"].imported).To(BeEmpty())
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-test"))
+
+		degraded := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+		Expect(degraded.Reason).To(Equal("KeyVaultSyncFailed"))
+		Expect(degraded.Message).To(ContainSubstring("vault-dr/" + certName))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-prod"))
+		Expect(degraded.Message).NotTo(ContainSubstring("vault-test"))
+
+		// A retry contacts only the vault that failed.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults["vault-prod"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-test"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-dr"].matchCalls).To(Equal(2))
+
+		// Once the failing vault is fixed it is imported too.
+		vaults["vault-dr"].matchErr = nil
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults["vault-dr"].imported).To(HaveLen(1))
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-dr", "vault-test"))
+
+		// Steady state: no credential, no Key Vault calls, no status write.
+		builds := kvCredBuilds
+		rv := cci.ResourceVersion
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvCredBuilds).To(Equal(builds))
+		for name, v := range vaults {
+			Expect(v.imported).To(HaveLen(1), name)
+		}
+		Expect(vaults["vault-prod"].matchCalls).To(Equal(1))
+		Expect(vaults["vault-dr"].matchCalls).To(Equal(3))
+		Expect(syncedVaults()).To(HaveLen(3))
+		Expect(cci.ResourceVersion).To(Equal(rv), "steady-state reconcile must not bump the object")
+
+		// A vault removed from the spec is dropped from status, without
+		// contacting any vault.
+		cci.Spec.KeyVaults = cci.Spec.KeyVaults[:2]
+		Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kvCredBuilds).To(Equal(builds))
+		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-dr"))
+	})
+
+	It("checks each synced Key Vault again a day after it was confirmed, repairing one changed outside the controller", func() {
+		const prodVault, testVault = "recheck-prod", "recheck-test"
+
+		certPEM, keyPEM, _ := genCert("kvrecheck.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret("kvrecheck-secret", certPEM, keyPEM)
+
+		vaults := map[string]*fakeKeyVault{
+			prodVault: {},
+			testVault: {matchErr: errors.New("Forbidden: missing get permission")},
+		}
+		reconciler.NewKeyVaultCredential = func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+			return fakeKeyVaultCredential{open: func(name string) *fakeKeyVault { return vaults[name] }}, nil
+		}
+
+		cci := createIdentity("kvrecheck-identity", "kvrecheck-secret", ezcav1.CloudPublic, true)
+		cci.Spec.KeyVaults = []ezcav1.KeyVaultSpec{
+			{VaultName: prodVault, CertName: certName},
+			{VaultName: testVault, CertName: certName},
+		}
+		Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		// The prod vault syncs now; the test vault only once it is fixed, 6h
+		// later, so the two come due at different times.
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].imported).To(HaveLen(1))
+
+		clockNow = now.Add(6 * time.Hour)
+		vaults[testVault].matchErr = nil
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[testVault].imported).To(HaveLen(1))
+		Expect(vaults[prodVault].matchCalls).To(Equal(1))
+		Expect(res.RequeueAfter).To(Equal(18*time.Hour), "comes back when the prod vault is due")
+
+		// Just before the prod vault is due, neither vault is contacted.
+		clockNow = now.Add(keyVaultRecheck - time.Minute)
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].matchCalls).To(Equal(1))
+		Expect(vaults[testVault].matchCalls).To(Equal(2))
+
+		// A day on, the prod vault is checked again; it still holds the
+		// certificate, so nothing is imported but the check is recorded.
+		clockNow = now.Add(keyVaultRecheck)
+		vaults[prodVault].matches = true
+		res, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].matchCalls).To(Equal(2))
+		Expect(vaults[prodVault].imported).To(HaveLen(1))
+		Expect(vaults[testVault].matchCalls).To(Equal(2))
+		Expect(res.RequeueAfter).To(Equal(6*time.Hour), "comes back when the test vault is due")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+		for _, kv := range cci.Status.KeyVaults {
+			if kv.VaultName == prodVault {
+				Expect(kv.SyncedAt.Time).To(BeTemporally("==", clockNow))
+			}
+		}
+
+		// The test vault's certificate was replaced outside the controller;
+		// its daily check finds that and imports the active certificate again.
+		clockNow = now.Add(6*time.Hour + keyVaultRecheck)
+		res, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[testVault].matchCalls).To(Equal(3))
+		Expect(vaults[testVault].imported).To(HaveLen(2))
+		Expect(vaults[prodVault].matchCalls).To(Equal(2))
+		Expect(res.RequeueAfter).To(Equal(18*time.Hour), "comes back when the prod vault is due")
+	})
+
+	It("rejects keyVaults without the Entra app fields", func() {
+		ezcaURL := testEZCAURL
+		cci := &ezcav1.ClusterCertIdentity{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv-noapp-identity"},
+			Spec: ezcav1.ClusterCertIdentitySpec{
+				CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+					EZCAURL:          &ezcaURL,
+					CertSecretName:   "kv-noapp-secret",
+					RenewalThreshold: 20,
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, cci)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("keyVaults requires the Entra app fields"))
+	})
+
+	It("accepts 200 keyVaults and 200 secretReplicas, and rejects more", func() {
+		// Both lists can grow together (every private instance needs a copy and
+		// a vault entry); this also proves the CEL cost estimate for the
+		// secretReplicas rule fits at that size, since the CRD would not have
+		// installed otherwise.
+		ezcaURL := testEZCAURL
+		tenant := testUUID0
+		app := testUUID1
+		objectID := testObjectID
+		build := func(name string, n int) *ezcav1.ClusterCertIdentity {
+			cci := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL:          &ezcaURL,
+						CertSecretName:   name + "-secret",
+						RenewalThreshold: 20,
+						TenantID:         &tenant,
+						AppID:            &app,
+						AppObjectID:      &objectID,
+					},
+					CertSecretNamespace: namespace,
+				},
+			}
+			for i := range n {
+				cci.Spec.KeyVaults = append(cci.Spec.KeyVaults, ezcav1.KeyVaultSpec{
+					VaultName: fmt.Sprintf("vault-%03d", i), CertName: certName,
+				})
+				cci.Spec.SecretReplicas = append(cci.Spec.SecretReplicas, ezcav1.SecretReplica{
+					Namespace: fmt.Sprintf("instance-%03d", i), Name: "app-cert",
+				})
+			}
+			return cci
+		}
+
+		Expect(k8sClient.Create(ctx, build("max-lists-identity", 200))).To(Succeed())
+
+		err := k8sClient.Create(ctx, build("over-lists-identity", 201))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.keyVaults"))
+		Expect(err.Error()).To(ContainSubstring("spec.secretReplicas"))
 	})
 
 	It("defers Key Vault sync (no error) while the certificate is still propagating", func() {
@@ -889,7 +1203,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -941,7 +1255,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -1016,7 +1330,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 					TenantID:         &tenant,
 					AppID:            &app,
 					AppObjectID:      &objectID,
-					KeyVault:         &ezcav1.KeyVaultSpec{VaultName: vaultName, CertName: certName},
+					KeyVaults:        []ezcav1.KeyVaultSpec{{VaultName: vaultName, CertName: certName}},
 				},
 				CertSecretNamespace: namespace,
 				AllowedNamespaces:   []string{namespace},
@@ -1553,6 +1867,621 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			err = k8sClient.Create(ctx, cci)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("must not repeat the primary appObjectID"))
+		})
+	})
+
+	Describe("secret replicas", func() {
+		const (
+			replicaName = "app-cert"
+			pruneNS     = "rep-prune"
+			copyProdNS  = "rep-copy-prod"
+			copyTestNS  = "rep-copy-test"
+			noSourceNS  = "rep-nosrc"
+			keepName    = "keep"
+			foreignKey  = "password"
+			opaqueNS    = "rep-opaque"
+			uncachedNS  = "rep-uncached"
+		)
+
+		createNamespace := func(name string) {
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})).To(Succeed())
+		}
+
+		setReplicas := func(cci *ezcav1.ClusterCertIdentity, replicas ...ezcav1.SecretReplica) {
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Spec.SecretReplicas = replicas
+			Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+		}
+
+		getSecret := func(ns, name string) *corev1.Secret {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &s)).To(Succeed())
+			return &s
+		}
+
+		secretExists := func(ns, name string) bool {
+			var s corev1.Secret
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &s)
+			if err == nil {
+				return true
+			}
+			Expect(client.IgnoreNotFound(err)).To(Succeed())
+			return false
+		}
+
+		replicasCondition := func(cci *ezcav1.ClusterCertIdentity) *metav1.Condition {
+			return meta.FindStatusCondition(cci.Status.Conditions, typeSecretReplicasSynced)
+		}
+
+		reconcileIdentity := func(cci *ezcav1.ClusterCertIdentity) ctrl.Result {
+			res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			return res
+		}
+
+		It("copies only the active certificate into every listed namespace", func() {
+			createNamespace(copyProdNS)
+			createNamespace(copyTestNS)
+			certPEM, keyPEM, _ := genCert("copy.ezca.io", now.Add(-10*day), now.Add(90*day))
+			src := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "rep-copy-src", Namespace: namespace},
+				Type:       corev1.SecretTypeTLS,
+				Data:       map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM, "ca.crt": []byte("bootstrap-only")},
+			}
+			Expect(k8sClient.Create(ctx, src)).To(Succeed())
+
+			cci := createIdentity("rep-copy", "rep-copy-src", ezcav1.CloudPublic, false)
+			setReplicas(cci,
+				ezcav1.SecretReplica{Namespace: copyProdNS, Name: replicaName},
+				ezcav1.SecretReplica{Namespace: copyTestNS, Name: replicaName})
+			reconcileIdentity(cci)
+
+			for _, ns := range []string{copyProdNS, copyTestNS} {
+				replica := getSecret(ns, replicaName)
+				Expect(replica.Type).To(Equal(corev1.SecretTypeTLS))
+				Expect(replica.Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+				Expect(replica.Labels).To(HaveKeyWithValue(secretReplicaLabel, secretReplicaLabelValue))
+				Expect(replica.Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "rep-copy"))
+			}
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(ConsistOf(
+				ezcav1.SecretReplicaStatus{Namespace: copyProdNS, Name: replicaName, UID: getSecret(copyProdNS, replicaName).UID},
+				ezcav1.SecretReplicaStatus{Namespace: copyTestNS, Name: replicaName, UID: getSecret(copyTestNS, replicaName).UID}))
+
+			// A steady-state pass rewrites neither the copies nor the status.
+			rv := cci.ResourceVersion
+			replicaRV := getSecret(copyProdNS, replicaName).ResourceVersion
+			reconcileIdentity(cci)
+			Expect(cci.ResourceVersion).To(Equal(rv))
+			Expect(getSecret(copyProdNS, replicaName).ResourceVersion).To(Equal(replicaRV))
+		})
+
+		It("brings the copies up to the renewed certificate", func() {
+			createNamespace("rep-renew")
+			certPEM, keyPEM, _ := genCert("rep-renew.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("rep-renew-src", certPEM, keyPEM)
+			cci := createIdentity("rep-renew", "rep-renew-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-renew", Name: replicaName})
+
+			_, _, parsedNew := genCert("rep-renew.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			reconcileIdentity(cci)
+			Expect(ezcaClient.called).To(BeTrue())
+
+			src := getSecret(namespace, "rep-renew-src")
+			replica := getSecret("rep-renew", replicaName)
+			Expect(replica.Data[tlsCertKey]).To(Equal(src.Data[tlsCertKey]))
+			Expect(replica.Data[tlsKeyKey]).To(Equal(src.Data[tlsKeyKey]))
+			chain, err := pki.ParseCertChainPEM(replica.Data[tlsCertKey])
+			Expect(err).NotTo(HaveOccurred())
+			Expect(chain[0].Equal(parsedNew)).To(BeTrue())
+		})
+
+		It("keeps serving the active certificate in the copies while a renewal is staged", func() {
+			createNamespace("rep-staged")
+			certPEM, keyPEM, _ := genCert("rep-staged.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("rep-staged-src", certPEM, keyPEM)
+			cci := createIdentity("rep-staged", "rep-staged-src", ezcav1.CloudPublic, true)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-staged", Name: replicaName})
+
+			_, _, parsedNew := genCert("rep-staged.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{parsedNew}
+			reconcileIdentity(cci)
+			Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(parsedNew)))
+
+			replica := getSecret("rep-staged", replicaName)
+			Expect(replica.Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+		})
+
+		It("restores a copy that was edited or deleted", func() {
+			createNamespace("rep-restore")
+			certPEM, keyPEM, _ := genCert("rep-restore.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-restore-src", certPEM, keyPEM)
+			cci := createIdentity("rep-restore", "rep-restore-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-restore", Name: replicaName})
+			reconcileIdentity(cci)
+
+			replica := getSecret("rep-restore", replicaName)
+			replica.Data[tlsCertKey] = []byte("tampered")
+			replica.Data["extra"] = []byte("x")
+			Expect(k8sClient.Update(ctx, replica)).To(Succeed())
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-restore", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+
+			Expect(k8sClient.Delete(ctx, replica)).To(Succeed())
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-restore", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+		})
+
+		It("deletes copies removed from the list and leaves other identities' copies alone", func() {
+			createNamespace(pruneNS)
+			certPEM, keyPEM, _ := genCert("rep-prune.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-prune-src", certPEM, keyPEM)
+			createSecret("rep-prune-other-src", certPEM, keyPEM)
+			cci := createIdentity(pruneNS, "rep-prune-src", ezcav1.CloudPublic, false)
+			other := createIdentity("rep-prune-other", "rep-prune-other-src", ezcav1.CloudPublic, false)
+			setReplicas(cci,
+				ezcav1.SecretReplica{Namespace: pruneNS, Name: keepName},
+				ezcav1.SecretReplica{Namespace: pruneNS, Name: "drop"})
+			setReplicas(other, ezcav1.SecretReplica{Namespace: pruneNS, Name: "other"})
+			reconcileIdentity(cci)
+			reconcileIdentity(other)
+			Expect(secretExists(pruneNS, "drop")).To(BeTrue())
+
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: pruneNS, Name: keepName})
+			reconcileIdentity(cci)
+			Expect(secretExists(pruneNS, keepName)).To(BeTrue())
+			Expect(secretExists(pruneNS, "drop")).To(BeFalse())
+			Expect(secretExists(pruneNS, "other")).To(BeTrue())
+
+			// Clearing the list removes the rest.
+			setReplicas(cci)
+			reconcileIdentity(cci)
+			Expect(secretExists(pruneNS, keepName)).To(BeFalse())
+			Expect(secretExists(pruneNS, "other")).To(BeTrue())
+		})
+
+		It("refuses to overwrite a Secret it did not create, and recovers once it is gone", func() {
+			createNamespace("rep-foreign")
+			certPEM, keyPEM, _ := genCert("rep-foreign.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-foreign-src", certPEM, keyPEM)
+			// An unmarked kubernetes.io/tls Secret, such as an ingress certificate.
+			foreign := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: replicaName, Namespace: "rep-foreign"},
+				Type:       corev1.SecretTypeTLS,
+				Data:       map[string][]byte{tlsCertKey: []byte("ingress"), tlsKeyKey: []byte("ingress")},
+			}
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+			cci := createIdentity("rep-foreign", "rep-foreign-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-foreign", Name: replicaName})
+			res := reconcileIdentity(cci)
+			Expect(res.RequeueAfter).To(BeNumerically("<=", replicaFailureRequeue))
+
+			Expect(getSecret("rep-foreign", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: []byte("ingress"), tlsKeyKey: []byte("ingress")}))
+			cond := replicasCondition(cci)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Message).To(ContainSubstring("rep-foreign/app-cert"))
+			Expect(cond.Message).To(ContainSubstring("was not written by the controller"))
+			// The certificate itself is fine: replication never touches Available.
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(BeEmpty())
+
+			Expect(k8sClient.Delete(ctx, getSecret("rep-foreign", replicaName))).To(Succeed())
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-foreign", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+		})
+
+		It("does not take over another identity's copy", func() {
+			createNamespace("rep-taken")
+			certPEM, keyPEM, _ := genCert("rep-taken.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-taken-a-src", certPEM, keyPEM)
+			otherPEM, otherKeyPEM, _ := genCert("rep-taken-b.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-taken-b-src", otherPEM, otherKeyPEM)
+			a := createIdentity("rep-taken-a", "rep-taken-a-src", ezcav1.CloudPublic, false)
+			b := createIdentity("rep-taken-b", "rep-taken-b-src", ezcav1.CloudPublic, false)
+			setReplicas(a, ezcav1.SecretReplica{Namespace: "rep-taken", Name: replicaName})
+			setReplicas(b, ezcav1.SecretReplica{Namespace: "rep-taken", Name: replicaName})
+
+			reconcileIdentity(a)
+			reconcileIdentity(b)
+			Expect(getSecret("rep-taken", replicaName).Data[tlsCertKey]).To(Equal(certPEM))
+			cond := replicasCondition(b)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Message).To(ContainSubstring(`ClusterCertIdentity "rep-taken-a"`))
+		})
+
+		It("takes over the copies of a deleted identity", func() {
+			createNamespace("rep-rename")
+			certPEM, keyPEM, _ := genCert("rep-rename.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-rename-src", certPEM, keyPEM)
+			old := createIdentity("rep-rename-old", "rep-rename-src", ezcav1.CloudPublic, false)
+			setReplicas(old, ezcav1.SecretReplica{Namespace: "rep-rename", Name: replicaName})
+			reconcileIdentity(old)
+			// Deleting the identity leaves its copy in place.
+			Expect(k8sClient.Delete(ctx, old)).To(Succeed())
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: old.Name}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretExists("rep-rename", replicaName)).To(BeTrue())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: old.Name}, old))
+			}).Should(BeTrue())
+
+			renamed := createIdentity("rep-rename-new", "rep-rename-src", ezcav1.CloudPublic, false)
+			setReplicas(renamed, ezcav1.SecretReplica{Namespace: "rep-rename", Name: replicaName})
+			reconcileIdentity(renamed)
+			Expect(meta.IsStatusConditionTrue(renamed.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			Expect(getSecret("rep-rename", replicaName).Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "rep-rename-new"))
+		})
+
+		It("never deletes a Secret it did not record writing, even one marked as a copy", func() {
+			createNamespace("rep-forged")
+			certPEM, keyPEM, _ := genCert("rep-forged.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-forged-src", certPEM, keyPEM)
+			cci := createIdentity("rep-forged", "rep-forged-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-forged", Name: replicaName})
+			reconcileIdentity(cci)
+
+			// A copy of the copy under another name carries the same markers.
+			backup := getSecret("rep-forged", replicaName).DeepCopy()
+			backup.ObjectMeta = metav1.ObjectMeta{
+				Name: "backup", Namespace: "rep-forged",
+				Labels: backup.Labels, Annotations: backup.Annotations,
+			}
+			Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+
+			setReplicas(cci)
+			reconcileIdentity(cci)
+			Expect(secretExists("rep-forged", replicaName)).To(BeFalse())
+			Expect(secretExists("rep-forged", "backup")).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(BeEmpty())
+			Expect(replicasCondition(cci)).To(BeNil())
+		})
+
+		It("forgets rather than deletes a recorded copy whose Secret was replaced", func() {
+			createNamespace("rep-replaced")
+			certPEM, keyPEM, _ := genCert("rep-replaced.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-replaced-src", certPEM, keyPEM)
+			cci := createIdentity("rep-replaced", "rep-replaced-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-replaced", Name: replicaName})
+			reconcileIdentity(cci)
+
+			Expect(k8sClient.Delete(ctx, getSecret("rep-replaced", replicaName))).To(Succeed())
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: replicaName, Namespace: "rep-replaced"},
+				Data:       map[string][]byte{foreignKey: []byte("hunter2")},
+			})).To(Succeed())
+
+			setReplicas(cci)
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-replaced", replicaName).Data).To(HaveKey(foreignKey))
+			Expect(cci.Status.SecretReplicas).To(BeEmpty())
+		})
+
+		It("deletes copies removed from the list while the certificate Secret is missing", func() {
+			createNamespace(noSourceNS)
+			certPEM, keyPEM, _ := genCert("rep-nosrc.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-nosrc-src", certPEM, keyPEM)
+			cci := createIdentity(noSourceNS, "rep-nosrc-src", ezcav1.CloudPublic, false)
+			setReplicas(cci,
+				ezcav1.SecretReplica{Namespace: noSourceNS, Name: keepName},
+				ezcav1.SecretReplica{Namespace: noSourceNS, Name: "drop"})
+			reconcileIdentity(cci)
+
+			Expect(k8sClient.Delete(ctx, getSecret(namespace, "rep-nosrc-src"))).To(Succeed())
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: noSourceNS, Name: keepName})
+			reconcileIdentity(cci)
+			Expect(secretExists(noSourceNS, "drop")).To(BeFalse())
+			Expect(secretExists(noSourceNS, keepName)).To(BeTrue())
+			cond := replicasCondition(cci)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Message).To(ContainSubstring("missing or invalid"))
+		})
+
+		It("catches the copies up once a stale cached read of the certificate Secret clears", func() {
+			createNamespace("rep-stale")
+			certPEM, keyPEM, _ := genCert("rep-stale.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-stale-src", certPEM, keyPEM)
+			cci := createIdentity("rep-stale", "rep-stale-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-stale", Name: replicaName})
+			reconcileIdentity(cci)
+
+			// The certificate Secret changes, but the replica sync's cached read
+			// still returns it as it was.
+			stale := getSecret(namespace, "rep-stale-src")
+			newPEM, newKeyPEM, _ := genCert("rep-stale.ezca.io", now.Add(-day), now.Add(100*day))
+			src := stale.DeepCopy()
+			src.Data = map[string][]byte{tlsCertKey: newPEM, tlsKeyKey: newKeyPEM}
+			Expect(k8sClient.Update(ctx, src)).To(Succeed())
+			reads := 0
+			reconciler.Client = staleSecretClient{Client: k8sClient, stale: stale, reads: &reads}
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-stale", replicaName).Data[tlsCertKey]).To(Equal(certPEM))
+
+			// The change's watch event reconciles again, now with a fresh read.
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-stale", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: newPEM, tlsKeyKey: newKeyPEM}))
+		})
+
+		It("reports and retries while a listed namespace does not exist", func() {
+			certPEM, keyPEM, _ := genCert("rep-nons.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-nons-src", certPEM, keyPEM)
+			cci := createIdentity("rep-nons", "rep-nons-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-nons-missing", Name: replicaName})
+
+			res := reconcileIdentity(cci)
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.RequeueAfter).To(BeNumerically("<=", replicaFailureRequeue))
+			Expect(meta.IsStatusConditionFalse(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+
+			createNamespace("rep-nons-missing")
+			reconcileIdentity(cci)
+			Expect(secretExists("rep-nons-missing", replicaName)).To(BeTrue())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+		})
+
+		It("refuses a copy of the certificate Secret onto itself", func() {
+			certPEM, keyPEM, _ := genCert("rep-self.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-self-src", certPEM, keyPEM)
+			cci := createIdentity("rep-self", "rep-self-src", ezcav1.CloudPublic, false)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Spec.SecretReplicas = []ezcav1.SecretReplica{{Namespace: namespace, Name: "rep-self-src"}}
+			err := k8sClient.Update(ctx, cci)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("secretReplicas must not name the certificate Secret itself"))
+
+			// With certSecretNamespace unset, CEL cannot see the default
+			// namespace; the controller refuses it instead.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Spec.CertSecretNamespace = ""
+			cci.Spec.SecretReplicas = []ezcav1.SecretReplica{{Namespace: namespace, Name: "rep-self-src"}}
+			Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+			reconcileIdentity(cci)
+			cond := replicasCondition(cci)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Message).To(ContainSubstring("is the certificate Secret itself"))
+			src := getSecret(namespace, "rep-self-src")
+			Expect(src.Labels).NotTo(HaveKey(secretReplicaLabel))
+			Expect(src.Data[tlsCertKey]).To(Equal(certPEM))
+		})
+
+		It("accepts an identity without allowedNamespaces", func() {
+			ezcaURL := testEZCAURL
+			cci := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "rep-no-allowed"},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL:          &ezcaURL,
+						CertSecretName:   "rep-no-allowed-src",
+						RenewalThreshold: 20,
+					},
+					CertSecretNamespace: namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cci)).To(Succeed())
+		})
+
+		It("refuses to renew another identity's copy as its certificate Secret", func() {
+			createNamespace("rep-asource")
+			certPEM, keyPEM, _ := genCert("rep-asource.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-asource-src", certPEM, keyPEM)
+			owner := createIdentity("rep-asource", "rep-asource-src", ezcav1.CloudPublic, false)
+			setReplicas(owner, ezcav1.SecretReplica{Namespace: "rep-asource", Name: replicaName})
+			reconcileIdentity(owner)
+
+			// With a 99% threshold the copy's certificate is due, so only the
+			// refusal keeps the second identity from renewing it.
+			ezcaURL := testEZCAURL
+			thief := &ezcav1.ClusterCertIdentity{
+				ObjectMeta: metav1.ObjectMeta{Name: "rep-asource-thief"},
+				Spec: ezcav1.ClusterCertIdentitySpec{
+					CertIdentitySpecBase: ezcav1.CertIdentitySpecBase{
+						EZCAURL: &ezcaURL, CertSecretName: replicaName, RenewalThreshold: 99,
+					},
+					CertSecretNamespace: "rep-asource",
+				},
+			}
+			Expect(k8sClient.Create(ctx, thief)).To(Succeed())
+			reconcileIdentity(thief)
+			Expect(ezcaClient.called).To(BeFalse())
+			degraded := meta.FindStatusCondition(thief.Status.Conditions, typeDegradedCertIdentity)
+			Expect(degraded).NotTo(BeNil())
+			Expect(degraded.Reason).To(Equal("CertificateSecretIsReplica"))
+			Expect(degraded.Message).To(ContainSubstring(`ClusterCertIdentity "rep-asource"`))
+		})
+
+		It("does not delete a recorded copy someone unmarked", func() {
+			createNamespace("rep-unmarked")
+			certPEM, keyPEM, _ := genCert("rep-unmarked.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-unmarked-src", certPEM, keyPEM)
+			cci := createIdentity("rep-unmarked", "rep-unmarked-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-unmarked", Name: replicaName})
+			reconcileIdentity(cci)
+
+			replica := getSecret("rep-unmarked", replicaName)
+			delete(replica.Labels, secretReplicaLabel)
+			Expect(k8sClient.Update(ctx, replica)).To(Succeed())
+
+			setReplicas(cci)
+			reconcileIdentity(cci)
+			Expect(secretExists("rep-unmarked", replicaName)).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(BeEmpty())
+		})
+
+		It("never takes over a Secret that is not of type kubernetes.io/tls", func() {
+			createNamespace(opaqueNS)
+			certPEM, keyPEM, _ := genCert("rep-opaque.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-opaque-src", certPEM, keyPEM)
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: replicaName, Namespace: opaqueNS,
+					Labels:      map[string]string{secretReplicaLabel: secretReplicaLabelValue},
+					Annotations: map[string]string{secretReplicaOfAnnotation: opaqueNS},
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{foreignKey: []byte("hunter2")},
+			})).To(Succeed())
+
+			cci := createIdentity(opaqueNS, "rep-opaque-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: opaqueNS, Name: replicaName})
+			reconcileIdentity(cci)
+			Expect(getSecret(opaqueNS, replicaName).Data).To(HaveKey(foreignKey))
+			Expect(replicasCondition(cci).Message).To(ContainSubstring("type Opaque"))
+		})
+
+		It("takes over a copy its named identity neither lists nor recorded", func() {
+			createNamespace("rep-orphan")
+			certPEM, keyPEM, _ := genCert("rep-orphan.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-orphan-src", certPEM, keyPEM)
+			createIdentity("rep-orphan-a", "rep-orphan-src", ezcav1.CloudPublic, false)
+			// A copy for identity a whose record was never written, and which a
+			// no longer lists.
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: replicaName, Namespace: "rep-orphan",
+					Labels:      map[string]string{secretReplicaLabel: secretReplicaLabelValue},
+					Annotations: map[string]string{secretReplicaOfAnnotation: "rep-orphan-a"},
+				},
+				Type: corev1.SecretTypeTLS,
+				Data: map[string][]byte{tlsCertKey: []byte("old"), tlsKeyKey: []byte("old")},
+			})).To(Succeed())
+
+			b := createIdentity("rep-orphan-b", "rep-orphan-src", ezcav1.CloudPublic, false)
+			setReplicas(b, ezcav1.SecretReplica{Namespace: "rep-orphan", Name: replicaName})
+			reconcileIdentity(b)
+			Expect(meta.IsStatusConditionTrue(b.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			Expect(getSecret("rep-orphan", replicaName).Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "rep-orphan-b"))
+		})
+
+		It("retries a write that lost a race with the cache without reporting a failure", func() {
+			createNamespace("rep-race")
+			certPEM, keyPEM, _ := genCert("rep-race.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-race-src", certPEM, keyPEM)
+			cci := createIdentity("rep-race", "rep-race-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-race", Name: replicaName})
+
+			reconciler.Client = alreadyExistsClient{Client: k8sClient}
+			res := reconcileIdentity(cci)
+			Expect(res.RequeueAfter).To(BeNumerically("<=", replicaRaceRequeue))
+			Expect(replicasCondition(cci)).To(BeNil())
+
+			reconciler.Client = k8sClient
+			reconcileIdentity(cci)
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+		})
+
+		It("re-adopts its own copy after its status is lost", func() {
+			createNamespace("rep-lost")
+			certPEM, keyPEM, _ := genCert("rep-lost.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-lost-src", certPEM, keyPEM)
+			cci := createIdentity("rep-lost", "rep-lost-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-lost", Name: replicaName})
+			reconcileIdentity(cci)
+			uid := getSecret("rep-lost", replicaName).UID
+
+			cci.Status = ezcav1.ClusterCertIdentityStatus{}
+			Expect(k8sClient.Status().Update(ctx, cci)).To(Succeed())
+			reconcileIdentity(cci)
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(ConsistOf(ezcav1.SecretReplicaStatus{Namespace: "rep-lost", Name: replicaName, UID: uid}))
+		})
+
+		It("leaves a copy two identities claim to the one it names, without the two taking turns", func() {
+			createNamespace("rep-pingpong")
+			certPEM, keyPEM, _ := genCert("rep-pingpong.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-pingpong-src", certPEM, keyPEM)
+			a := createIdentity("rep-pingpong-a", "rep-pingpong-src", ezcav1.CloudPublic, false)
+			b := createIdentity("rep-pingpong-b", "rep-pingpong-src", ezcav1.CloudPublic, false)
+			setReplicas(a, ezcav1.SecretReplica{Namespace: "rep-pingpong", Name: replicaName})
+			setReplicas(b, ezcav1.SecretReplica{Namespace: "rep-pingpong", Name: replicaName})
+			reconcileIdentity(a)
+			reconcileIdentity(b)
+			Expect(meta.IsStatusConditionFalse(b.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+
+			// Someone re-points the copy at b, although a still records it.
+			replica := getSecret("rep-pingpong", replicaName)
+			replica.Annotations[secretReplicaOfAnnotation] = "rep-pingpong-b"
+			Expect(k8sClient.Update(ctx, replica)).To(Succeed())
+
+			reconcileIdentity(b)
+			reconcileIdentity(a)
+			rv := getSecret("rep-pingpong", replicaName).ResourceVersion
+			reconcileIdentity(b)
+			reconcileIdentity(a)
+			Expect(getSecret("rep-pingpong", replicaName).ResourceVersion).To(Equal(rv))
+			Expect(getSecret("rep-pingpong", replicaName).Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "rep-pingpong-b"))
+			Expect(meta.IsStatusConditionTrue(b.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			cond := replicasCondition(a)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Message).To(ContainSubstring(`ClusterCertIdentity "rep-pingpong-b"`))
+		})
+
+		It("deletes a removed copy by UID when the cache has not seen it yet, and only that copy", func() {
+			createNamespace(uncachedNS)
+			certPEM, keyPEM, _ := genCert("rep-uncached.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-uncached-src", certPEM, keyPEM)
+			cci := createIdentity(uncachedNS, "rep-uncached-src", ezcav1.CloudPublic, false)
+			setReplicas(cci,
+				ezcav1.SecretReplica{Namespace: uncachedNS, Name: replicaName},
+				ezcav1.SecretReplica{Namespace: uncachedNS, Name: "replaced"})
+			reconcileIdentity(cci)
+			// "replaced" is deleted and recreated by someone else: new UID.
+			Expect(k8sClient.Delete(ctx, getSecret(uncachedNS, "replaced"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "replaced", Namespace: uncachedNS},
+				Data:       map[string][]byte{foreignKey: []byte("hunter2")},
+			})).To(Succeed())
+
+			setReplicas(cci)
+			reconciler.Client = notFoundSecretClient{Client: k8sClient, namespace: uncachedNS}
+			reconcileIdentity(cci)
+			Expect(secretExists(uncachedNS, replicaName)).To(BeFalse())
+			Expect(secretExists(uncachedNS, "replaced")).To(BeTrue())
+			Expect(cci.Status.SecretReplicas).To(BeEmpty())
+		})
+
+		It("does not copy a certificate Secret that fails to parse", func() {
+			createNamespace("rep-badsrc")
+			certPEM, keyPEM, _ := genCert("rep-badsrc.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-badsrc-src", certPEM, keyPEM)
+			cci := createIdentity("rep-badsrc", "rep-badsrc-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-badsrc", Name: replicaName})
+			reconcileIdentity(cci)
+
+			// The replica sync's read sees a broken Secret written after the
+			// state machine's read.
+			broken := getSecret(namespace, "rep-badsrc-src")
+			broken.Data = map[string][]byte{tlsCertKey: []byte("garbage"), tlsKeyKey: []byte("garbage")}
+			reads := 0
+			reconciler.Client = staleSecretClient{Client: k8sClient, stale: broken, reads: &reads}
+			reconcileIdentity(cci)
+			Expect(getSecret("rep-badsrc", replicaName).Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+			Expect(replicasCondition(cci).Message).To(ContainSubstring("missing or invalid"))
+		})
+
+		It("does not map a marked copy to an identity that neither lists nor recorded it", func() {
+			replica := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: replicaName, Namespace: "anywhere",
+				Labels:      map[string]string{secretReplicaLabel: secretReplicaLabelValue},
+				Annotations: map[string]string{secretReplicaOfAnnotation: "owner-identity"},
+			}}
+			Expect(reconciler.secretToRequests(ctx, replica)).NotTo(ContainElement(
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: "owner-identity"}}))
+		})
+
+		It("maps an unmarked Secret at a listed copy's name to the identity listing it", func() {
+			certPEM, keyPEM, _ := genCert("rep-map.ezca.io", now.Add(-10*day), now.Add(90*day))
+			createSecret("rep-map-src", certPEM, keyPEM)
+			cci := createIdentity("rep-map", "rep-map-src", ezcav1.CloudPublic, false)
+			setReplicas(cci, ezcav1.SecretReplica{Namespace: "rep-map-ns", Name: replicaName})
+			stripped := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: replicaName, Namespace: "rep-map-ns"}}
+			Expect(reconciler.secretToRequests(ctx, stripped)).To(ContainElement(
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: "rep-map"}}))
 		})
 	})
 })

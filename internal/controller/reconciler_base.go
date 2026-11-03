@@ -56,12 +56,12 @@ type ReconcilerBase struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// Now, NewEZCAClient, NewEntraClient, and NewKeyVaultClient are injection
-	// points for tests. When nil, real implementations are used.
-	Now               func() time.Time
-	NewEZCAClient     func(ezcaURL string) (ezcaRenewer, error)
-	NewEntraClient    func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
-	NewKeyVaultClient func(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error)
+	// Now, NewEZCAClient, NewEntraClient, and NewKeyVaultCredential are
+	// injection points for tests. When nil, real implementations are used.
+	Now                   func() time.Time
+	NewEZCAClient         func(ezcaURL string) (ezcaRenewer, error)
+	NewEntraClient        func(tenantID, appID string, cl entra.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (entraManager, error)
+	NewKeyVaultCredential func(tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultCredential, error)
 
 	// Propagation bounds how long a key added to an app registration is given
 	// to propagate across Entra ID. Zero fields use the defaults.
@@ -189,9 +189,26 @@ func (r *ReconcilerBase) newEntraClient(tenantID, appID string, cl entra.Cloud, 
 	return entra.NewClient(tenantID, appID, cl, cert, key)
 }
 
-func (r *ReconcilerBase) newKeyVaultClient(vaultName, tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultManager, error) {
-	if r.NewKeyVaultClient != nil {
-		return r.NewKeyVaultClient(vaultName, tenantID, appID, cl, cert, key)
+func (r *ReconcilerBase) newKeyVaultCredential(tenantID, appID string, cl keyvault.Cloud, cert *x509.Certificate, key *rsa.PrivateKey) (keyVaultCredential, error) {
+	if r.NewKeyVaultCredential != nil {
+		return r.NewKeyVaultCredential(tenantID, appID, cl, cert, key)
 	}
-	return keyvault.NewClient(vaultName, tenantID, appID, cl, cert, key)
+	cred, err := keyvault.NewCredential(tenantID, appID, cl, cert, key)
+	if err != nil {
+		return nil, err
+	}
+	return azureKeyVaultCredential{cred}, nil
+}
+
+// azureKeyVaultCredential adapts *keyvault.Credential to keyVaultCredential.
+type azureKeyVaultCredential struct {
+	cred *keyvault.Credential
+}
+
+func (c azureKeyVaultCredential) vaultClient(vaultName string) (keyVaultManager, error) {
+	cl, err := c.cred.NewClient(vaultName)
+	if err != nil {
+		return nil, err
+	}
+	return cl, nil
 }

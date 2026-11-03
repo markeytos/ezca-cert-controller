@@ -162,6 +162,10 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 		}
 		return ctrl.Result{}, err
 	}
+	if isSecretReplica(&secret) {
+		refuseReplicaSecret(mc, &secret)
+		return ctrl.Result{}, nil
+	}
 
 	// Tolerate an empty Secret (present but without certificate material) as a
 	// bootstrap trigger, unless a rotation is already staged in it.
@@ -217,23 +221,21 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 
 	result, coreErr := reconcileCertState(ctx, r, mc, &secret, chain, key, now, tel)
 
-	if mc.Spec.KeyVault != nil {
-		// Key Vault sync authenticates to the vault AS this credential's app using
-		// the active certificate, which only works once that certificate has been
-		// registered on the app registration (via addKey). If it is not registered
-		// yet, syncing would just fail vault authentication on every reconcile, so
-		// skip it and surface the real reason instead of a misleading Key Vault
-		// error that masks the missing registration.
-		if appConfigured(mc) && !leafRegisteredInEntra(mc, chain[0]) {
-			logf.FromContext(ctx).Info("Skipping Key Vault sync: certificate is not registered on the app registration",
-				"thumbprint", pki.Thumbprint(chain[0]), "appID", *mc.Spec.AppID)
-			if coreErr == nil {
-				setDegraded(mc, "CertificateNotRegisteredOnApp",
-					"Certificate is not registered on the app registration, so it cannot authenticate to Key Vault; the app registration (addKey) must succeed first")
-			}
-		} else {
-			syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
+	// Key Vault sync authenticates to the vault AS this credential's app using
+	// the active certificate, which only works once that certificate has been
+	// registered on the app registration (via addKey). If it is not registered
+	// yet, syncing would just fail vault authentication on every reconcile, so
+	// skip it and surface the real reason instead of a misleading Key Vault
+	// error that masks the missing registration.
+	if len(mc.Spec.KeyVaults) > 0 && appConfigured(mc) && !leafRegisteredInEntra(mc, chain[0]) {
+		logf.FromContext(ctx).Info("Skipping Key Vault sync: certificate is not registered on the app registration",
+			"thumbprint", pki.Thumbprint(chain[0]), "appID", *mc.Spec.AppID)
+		if coreErr == nil {
+			setDegraded(mc, "CertificateNotRegisteredOnApp",
+				"Certificate is not registered on the app registration, so it cannot authenticate to Key Vault; the app registration (addKey) must succeed first")
 		}
+	} else {
+		syncKeyVaultBestEffort(ctx, r, mc, &secret, now, tel, &result, coreErr)
 	}
 	return result, coreErr
 }
@@ -408,7 +410,7 @@ func (r *ManagedCredentialReconciler) finishIssuance(mc *ezcav1.ManagedCredentia
 	mc.Status.LastRenewalTime = &metav1.Time{Time: now}
 	clearPending(mc.StatusBase())
 	setAvailable(mc, successReason, "Certificate issued successfully")
-	if mc.Spec.KeyVault != nil {
+	if len(mc.Spec.KeyVaults) > 0 {
 		// Hand off to the steady-state path so the new certificate syncs to Key
 		// Vault once it is usable — that is, after its propagation grace, which
 		// the Key Vault sync measures from when the certificate was registered
@@ -620,6 +622,9 @@ func (r *ManagedCredentialReconciler) identityRefCertKey(ctx context.Context, mc
 	var s corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: secretNS, Name: base.CertSecretName}, &s); err != nil {
 		return nil, nil, nil, fmt.Errorf("getting referenced identity's Secret: %w", err)
+	}
+	if isSecretReplica(&s) {
+		return nil, nil, nil, fmt.Errorf("referenced identity %q uses Secret %s/%s, a copy kept by ClusterCertIdentity %q, as its certificate Secret", ref.Name, s.Namespace, s.Name, s.Annotations[secretReplicaOfAnnotation])
 	}
 	chain, key, err := parseSecret(&s)
 	if err != nil {

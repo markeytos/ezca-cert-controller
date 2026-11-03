@@ -19,6 +19,7 @@ package v1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -95,6 +96,42 @@ type CertIdentityStatusBase struct {
 	// +listMapKey=thumbprint
 	// +optional
 	ManagedKeyCredentials []ManagedKeyCredential `json:"managedKeyCredentials,omitempty"`
+
+	// keyVaults records, for each spec.keyVaults entry, the certificate the
+	// vault was last confirmed to hold. A vault already recorded with the
+	// active certificate is not contacted again until that certificate
+	// changes or 24 hours have passed since syncedAt, so most reconciles make
+	// no Key Vault calls, and a failing vault is the only one retried. A vault
+	// certificate changed outside the controller is therefore corrected within
+	// a day; remove its entry from spec.keyVaults and add it back to force a
+	// sync sooner.
+	// +listType=map
+	// +listMapKey=vaultName
+	// +listMapKey=certName
+	// +optional
+	KeyVaults []KeyVaultSyncStatus `json:"keyVaults,omitempty"`
+}
+
+// KeyVaultSyncStatus records the certificate last synced to one Key Vault
+// certificate (spec.keyVaults).
+type KeyVaultSyncStatus struct {
+	// vaultName is the name of the Azure Key Vault.
+	// +required
+	VaultName string `json:"vaultName"`
+
+	// certName is the name of the certificate in that vault.
+	// +required
+	CertName string `json:"certName"`
+
+	// thumbprint is the SHA-1 thumbprint (hex) of the certificate the vault
+	// was last confirmed to hold.
+	// +required
+	Thumbprint string `json:"thumbprint"`
+
+	// syncedAt is when the vault was confirmed to hold that certificate,
+	// either by importing it or by finding it already there.
+	// +optional
+	SyncedAt *metav1.Time `json:"syncedAt,omitempty"`
 }
 
 type CertIdentitySpecBase struct {
@@ -166,15 +203,22 @@ type CertIdentitySpecBase struct {
 	// +kubebuilder:validation:MinLength=1
 	AppInsightsConnString *string `json:"appInsightsConnString,omitempty"`
 
-	// keyVault, when set, keeps a certificate in an Azure Key Vault in sync with
-	// the Secret. On every reconcile the controller ensures the named vault
-	// certificate matches the Secret, importing the current certificate (and
-	// key) whenever they differ. The controller authenticates to the vault as
-	// the identity's app using its certificate, so this requires the app fields
-	// (tenantID, appID, appObjectID) and the app service principal must have get
-	// and import permission on the vault.
+	// keyVaults are Azure Key Vault certificates to keep in sync with the
+	// Secret. The controller checks each named vault certificate against the
+	// Secret whenever the certificate changes and at least daily, importing
+	// the current certificate (and key) whenever they differ. Each vault is synced independently, so one
+	// failing vault does not hold back the others; the identity reports Degraded
+	// (KeyVaultSyncFailed) naming every vault that could not be synced. The
+	// controller authenticates to every vault as the identity's app using its
+	// certificate, so this requires the app fields (tenantID, appID,
+	// appObjectID) and the app service principal must have get and import
+	// permission on each vault. A vault removed from this list is left as it is.
 	// +optional
-	KeyVault *KeyVaultSpec `json:"keyVault,omitempty"`
+	// +listType=map
+	// +listMapKey=vaultName
+	// +listMapKey=certName
+	// +kubebuilder:validation:MaxItems=200
+	KeyVaults []KeyVaultSpec `json:"keyVaults,omitempty"`
 
 	// renewalThreshold is the percentage of the certificate's total lifetime
 	// remaining at or below which the certificate is renewed.
@@ -193,9 +237,10 @@ type CertIdentitySpecBase struct {
 // app is configured, rotates the renewed certificate onto the app registration.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.tenantID) == has(self.appID) && has(self.appID) == has(self.appObjectID)",message="tenantID, appID, and appObjectID must be set together"
-// +kubebuilder:validation:XValidation:rule="!has(self.keyVault) || has(self.appID)",message="keyVault requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
+// +kubebuilder:validation:XValidation:rule="!has(self.keyVaults) || size(self.keyVaults) == 0 || has(self.appID)",message="keyVaults requires the Entra app fields (tenantID, appID, appObjectID); the certificate authenticates to Key Vault as that app"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
+// +kubebuilder:validation:XValidation:rule="!has(self.secretReplicas) || !has(self.certSecretNamespace) || self.secretReplicas.all(r, r.namespace != self.certSecretNamespace || r.name != self.certSecretName)",message="secretReplicas must not name the certificate Secret itself"
 type ClusterCertIdentitySpec struct {
 	CertIdentitySpecBase `json:",inline"`
 
@@ -203,6 +248,7 @@ type ClusterCertIdentitySpec struct {
 	// empty it defaults to the namespace the controller runs in.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	CertSecretNamespace string `json:"certSecretNamespace,omitempty"`
 
 	// allowedNamespaces is the set of namespaces whose ManagedCredentials may
@@ -210,25 +256,70 @@ type ClusterCertIdentitySpec struct {
 	// their certificate. Because a ClusterCertIdentity is cluster-scoped, a
 	// reference lets the referencing ManagedCredential issue certificates as
 	// this identity's Entra app; this allowlist bounds which namespaces may do
-	// so. It is required and must be non-empty: a ClusterCertIdentity that lists
-	// no namespaces can be referenced by no one.
-	// +required
-	// +kubebuilder:validation:MinItems=1
+	// so. When empty, no ManagedCredential may reference this identity. It does
+	// not govern secretReplicas.
+	// +optional
 	// +kubebuilder:validation:items:MinLength=1
-	AllowedNamespaces []string `json:"allowedNamespaces"`
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
+
+	// secretReplicas are Secrets the controller keeps as read-only copies of
+	// the certificate Secret, for workloads in other namespaces that use the
+	// same certificate. Each copy is a kubernetes.io/tls Secret holding only the
+	// active tls.crt and tls.key; a renewed certificate reaches the copies once
+	// it is promoted into the certificate Secret. The copies are never renewed
+	// or rotated on their own: this identity remains the only one renewing the
+	// certificate, rotating it onto the app registrations, and syncing Key
+	// Vault.
+	//
+	// A copy holds the identity's private key, so listing a namespace here
+	// gives that namespace the identity itself. The controller creates each
+	// copy and never overwrites a Secret that is not a kubernetes.io/tls copy
+	// it wrote. It takes over a copy written for another ClusterCertIdentity
+	// only once that identity no longer lists it (for example after a rename).
+	// A copy removed from this list is deleted, unless it was unmarked or
+	// replaced since, in which case it is left alone. Deleting the
+	// ClusterCertIdentity leaves its copies in place. No identity may use a
+	// copy as its own certificate Secret. The SecretReplicasSynced condition
+	// reports whether every copy is up to date.
+	// +optional
+	// +listType=map
+	// +listMapKey=namespace
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=200
+	SecretReplicas []SecretReplica `json:"secretReplicas,omitempty"`
+}
+
+// SecretReplica names one Secret kept as a copy of a ClusterCertIdentity's
+// certificate Secret (spec.secretReplicas).
+type SecretReplica struct {
+	// namespace is the namespace of the copy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace string `json:"namespace"`
+
+	// name is the name of the copy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	Name string `json:"name"`
 }
 
 // KeyVaultSpec identifies an Azure Key Vault certificate to keep in sync with
-// the controller-managed certificate.
+// the controller-managed certificate (spec.keyVaults).
 type KeyVaultSpec struct {
 	// vaultName is the name of the Azure Key Vault (not the full URL).
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=24
 	VaultName string `json:"vaultName"`
 
 	// certName is the name of the certificate in the vault to keep in sync.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=127
 	CertName string `json:"certName"`
 }
 
@@ -319,6 +410,30 @@ type ClusterCertIdentityStatus struct {
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
 	CertIdentityStatusBase `json:",inline"`
+
+	// secretReplicas are the copies of the certificate Secret the controller
+	// wrote for spec.secretReplicas, by UID. Only a Secret recorded here is
+	// ever deleted, and only while it still has the recorded UID.
+	// +listType=map
+	// +listMapKey=namespace
+	// +listMapKey=name
+	// +optional
+	SecretReplicas []SecretReplicaStatus `json:"secretReplicas,omitempty"`
+}
+
+// SecretReplicaStatus records one Secret replica the controller wrote.
+type SecretReplicaStatus struct {
+	// namespace is the namespace of the copy.
+	// +required
+	Namespace string `json:"namespace"`
+
+	// name is the name of the copy.
+	// +required
+	Name string `json:"name"`
+
+	// uid is the UID of the copy the controller wrote.
+	// +required
+	UID types.UID `json:"uid"`
 }
 
 // +kubebuilder:object:root=true
@@ -327,6 +442,7 @@ type ClusterCertIdentityStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
 // +kubebuilder:printcolumn:name="Expiration",type=string,JSONPath=".status.notAfter"
 // +kubebuilder:printcolumn:name="Thumbprint",type=string,JSONPath=".status.thumbprint"
+// +kubebuilder:printcolumn:name="Replicas",type=string,JSONPath=".status.conditions[?(@.type=='SecretReplicasSynced')].status"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // ClusterCertIdentity is the Schema for the clustercertidentities API
