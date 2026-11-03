@@ -1049,6 +1049,77 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(syncedVaults()).To(ConsistOf("vault-prod", "vault-dr"))
 	})
 
+	It("checks each synced Key Vault again a day after it was confirmed, repairing one changed outside the controller", func() {
+		const prodVault, testVault = "recheck-prod", "recheck-test"
+
+		certPEM, keyPEM, _ := genCert("kvrecheck.ezca.io", now.Add(-10*day), now.Add(90*day))
+		createSecret("kvrecheck-secret", certPEM, keyPEM)
+
+		vaults := map[string]*fakeKeyVault{
+			prodVault: {},
+			testVault: {matchErr: errors.New("Forbidden: missing get permission")},
+		}
+		reconciler.NewKeyVaultCredential = func(_, _ string, _ keyvault.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (keyVaultCredential, error) {
+			return fakeKeyVaultCredential{open: func(name string) *fakeKeyVault { return vaults[name] }}, nil
+		}
+
+		cci := createIdentity("kvrecheck-identity", "kvrecheck-secret", ezcav1.CloudPublic, true)
+		cci.Spec.KeyVaults = []ezcav1.KeyVaultSpec{
+			{VaultName: prodVault, CertName: certName},
+			{VaultName: testVault, CertName: certName},
+		}
+		Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+		// The prod vault syncs now; the test vault only once it is fixed, 6h
+		// later, so the two come due at different times.
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].imported).To(HaveLen(1))
+
+		clockNow = now.Add(6 * time.Hour)
+		vaults[testVault].matchErr = nil
+		res, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[testVault].imported).To(HaveLen(1))
+		Expect(vaults[prodVault].matchCalls).To(Equal(1))
+		Expect(res.RequeueAfter).To(Equal(18*time.Hour), "comes back when the prod vault is due")
+
+		// Just before the prod vault is due, neither vault is contacted.
+		clockNow = now.Add(keyVaultRecheck - time.Minute)
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].matchCalls).To(Equal(1))
+		Expect(vaults[testVault].matchCalls).To(Equal(2))
+
+		// A day on, the prod vault is checked again; it still holds the
+		// certificate, so nothing is imported but the check is recorded.
+		clockNow = now.Add(keyVaultRecheck)
+		vaults[prodVault].matches = true
+		res, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[prodVault].matchCalls).To(Equal(2))
+		Expect(vaults[prodVault].imported).To(HaveLen(1))
+		Expect(vaults[testVault].matchCalls).To(Equal(2))
+		Expect(res.RequeueAfter).To(Equal(6*time.Hour), "comes back when the test vault is due")
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cci)).To(Succeed())
+		for _, kv := range cci.Status.KeyVaults {
+			if kv.VaultName == prodVault {
+				Expect(kv.SyncedAt.Time).To(BeTemporally("==", clockNow))
+			}
+		}
+
+		// The test vault's certificate was replaced outside the controller;
+		// its daily check finds that and imports the active certificate again.
+		clockNow = now.Add(6*time.Hour + keyVaultRecheck)
+		res, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(vaults[testVault].matchCalls).To(Equal(3))
+		Expect(vaults[testVault].imported).To(HaveLen(2))
+		Expect(vaults[prodVault].matchCalls).To(Equal(2))
+		Expect(res.RequeueAfter).To(Equal(18*time.Hour), "comes back when the prod vault is due")
+	})
+
 	It("rejects keyVaults without the Entra app fields", func() {
 		ezcaURL := testEZCAURL
 		cci := &ezcav1.ClusterCertIdentity{

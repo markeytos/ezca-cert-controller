@@ -78,6 +78,11 @@ const (
 	// propagationRequeue is how often the controller retries a Key Vault sync
 	// whose certificate has not propagated yet.
 	propagationRequeue = 30 * time.Second
+	// keyVaultRecheck is how long a vault recorded as holding the active
+	// certificate goes before it is checked again, so a vault certificate
+	// changed outside the controller is corrected within this interval rather
+	// than only at the next renewal.
+	keyVaultRecheck = 24 * time.Hour
 	// propagationVerifications is how many consecutive checks, spaced evenly
 	// across the propagation grace, a staged certificate must pass before it is
 	// promoted. One successful token only shows that one token-endpoint
@@ -1044,9 +1049,10 @@ func setTLSData(secret *corev1.Secret, certKey, keyKey string, chain []*x509.Cer
 }
 
 // syncKeyVaultBestEffort runs the Key Vault sync without letting it override a
-// successful core result. Vaults status already records as holding the active
-// certificate are skipped, so a steady-state reconcile makes no Key Vault
-// calls. It defers while a freshly changed certificate is still propagating
+// successful core result. Vaults status records as holding the active
+// certificate within the last keyVaultRecheck are skipped, so most
+// steady-state reconciles make no Key Vault calls. It defers while a freshly
+// changed certificate is still propagating
 // across Entra ID token replicas, and treats the "certificate not yet
 // registered" auth error as a quiet, transient retry rather than a hard
 // failure.
@@ -1069,10 +1075,14 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	thumbprint := pki.Thumbprint(chain[0])
 	var pending []ezcav1.KeyVaultSpec
 	for _, kv := range spec.KeyVaults {
-		if !keyVaultHolds(status, kv, thumbprint) {
+		if !keyVaultHolds(status, kv, thumbprint, now) {
 			pending = append(pending, kv)
 		}
 	}
+	// Come back when the first vault skipped here is due to be checked again.
+	// A vault synced in this pass is due a full keyVaultRecheck from now, no
+	// sooner than any skipped one.
+	requeueAtMost(result, nextKeyVaultRecheck(status, thumbprint, now))
 	if len(pending) == 0 {
 		return
 	}
@@ -1173,14 +1183,31 @@ func syncKeyVault(ctx context.Context, cred keyVaultCredential, obj certIdentity
 }
 
 // keyVaultHolds reports whether status records the vault certificate kv as
-// holding the certificate with the given thumbprint.
-func keyVaultHolds(status *ezcav1.CertIdentityStatusBase, kv ezcav1.KeyVaultSpec, thumbprint string) bool {
+// holding the certificate with the given thumbprint, confirmed less than
+// keyVaultRecheck before now.
+func keyVaultHolds(status *ezcav1.CertIdentityStatusBase, kv ezcav1.KeyVaultSpec, thumbprint string, now time.Time) bool {
 	for _, s := range status.KeyVaults {
 		if s.VaultName == kv.VaultName && s.CertName == kv.CertName {
-			return s.Thumbprint == thumbprint
+			return s.Thumbprint == thumbprint && s.SyncedAt != nil && now.Sub(s.SyncedAt.Time) < keyVaultRecheck
 		}
 	}
 	return false
+}
+
+// nextKeyVaultRecheck returns how long until the first vault status records as
+// holding the certificate with the given thumbprint is due to be checked
+// again, or keyVaultRecheck when none is.
+func nextKeyVaultRecheck(status *ezcav1.CertIdentityStatusBase, thumbprint string, now time.Time) time.Duration {
+	next := keyVaultRecheck
+	for _, s := range status.KeyVaults {
+		if s.Thumbprint != thumbprint || s.SyncedAt == nil {
+			continue
+		}
+		if d := s.SyncedAt.Add(keyVaultRecheck).Sub(now); d > 0 && d < next {
+			next = d
+		}
+	}
+	return next
 }
 
 // setKeyVaultSynced records that the vault certificate kv holds the

@@ -149,9 +149,9 @@ spec:
               keyVaults:
                 description: |-
                   keyVaults are Azure Key Vault certificates to keep in sync with the
-                  Secret. On every reconcile the controller ensures each named vault
-                  certificate matches the Secret, importing the current certificate (and
-                  key) whenever they differ. Each vault is synced independently, so one
+                  Secret. The controller checks each named vault certificate against the
+                  Secret whenever the certificate changes and at least daily, importing
+                  the current certificate (and key) whenever they differ. Each vault is synced independently, so one
                   failing vault does not hold back the others; the identity reports Degraded
                   (KeyVaultSyncFailed) naming every vault that could not be synced. The
                   controller authenticates to every vault as the identity's app using its
@@ -294,11 +294,11 @@ spec:
                   keyVaults records, for each spec.keyVaults entry, the certificate the
                   vault was last confirmed to hold. A vault already recorded with the
                   active certificate is not contacted again until that certificate
-                  changes, so a steady-state reconcile makes no Key Vault calls, and a
-                  failing vault is the only one retried. A vault certificate changed
-                  outside the controller is therefore not corrected until the next
-                  renewal; remove its entry from spec.keyVaults and add it back to force a
-                  sync.
+                  changes or 24 hours have passed since syncedAt, so most reconciles make
+                  no Key Vault calls, and a failing vault is the only one retried. A vault
+                  certificate changed outside the controller is therefore corrected within
+                  a day; remove its entry from spec.keyVaults and add it back to force a
+                  sync sooner.
                 items:
                   description: |-
                     KeyVaultSyncStatus records the certificate last synced to one Key Vault
