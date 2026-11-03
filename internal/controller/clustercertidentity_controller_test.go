@@ -245,8 +245,13 @@ type fakeKeyVault struct {
 	matches    bool
 	matchErr   error
 	matchCalls int
-	imported   [][]byte
+	imported   []kvImport
 	importErr  error
+}
+
+type kvImport struct {
+	chain []*x509.Certificate
+	key   *rsa.PrivateKey
 }
 
 func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool, error) {
@@ -254,11 +259,11 @@ func (f *fakeKeyVault) CertificateMatches(_ context.Context, _, _ string) (bool,
 	return f.matches, f.matchErr
 }
 
-func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, bundle []byte) error {
-	if len(bundle) <= 0 {
+func (f *fakeKeyVault) ImportCertificate(_ context.Context, _ string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if len(chain) <= 0 {
 		return f.importErr
 	}
-	f.imported = append(f.imported, bundle)
+	f.imported = append(f.imported, kvImport{chain: chain, key: key})
 	return nil
 }
 
@@ -886,7 +891,7 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 	})
 
 	It("imports the certificate into Key Vault when it differs, and skips when it matches", func() {
-		certPEM, keyPEM, _ := genCert("kv.ezca.io", now.Add(-10*day), now.Add(90*day))
+		certPEM, keyPEM, cert := genCert("kv.ezca.io", now.Add(-10*day), now.Add(90*day))
 		createSecret("kv-secret", certPEM, keyPEM)
 
 		ezcaURL := testEZCAURL
@@ -914,13 +919,14 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(k8sClient.Create(ctx, cci)).To(Succeed())
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
 
-		// Key Vault differs -> import a PEM bundle (cert chain + key).
+		// Key Vault differs -> import the Secret's cert chain and key.
 		kvClient.matches = false
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kvClient.imported).To(HaveLen(1))
-		Expect(string(kvClient.imported[0])).To(ContainSubstring("BEGIN CERTIFICATE"))
-		Expect(string(kvClient.imported[0])).To(ContainSubstring("PRIVATE KEY"))
+		Expect(kvClient.imported[0].chain).NotTo(BeEmpty())
+		Expect(kvClient.imported[0].chain[0].Equal(cert)).To(BeTrue())
+		Expect(kvClient.imported[0].key.PublicKey.Equal(cert.PublicKey)).To(BeTrue())
 
 		// Status now records the vault as holding the certificate, so the next
 		// reconcile does not contact Key Vault at all.

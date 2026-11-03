@@ -116,7 +116,7 @@ type entraManager interface {
 // *keyvault.Client; overridable in tests.
 type keyVaultManager interface {
 	CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error)
-	ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error
+	ImportCertificate(ctx context.Context, certName string, chain []*x509.Certificate, key *rsa.PrivateKey) error
 }
 
 // keyVaultCredential opens the Key Vaults an identity syncs to, all
@@ -1102,13 +1102,6 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 		reportKeyVaultFailure(obj, result, coreErr, err.Error())
 		return
 	}
-	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
-	if err != nil {
-		log.Error(err, "Failed to encode private key for Key Vault sync")
-		reportKeyVaultFailure(obj, result, coreErr, err.Error())
-		return
-	}
-	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
 
 	// Each vault is synced independently: a vault that cannot be reached (for
 	// example one whose access policy is missing) must not hold back the
@@ -1117,7 +1110,7 @@ func syncKeyVaultBestEffort(ctx context.Context, d reconcilerDeps, obj certIdent
 	propagating := false
 	var failed []string
 	for _, kv := range pending {
-		kvErr := syncKeyVault(ctx, cred, obj, kv, thumbprint, bundle, tel)
+		kvErr := syncKeyVault(ctx, cred, obj, kv, thumbprint, chain, key, tel)
 		if kvErr == nil {
 			setKeyVaultSynced(status, kv, thumbprint, now)
 			continue
@@ -1154,11 +1147,11 @@ func reportKeyVaultFailure(obj certIdentity, result *ctrl.Result, coreErr error,
 }
 
 // syncKeyVault ensures one configured Key Vault certificate matches the active
-// Secret certificate (thumbprint), importing bundle (its chain and key) when
-// they differ. It authenticates to the vault as the identity's app using that
+// Secret certificate (thumbprint), importing its chain and key when they
+// differ. It authenticates to the vault as the identity's app using that
 // certificate, so keyVaults requires the app fields (enforced by CRD
 // validation).
-func syncKeyVault(ctx context.Context, cred keyVaultCredential, obj certIdentity, kv ezcav1.KeyVaultSpec, thumbprint string, bundle []byte, tel *telemetry.Telemetry) error {
+func syncKeyVault(ctx context.Context, cred keyVaultCredential, obj certIdentity, kv ezcav1.KeyVaultSpec, thumbprint string, chain []*x509.Certificate, key *rsa.PrivateKey, tel *telemetry.Telemetry) error {
 	cl, err := cred.vaultClient(kv.VaultName)
 	if err != nil {
 		return err
@@ -1170,7 +1163,7 @@ func syncKeyVault(ctx context.Context, cred keyVaultCredential, obj certIdentity
 	if match {
 		return nil
 	}
-	if err := cl.ImportCertificate(ctx, kv.CertName, bundle); err != nil {
+	if err := cl.ImportCertificate(ctx, kv.CertName, chain, key); err != nil {
 		return err
 	}
 	logf.FromContext(ctx).Info("Updated Key Vault certificate",
