@@ -116,7 +116,7 @@ type entraManager interface {
 // *keyvault.Client; overridable in tests.
 type keyVaultManager interface {
 	CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error)
-	ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error
+	ImportCertificate(ctx context.Context, certName string, chain []*x509.Certificate, key *rsa.PrivateKey) error
 }
 
 // certIdentity is the shared behavior of the certificate-identity kinds
@@ -1105,12 +1105,7 @@ func syncKeyVault(ctx context.Context, d reconcilerDeps, obj certIdentity, secre
 		return nil
 	}
 
-	keyPEM, err := pki.EncodeRSAPrivateKeyPEM(key)
-	if err != nil {
-		return err
-	}
-	bundle := append(pki.EncodeCertChainPEM(chain), keyPEM...)
-	if err := cl.ImportCertificate(ctx, spec.KeyVault.CertName, bundle); err != nil {
+	if err := cl.ImportCertificate(ctx, spec.KeyVault.CertName, chain, key); err != nil {
 		return err
 	}
 	logf.FromContext(ctx).Info("Updated Key Vault certificate",

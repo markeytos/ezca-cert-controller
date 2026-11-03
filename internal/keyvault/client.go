@@ -38,9 +38,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
-const pemContentType = "application/x-pem-file"
+const pkcs12ContentType = "application/x-pkcs12"
 
 // Cloud selects the Azure sovereign cloud.
 type Cloud string
@@ -105,7 +106,10 @@ func NewClient(vaultName, tenantID, appID string, cl Cloud, cert *x509.Certifica
 }
 
 // CertificateMatches reports whether the vault's current certificate has the
-// given SHA-1 thumbprint (uppercase hex). A missing certificate reports false.
+// given SHA-1 thumbprint (uppercase hex) and is stored as PKCS#12. A
+// certificate stored in another format (PEM, from earlier controller versions)
+// reports false so the sync re-imports it as PFX. A missing certificate reports
+// false.
 func (c *Client) CertificateMatches(ctx context.Context, certName, thumbprint string) (bool, error) {
 	resp, err := c.certs.GetCertificate(ctx, certName, "", nil)
 	if err != nil {
@@ -119,15 +123,46 @@ func (c *Client) CertificateMatches(ctx context.Context, certName, thumbprint st
 		return false, nil
 	}
 	sum := sha1.Sum(resp.CER)
-	return strings.EqualFold(thumbprint, hex.EncodeToString(sum[:])), nil
+	if !strings.EqualFold(thumbprint, hex.EncodeToString(sum[:])) {
+		return false, nil
+	}
+	// An unreported content type is taken as current, so a vault that omits it
+	// is not re-imported on every sync.
+	ct := secretContentType(resp.Certificate)
+	return ct == "" || strings.EqualFold(ct, pkcs12ContentType), nil
 }
 
-// ImportCertificate imports a PEM bundle (certificate chain plus private key)
-// into the vault under certName, creating or updating it.
-func (c *Client) ImportCertificate(ctx context.Context, certName string, pemBundle []byte) error {
-	b64 := base64.StdEncoding.EncodeToString(pemBundle)
-	contentType := pemContentType
-	_, err := c.certs.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
+// secretContentType returns the content type of the certificate's secret, from
+// the certificate itself or else its policy, or "" when the vault reports
+// neither.
+func secretContentType(cert azcertificates.Certificate) string {
+	if cert.ContentType != nil {
+		return *cert.ContentType
+	}
+	if cert.Policy != nil && cert.Policy.SecretProperties != nil && cert.Policy.SecretProperties.ContentType != nil {
+		return *cert.Policy.SecretProperties.ContentType
+	}
+	return ""
+}
+
+// ImportCertificate imports the certificate chain (leaf first) and its private
+// key into the vault under certName as a PKCS#12 (PFX) bundle, creating or
+// updating it. PFX is the format Azure consumers of vault certificates (App
+// Service, Application Gateway) require.
+func (c *Client) ImportCertificate(ctx context.Context, certName string, chain []*x509.Certificate, key *rsa.PrivateKey) error {
+	if len(chain) == 0 {
+		return errors.New("keyvault: empty certificate chain")
+	}
+	// Key Vault does not keep the import password and exports the secret with
+	// an empty one, so the bundle uses an empty password too. LegacyDES is the
+	// encoding the widest range of PFX readers accept.
+	pfx, err := pkcs12.LegacyDES.Encode(key, chain[0], chain[1:], "")
+	if err != nil {
+		return fmt.Errorf("keyvault: encode PFX: %w", err)
+	}
+	b64 := base64.StdEncoding.EncodeToString(pfx)
+	contentType := pkcs12ContentType
+	_, err = c.certs.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
 		Base64EncodedCertificate: &b64,
 		CertificatePolicy: &azcertificates.CertificatePolicy{
 			SecretProperties: &azcertificates.SecretProperties{ContentType: &contentType},
