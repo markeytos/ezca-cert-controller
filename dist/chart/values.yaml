@@ -61,6 +61,17 @@ clusterIdentity:
   #   name: my-app-cert
   # - namespace: my-app-test-slot
   #   name: my-app-cert
+  ## Label selector for namespaces that each get a copy named secretReplicaName,
+  ## in addition to secretReplicas. A namespace opts in by carrying the labels;
+  ## a copy whose namespace stops matching is deleted, and deleting the
+  ## namespace deletes its copy. Only In and Exists expressions are accepted.
+  ## Anyone who can label a namespace to match can read the private key.
+  ## Deleting the identity leaves the copies behind. Blank -> none.
+  secretReplicaNamespaceSelector: {}
+  #   matchLabels:
+  #     ezca.keytos.io/bootstrap-certificate: my-identity
+  ## Name of the copy in each selected namespace. Required with the selector.
+  secretReplicaName: ""
   ## Key Vault certificates to keep in sync with the Secret, each synced
   ## independently. Needs appID/appObjectID and global.tenantID: the controller
   ## authenticates to every vault as this app, which needs get + import on each.
