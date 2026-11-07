@@ -17,5 +17,14 @@ spec:
   secretReplicas:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .secretReplicaNamespaceSelector }}
+  secretReplicaNamespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  secretReplicaName: {{ required "clusterIdentity.secretReplicaName is required with secretReplicaNamespaceSelector" $.Values.clusterIdentity.secretReplicaName | quote }}
+  {{- else }}
+  {{- if .secretReplicaName }}
+  {{- fail "clusterIdentity.secretReplicaName is set without secretReplicaNamespaceSelector, so no copy would be made" }}
+  {{- end }}
+  {{- end }}
 {{- end }}
 {{- end }}
