@@ -91,6 +91,7 @@ func (r *CertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	originalStatus := ci.Status.DeepCopy()
 	result, reconcileErr := r.reconcile(ctx, &ci, tel)
+	r.warnIfExpiring(ctx, &ci, r.now(), tel, &result)
 
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the CertIdentity watch.
@@ -123,6 +124,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 			// by the cluster operator, we cannot do anything
 			setDegraded(ci, "CertificateNotBootstrapped",
 				fmt.Sprintf("Certificate Secret %s not found; an administrator must bootstrap it", secretName))
+			reportLostCertificate(ci, secretName, tel)
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
 		return ctrl.Result{}, err
@@ -134,6 +136,7 @@ func (r *CertIdentityReconciler) reconcile(ctx context.Context, ci *ezcav1.CertI
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse certificate Secret", identityProps(ci))
 		setDegraded(ci, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}

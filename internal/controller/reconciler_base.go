@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
@@ -25,14 +26,17 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	ezca "github.com/markeytos/ezca-go"
 
 	"github.com/markeytos/ezca-cert-controller/internal/entra"
 	"github.com/markeytos/ezca-cert-controller/internal/keyvault"
+	"github.com/markeytos/ezca-cert-controller/internal/telemetry"
 )
 
 // specOrDeletionChanged filters the events of a reconciler's own resource down
@@ -73,6 +77,13 @@ type ReconcilerBase struct {
 	// It is in memory only: a restart can cost at most one more issuance.
 	issuedMu sync.Mutex
 	issued   map[types.UID]heldIssuance
+
+	// expiryWarned records when each identity's close-to-expiry certificate
+	// was last reported, by object UID, so the report repeats only every
+	// expiryWarningInterval. It is in memory only: a restart reports again at
+	// once.
+	expiryMu     sync.Mutex
+	expiryWarned map[types.UID]time.Time
 }
 
 // heldIssuance is an issued certificate awaiting storage. replaces is the
@@ -119,6 +130,49 @@ func (r *ReconcilerBase) releaseIssued(uid types.UID) {
 	r.issuedMu.Lock()
 	defer r.issuedMu.Unlock()
 	delete(r.issued, uid)
+}
+
+// warnIfExpiring reports an identity whose active certificate has used up half
+// of its renewal window without being renewed (see expiryWarningTime), or has
+// expired, whatever stopped the renewal: a failure already reported, or one
+// that was not, such as a Secret that went missing. The certificate is read
+// from status, which keeps the last one observed even when the Secret cannot
+// be read. The report repeats at most every expiryWarningInterval, and result
+// is shortened so the identity is reconciled again when the next one is due.
+func (r *ReconcilerBase) warnIfExpiring(ctx context.Context, obj certIdentity, now time.Time, tel *telemetry.Telemetry, result *ctrl.Result) {
+	status := obj.StatusBase()
+	if status.NotBefore == nil || status.NotAfter == nil {
+		return
+	}
+	notAfter := status.NotAfter.Time
+	warnAt := expiryWarningTime(status.NotBefore.Time, notAfter, obj.SpecBase().RenewalThreshold)
+
+	r.expiryMu.Lock()
+	defer r.expiryMu.Unlock()
+	if now.Before(warnAt) {
+		delete(r.expiryWarned, obj.GetUID())
+		requeueAtMost(result, warnAt.Sub(now))
+		return
+	}
+	requeueAtMost(result, expiryWarningInterval)
+	if last, ok := r.expiryWarned[obj.GetUID()]; ok && now.Sub(last) < expiryWarningInterval {
+		return
+	}
+	if r.expiryWarned == nil {
+		r.expiryWarned = map[types.UID]time.Time{}
+	}
+	r.expiryWarned[obj.GetUID()] = now
+
+	props := identityProps(obj)
+	props["notAfter"] = notAfter.UTC().Format(time.RFC3339)
+	message := "Certificate is close to expiry and has not been renewed"
+	err := fmt.Errorf("certificate %s expires at %s and has not been renewed", status.Thumbprint, props["notAfter"])
+	if !notAfter.After(now) {
+		message = "Certificate has expired"
+		err = fmt.Errorf("certificate %s expired at %s", status.Thumbprint, props["notAfter"])
+	}
+	logf.FromContext(ctx).Error(err, message, "thumbprint", status.Thumbprint, "notAfter", notAfter)
+	tel.TrackError(err, message, props)
 }
 
 // PropagationTiming bounds how long the controller waits for a key added to an

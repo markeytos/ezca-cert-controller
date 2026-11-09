@@ -88,6 +88,10 @@ const (
 	// promoted. One successful token only shows that one token-endpoint
 	// replica holds the new key.
 	propagationVerifications = 3
+	// expiryWarningInterval is how often an identity whose certificate is close
+	// to expiry (see expiryWarningTime) is reported again while it stays that
+	// way.
+	expiryWarningInterval = 6 * time.Hour
 )
 
 const (
@@ -470,6 +474,7 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 	for _, appID := range promotionAppIDs(spec, activeValid) {
 		cl, err := d.newEntraClient(*spec.TenantID, appID, cloudFor(spec.Cloud), pendingLeaf, pendingKey)
 		if err != nil {
+			tel.TrackError(err, "Failed to create Entra ID client to verify renewed certificate", identityPropsForApp(obj, appID))
 			return ctrl.Result{}, err
 		}
 		verr := cl.VerifyCredential(ctx)
@@ -657,10 +662,12 @@ func propagationAnchor(obj certIdentity, thumbprint string) time.Time {
 func renew(ctx context.Context, d reconcilerDeps, obj certIdentity, current *x509.Certificate, key *rsa.PrivateKey, tel *telemetry.Telemetry) ([]*x509.Certificate, *rsa.PrivateKey, error) {
 	csrDER, newKey, err := pki.BuildRenewalCSR(current)
 	if err != nil {
+		tel.TrackError(err, "Failed to build renewal CSR", identityProps(obj))
 		return nil, nil, err
 	}
 	renewer, err := d.newEZCAClient(*obj.SpecBase().EZCAURL)
 	if err != nil {
+		tel.TrackError(err, "Failed to create EZCA client", identityProps(obj))
 		return nil, nil, err
 	}
 	newChain, err := renewer.RenewCertificateV3(ctx, current, key, csrDER, pki.ValidityInDays(current))
@@ -687,6 +694,7 @@ func manageApp(ctx context.Context, d reconcilerDeps, obj certIdentity, authCert
 	status := obj.StatusBase()
 	cl, err := d.newEntraClient(*spec.TenantID, *spec.AppID, cloudFor(spec.Cloud), authCert, authKey)
 	if err != nil {
+		tel.TrackError(err, "Failed to create Entra ID client for app registration", identityProps(obj))
 		return err
 	}
 	objectID := *spec.AppObjectID
@@ -1243,6 +1251,14 @@ func pruneKeyVaultStatus(spec *ezcav1.CertIdentitySpecBase, status *ezcav1.CertI
 	status.KeyVaults = kept
 }
 
+// expiryWarningTime is when a certificate valid from notBefore to notAfter has
+// used up half of its renewal window (the last thresholdPct percent of its
+// lifetime) without being replaced, and is reported as close to expiry.
+func expiryWarningTime(notBefore, notAfter time.Time, thresholdPct int32) time.Time {
+	lifetime := notAfter.Sub(notBefore)
+	return notAfter.Add(-time.Duration(float64(lifetime) * float64(thresholdPct) / 200))
+}
+
 // requeueAtMost lowers result.RequeueAfter to d if it is currently unset or
 // longer than d.
 func requeueAtMost(result *ctrl.Result, d time.Duration) {
@@ -1406,6 +1422,16 @@ func identityProps(obj certIdentity) map[string]string {
 		props["appID"] = *spec.AppID
 	}
 	return props
+}
+
+// reportLostCertificate reports a certificate Secret that is missing or empty
+// after the identity had a certificate, so whatever used it has lost it. An
+// identity that was never bootstrapped is only marked Degraded.
+func reportLostCertificate(obj certIdentity, secretName types.NamespacedName, tel *telemetry.Telemetry) {
+	if obj.StatusBase().Thumbprint == "" {
+		return
+	}
+	tel.TrackError(fmt.Errorf("certificate Secret %s holds no certificate", secretName), "Certificate Secret lost its certificate", identityProps(obj))
 }
 
 // identityPropsForApp extends identityProps with the app registration an

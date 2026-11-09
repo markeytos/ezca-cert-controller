@@ -52,6 +52,12 @@ func New(connString *string) *Telemetry {
 	return &Telemetry{ikey: ikey, endpoint: endpoint, enabled: true}
 }
 
+// NewWithClient builds an enabled Telemetry that reports through client, so
+// tests can capture what the controller reports.
+func NewWithClient(client appinsights.TelemetryClient) *Telemetry {
+	return &Telemetry{enabled: true, client: client}
+}
+
 // parseConnString extracts the instrumentation key and (optional) ingestion
 // track endpoint from an Application Insights connection string. A bare
 // instrumentation key is also accepted.
