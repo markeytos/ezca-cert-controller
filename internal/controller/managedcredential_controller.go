@@ -118,6 +118,7 @@ func (r *ManagedCredentialReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	originalStatus := mc.Status.DeepCopy()
 	result, reconcileErr := r.reconcile(ctx, &mc, tel)
+	r.warnIfExpiring(ctx, &mc, r.now(), tel, &result)
 
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the ManagedCredential watch.
@@ -146,6 +147,7 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	// The desired subject and SANs; used for both issuance and drift detection.
 	req, err := certRequestFromSpec(mc)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse subject alternative names", identityProps(mc))
 		setDegraded(mc, "InvalidSANs", fmt.Sprintf("Invalid subject alternative names: %v", err))
 		return ctrl.Result{}, nil
 	}
@@ -155,7 +157,7 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	if err := r.Get(ctx, secretName, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			if !canSelfBootstrap(mc) {
-				return r.requireBootstrap(mc, secretName), nil
+				return r.requireBootstrap(mc, secretName, tel), nil
 			}
 			// No Secret yet: bootstrap by issuing the first certificate.
 			return r.issueAndStore(ctx, mc, nil, nil, nil, req, now, tel, "Bootstrapped")
@@ -171,13 +173,14 @@ func (r *ManagedCredentialReconciler) reconcile(ctx context.Context, mc *ezcav1.
 	// bootstrap trigger, unless a rotation is already staged in it.
 	if isEmptyTLSSecret(&secret) && !hasPendingCert(&secret) {
 		if !canSelfBootstrap(mc) {
-			return r.requireBootstrap(mc, secretName), nil
+			return r.requireBootstrap(mc, secretName, tel), nil
 		}
 		return r.issueAndStore(ctx, mc, &secret, nil, nil, req, now, tel, "Bootstrapped")
 	}
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse certificate Secret", identityProps(mc))
 		setDegraded(mc, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
@@ -250,17 +253,20 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 
 	caID, err := uuid.Parse(mc.Spec.CAID)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse spec.caID", identityProps(mc))
 		setDegraded(mc, "InvalidCAID", fmt.Sprintf("spec.caID is not a valid UUID: %v", err))
 		return ctrl.Result{}, nil
 	}
 	templateID, err := uuid.Parse(mc.Spec.TemplateID)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse spec.templateID", identityProps(mc))
 		setDegraded(mc, "InvalidTemplateID", fmt.Sprintf("spec.templateID is not a valid UUID: %v", err))
 		return ctrl.Result{}, nil
 	}
 
 	signOpts, err := signOptions(mc, req)
 	if err != nil {
+		tel.TrackError(err, "Failed to build certificate options", identityProps(mc))
 		setDegraded(mc, "InvalidSignOptions", fmt.Sprintf("Invalid certificate options: %v", err))
 		return ctrl.Result{}, nil
 	}
@@ -286,12 +292,14 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 
 	issuer, err := r.newEZCAIssuer(ctx, *mc.Spec.EZCAURL, cred, azureCloudFor(mc.Spec.Cloud), caID, templateID)
 	if err != nil {
+		tel.TrackError(err, "Failed to create EZCA issuer", identityProps(mc))
 		setDegraded(mc, "IssuerUnavailable", fmt.Sprintf("Could not create EZCA issuer: %v", err))
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 
 	csrDER, newKey, err := pki.BuildIssuanceCSR(req)
 	if err != nil {
+		tel.TrackError(err, "Failed to build issuance CSR", identityProps(mc))
 		setDegraded(mc, "CSRFailed", fmt.Sprintf("Could not build issuance CSR: %v", err))
 		return ctrl.Result{}, err
 	}
@@ -310,6 +318,7 @@ func (r *ManagedCredentialReconciler) issueAndStore(ctx context.Context, mc *ezc
 	// match the desired subject/SANs, surface Degraded (and do not store or
 	// register it) instead of re-issuing on the next pass.
 	if !pki.LeafMatchesSpec(newLeaf, req) {
+		tel.TrackError(errors.New("issued certificate does not match spec.subjectName and SANs"), "Issued certificate does not match spec", identityProps(mc))
 		setDegraded(mc, "IssuedCertificateMismatch",
 			"Issued certificate does not match spec.subjectName and SANs; check the CA and template configuration")
 		return ctrl.Result{RequeueAfter: maxRequeueAfter}, nil
@@ -565,9 +574,10 @@ func canSelfBootstrap(mc *ezcav1.ManagedCredential) bool {
 // and no identityRef to issue one, so an administrator must provision the
 // Secret. It mirrors how ClusterCertIdentity/CertIdentity treat a missing
 // certificate.
-func (r *ManagedCredentialReconciler) requireBootstrap(mc *ezcav1.ManagedCredential, secretName types.NamespacedName) ctrl.Result {
+func (r *ManagedCredentialReconciler) requireBootstrap(mc *ezcav1.ManagedCredential, secretName types.NamespacedName, tel *telemetry.Telemetry) ctrl.Result {
 	setDegraded(mc, "CertificateNotBootstrapped",
 		fmt.Sprintf("Certificate Secret %s has no certificate and spec.identityRef is not set to bootstrap one; an administrator must provision it", secretName))
+	reportLostCertificate(mc, secretName, tel)
 	return ctrl.Result{RequeueAfter: time.Minute}
 }
 

@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,7 +41,8 @@ import (
 
 const (
 	// secretReplicaLabel marks a Secret the controller wrote as a copy of a
-	// ClusterCertIdentity's certificate Secret (spec.secretReplicas).
+	// ClusterCertIdentity's certificate Secret (spec.secretReplicas or
+	// spec.secretReplicaNamespaceSelector).
 	secretReplicaLabel      = "ezca.keytos.io/secret-replica"
 	secretReplicaLabelValue = "true"
 	// secretReplicaOfAnnotation names the ClusterCertIdentity a copy belongs
@@ -52,7 +54,8 @@ const (
 	secretReplicaOfAnnotation = "ezca.keytos.io/replica-of"
 
 	// typeSecretReplicasSynced reports whether every copy listed in
-	// spec.secretReplicas holds the active certificate. It is kept apart from
+	// spec.secretReplicas or selected by spec.secretReplicaNamespaceSelector
+	// holds the active certificate. It is kept apart from
 	// Available and Degraded, which describe the certificate itself.
 	typeSecretReplicasSynced = "SecretReplicasSynced"
 
@@ -89,7 +92,7 @@ func (s *replicaSync) add(err error) {
 }
 
 // isSecretReplica reports whether secret is a copy a ClusterCertIdentity keeps
-// (spec.secretReplicas). The identity overwrites a copy whenever it changes,
+// (spec.secretReplicas or spec.secretReplicaNamespaceSelector). The identity overwrites a copy whenever it changes,
 // so no identity may use one as its own certificate Secret.
 func isSecretReplica(secret *corev1.Secret) bool {
 	return secret.Labels[secretReplicaLabel] == secretReplicaLabelValue
@@ -99,17 +102,101 @@ func isSecretReplica(secret *corev1.Secret) bool {
 // Secret watch reconciles obj again once the Secret changes.
 func refuseReplicaSecret(obj certIdentity, secret *corev1.Secret) {
 	setDegraded(obj, "CertificateSecretIsReplica", fmt.Sprintf(
-		"Certificate Secret %s/%s is a copy kept by ClusterCertIdentity %q (spec.secretReplicas); it is renewed through that identity, so it cannot be used as a certificate Secret",
+		"Certificate Secret %s/%s is a copy kept by ClusterCertIdentity %q (spec.secretReplicas or spec.secretReplicaNamespaceSelector); it is renewed through that identity, so it cannot be used as a certificate Secret",
 		secret.Namespace, secret.Name, secret.Annotations[secretReplicaOfAnnotation]))
 }
 
+// desiredSecretReplicas returns every copy cci keeps: those listed in
+// spec.secretReplicas and, in each namespace spec.secretReplicaNamespaceSelector
+// selects, one named spec.secretReplicaName. When the selected namespaces
+// cannot be determined it returns the listed copies alone, with the error.
+func (r *ClusterCertIdentityReconciler) desiredSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity) ([]types.NamespacedName, error) {
+	desired := make([]types.NamespacedName, 0, len(cci.Spec.SecretReplicas))
+	seen := make(map[types.NamespacedName]bool, len(cci.Spec.SecretReplicas))
+	for _, rep := range cci.Spec.SecretReplicas {
+		key := types.NamespacedName{Namespace: rep.Namespace, Name: rep.Name}
+		desired = append(desired, key)
+		seen[key] = true
+	}
+	if cci.Spec.SecretReplicaNamespaceSelector == nil {
+		return desired, nil
+	}
+	selector, err := replicaNamespaceSelector(cci.Spec.SecretReplicaNamespaceSelector)
+	if err != nil {
+		return desired, err
+	}
+	var namespaces corev1.NamespaceList
+	if err := r.List(ctx, &namespaces, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return desired, fmt.Errorf("failed to list namespaces selected by secretReplicaNamespaceSelector: %w", err)
+	}
+	for i := range namespaces.Items {
+		ns := &namespaces.Items[i]
+		key := types.NamespacedName{Namespace: ns.Name, Name: cci.Spec.SecretReplicaName}
+		if ns.DeletionTimestamp.IsZero() && !seen[key] {
+			desired = append(desired, key)
+			seen[key] = true
+		}
+	}
+	return desired, nil
+}
+
+// replicaNamespaceSelector converts a secretReplicaNamespaceSelector into a
+// labels.Selector. It refuses an empty selector and any operator other than
+// In and Exists even though the CRD already does, since a selector that
+// matched by a label's absence would copy the private key into namespaces
+// that never opted in.
+func replicaNamespaceSelector(sel *ezcav1.SecretReplicaNamespaceSelector) (labels.Selector, error) {
+	ls := &metav1.LabelSelector{MatchLabels: sel.MatchLabels}
+	for _, req := range sel.MatchExpressions {
+		if req.Operator != metav1.LabelSelectorOpIn && req.Operator != metav1.LabelSelectorOpExists {
+			return nil, fmt.Errorf("invalid secretReplicaNamespaceSelector: operator %q is not In or Exists", req.Operator)
+		}
+		ls.MatchExpressions = append(ls.MatchExpressions, metav1.LabelSelectorRequirement{
+			Key: req.Key, Operator: req.Operator, Values: req.Values,
+		})
+	}
+	selector, err := metav1.LabelSelectorAsSelector(ls)
+	if err != nil {
+		return nil, fmt.Errorf("invalid secretReplicaNamespaceSelector: %w", err)
+	}
+	if selector.Empty() {
+		return nil, errors.New("invalid secretReplicaNamespaceSelector: it must not be empty")
+	}
+	return selector, nil
+}
+
+// replicasConfigured reports whether cci asks for any copies, listed or
+// selected.
+func replicasConfigured(cci *ezcav1.ClusterCertIdentity) bool {
+	return len(cci.Spec.SecretReplicas) > 0 || cci.Spec.SecretReplicaNamespaceSelector != nil
+}
+
+// namespaceSelected reports whether cci's secretReplicaNamespaceSelector
+// selects ns. A terminating namespace is never selected.
+func namespaceSelected(cci *ezcav1.ClusterCertIdentity, ns *corev1.Namespace) bool {
+	if cci.Spec.SecretReplicaNamespaceSelector == nil || !ns.DeletionTimestamp.IsZero() {
+		return false
+	}
+	selector, err := replicaNamespaceSelector(cci.Spec.SecretReplicaNamespaceSelector)
+	return err == nil && selector.Matches(labels.Set(ns.Labels))
+}
+
 // pruneSecretReplicas deletes the copies the controller recorded writing that
-// are no longer listed in spec.secretReplicas. A recorded copy is deleted only
-// while it still has the recorded UID and is still marked as this identity's
-// copy; otherwise it is no longer the controller's, and is forgotten instead.
-func (r *ClusterCertIdentityReconciler) pruneSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, rs *replicaSync) {
+// are no longer desired. A recorded copy is deleted only while it still has
+// the recorded UID and is still marked as this identity's copy; otherwise it
+// is no longer the controller's, and is forgotten instead. When
+// selectionKnown is false the selected namespaces could not be determined, so
+// a copy named spec.secretReplicaName may still be selected and is kept; any
+// other copy no longer listed is deleted as usual.
+func (r *ClusterCertIdentityReconciler) pruneSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, desired []types.NamespacedName, selectionKnown bool, rs *replicaSync) {
+	keep := make(map[types.NamespacedName]bool, len(desired))
+	for _, key := range desired {
+		keep[key] = true
+	}
+	mayBeSelected := !selectionKnown && cci.Spec.SecretReplicaNamespaceSelector != nil
 	cci.Status.SecretReplicas = slices.DeleteFunc(cci.Status.SecretReplicas, func(rec ezcav1.SecretReplicaStatus) bool {
-		if replicaListed(cci, rec.Namespace, rec.Name) {
+		if keep[types.NamespacedName{Namespace: rec.Namespace, Name: rec.Name}] ||
+			(mayBeSelected && rec.Name == cci.Spec.SecretReplicaName) {
 			return false
 		}
 		forget, err := r.deleteSecretReplica(ctx, cci, rec)
@@ -163,9 +250,9 @@ func (r *ClusterCertIdentityReconciler) deleteSecretReplica(ctx context.Context,
 }
 
 // syncSecretReplicas writes the active certificate of the source Secret into
-// every copy listed in spec.secretReplicas.
-func (r *ClusterCertIdentityReconciler) syncSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, source types.NamespacedName, tel *telemetry.Telemetry, rs *replicaSync) {
-	if len(cci.Spec.SecretReplicas) == 0 {
+// every desired copy.
+func (r *ClusterCertIdentityReconciler) syncSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, source types.NamespacedName, desired []types.NamespacedName, tel *telemetry.Telemetry, rs *replicaSync) {
+	if len(desired) == 0 {
 		return
 	}
 	// Read the Secret as stored rather than the copy the state machine wrote
@@ -182,10 +269,13 @@ func (r *ClusterCertIdentityReconciler) syncSecretReplicas(ctx context.Context, 
 		return
 	}
 	data := map[string][]byte{tlsCertKey: src.Data[tlsCertKey], tlsKeyKey: src.Data[tlsKeyKey]}
-	for _, rep := range cci.Spec.SecretReplicas {
-		key := types.NamespacedName{Namespace: rep.Namespace, Name: rep.Name}
+	for _, key := range desired {
 		if key == source {
-			rs.add(fmt.Errorf("secret replica %s is the certificate Secret itself", key))
+			// A selected namespace may be the certificate Secret's own, which
+			// already holds the certificate; only a listed copy is a mistake.
+			if replicaListed(cci, key.Namespace, key.Name) {
+				rs.add(fmt.Errorf("secret replica %s is the certificate Secret itself", key))
+			}
 			continue
 		}
 		if err := r.writeSecretReplica(ctx, cci, key, data, tel); err != nil {
@@ -275,8 +365,14 @@ func (r *ClusterCertIdentityReconciler) checkWritable(ctx context.Context, cci *
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err == nil && replicaTracked(&other, client.ObjectKeyFromObject(existing)) {
-		return fmt.Errorf("already exists as a copy for ClusterCertIdentity %q", owner)
+	if err == nil {
+		tracked, err := r.replicaTracked(ctx, &other, client.ObjectKeyFromObject(existing))
+		if err != nil {
+			return err
+		}
+		if tracked {
+			return fmt.Errorf("already exists as a copy for ClusterCertIdentity %q", owner)
+		}
 	}
 	logf.FromContext(ctx).Info("Taking over Secret replica no longer claimed by its ClusterCertIdentity",
 		"namespace", existing.Namespace, "name", existing.Name, "previousOwner", owner)
@@ -305,7 +401,7 @@ func reportSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, 
 		requeueAtMost(result, replicaRaceRequeue)
 		return
 	}
-	if len(cci.Spec.SecretReplicas) == 0 && len(status.SecretReplicas) == 0 {
+	if !replicasConfigured(cci) && len(status.SecretReplicas) == 0 {
 		meta.RemoveStatusCondition(&status.Conditions, typeSecretReplicasSynced)
 		return
 	}
@@ -313,14 +409,21 @@ func reportSecretReplicas(ctx context.Context, cci *ezcav1.ClusterCertIdentity, 
 		Type:    typeSecretReplicasSynced,
 		Status:  metav1.ConditionTrue,
 		Reason:  "Synced",
-		Message: "Every Secret replica holds the active certificate",
+		Message: replicasSyncedMessage(len(status.SecretReplicas)),
 	})
 }
 
+func replicasSyncedMessage(n int) string {
+	if n == 0 {
+		return "No Secret replica is listed or selected"
+	}
+	return fmt.Sprintf("All %d Secret replicas hold the active certificate", n)
+}
+
 // blockSecretReplicas records, for a pass that stopped before the certificate
-// Secret could be used, that the listed copies could not be synced.
-func blockSecretReplicas(cci *ezcav1.ClusterCertIdentity, rs *replicaSync) {
-	if len(cci.Spec.SecretReplicas) > 0 {
+// Secret could be used, that the desired copies could not be synced.
+func blockSecretReplicas(desired []types.NamespacedName, rs *replicaSync) {
+	if len(desired) > 0 {
 		rs.add(errCertificateSecretUnusable)
 	}
 }
@@ -331,10 +434,28 @@ func replicaListed(cci *ezcav1.ClusterCertIdentity, namespace, name string) bool
 	})
 }
 
-// replicaTracked reports whether cci lists or has recorded a copy at key.
-func replicaTracked(cci *ezcav1.ClusterCertIdentity, key types.NamespacedName) bool {
-	return replicaListed(cci, key.Namespace, key.Name) || slices.ContainsFunc(cci.Status.SecretReplicas, func(rec ezcav1.SecretReplicaStatus) bool {
+// replicaTracked reports whether cci lists, selects, or has recorded a copy at
+// key.
+func (r *ClusterCertIdentityReconciler) replicaTracked(ctx context.Context, cci *ezcav1.ClusterCertIdentity, key types.NamespacedName) (bool, error) {
+	if replicaListed(cci, key.Namespace, key.Name) || slices.ContainsFunc(cci.Status.SecretReplicas, func(rec ezcav1.SecretReplicaStatus) bool {
 		return rec.Namespace == key.Namespace && rec.Name == key.Name
+	}) {
+		return true, nil
+	}
+	if cci.Spec.SecretReplicaNamespaceSelector == nil || key.Name != cci.Spec.SecretReplicaName {
+		return false, nil
+	}
+	var ns corev1.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Name: key.Namespace}, &ns); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return namespaceSelected(cci, &ns), nil
+}
+
+// replicaRecordedIn reports whether cci has recorded a copy in namespace.
+func replicaRecordedIn(cci *ezcav1.ClusterCertIdentity, namespace string) bool {
+	return slices.ContainsFunc(cci.Status.SecretReplicas, func(rec ezcav1.SecretReplicaStatus) bool {
+		return rec.Namespace == namespace
 	})
 }
 

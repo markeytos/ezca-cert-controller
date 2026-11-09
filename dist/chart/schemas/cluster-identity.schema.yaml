@@ -69,6 +69,70 @@ properties:
           maxLength: 253
           pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
 
+  secretReplicaNamespaceSelector:
+    description: Label selector for namespaces that each receive a read-only copy of the certificate Secret named secretReplicaName, in addition to secretReplicas. A namespace opts in by carrying the labels; a copy whose namespace stops matching is deleted. Only In and Exists are accepted, so a namespace is never selected for lacking a label. Anyone who can set these labels on a namespace can read the private key. Deleting the identity leaves the copies behind. Blank ({}) means none.
+    type: object
+    additionalProperties: false
+    # Either blank, or at least one label or expression: a selector with both
+    # left empty would match every namespace.
+    anyOf:
+      - maxProperties: 0
+      - required: [matchLabels]
+        properties:
+          matchLabels:
+            minProperties: 1
+      - required: [matchExpressions]
+        properties:
+          matchExpressions:
+            minItems: 1
+    properties:
+      matchLabels:
+        type: object
+        maxProperties: 20
+        additionalProperties:
+          type: string
+          maxLength: 63
+      matchExpressions:
+        type: array
+        maxItems: 20
+        items:
+          type: object
+          additionalProperties: false
+          required: [key, operator]
+          properties:
+            key:
+              type: string
+              minLength: 1
+              maxLength: 317
+            operator:
+              description: In (the label has one of values) or Exists (the label is present).
+              type: string
+              enum: [In, Exists]
+            values:
+              type: array
+              maxItems: 50
+              items:
+                type: string
+                maxLength: 63
+          if:
+            properties:
+              operator:
+                const: In
+          then:
+            required: [values]
+            properties:
+              values:
+                minItems: 1
+          else:
+            properties:
+              values:
+                maxItems: 0
+  secretReplicaName:
+    description: Name of the copy written into each namespace secretReplicaNamespaceSelector selects. Required with that selector.
+    type: string
+    maxLength: 253
+    pattern: ^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+
   keyVaults:
     description: Optional Key Vault certificates to keep in sync with the Secret, each synced independently. Needs the Entra app fields, which the chart checks while rendering; the app needs get and import permission on every vault.
     type: array

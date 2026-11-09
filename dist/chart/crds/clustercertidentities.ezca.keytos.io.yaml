@@ -112,7 +112,7 @@ spec:
                   reference lets the referencing ManagedCredential issue certificates as
                   this identity's Entra app; this allowlist bounds which namespaces may do
                   so. When empty, no ManagedCredential may reference this identity. It does
-                  not govern secretReplicas.
+                  not govern secretReplicas or secretReplicaNamespaceSelector.
                 items:
                   minLength: 1
                   type: string
@@ -218,6 +218,97 @@ spec:
                 maximum: 99
                 minimum: 1
                 type: integer
+              secretReplicaName:
+                description: |-
+                  secretReplicaName is the name of the copy written into each namespace
+                  secretReplicaNamespaceSelector selects. It must be set together with
+                  secretReplicaNamespaceSelector.
+                maxLength: 253
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                type: string
+              secretReplicaNamespaceSelector:
+                description: |-
+                  secretReplicaNamespaceSelector selects namespaces that each receive a
+                  copy of the certificate Secret named secretReplicaName, in addition to
+                  the copies listed in secretReplicas. A namespace opts in by carrying
+                  the selected labels, so the labels on the namespaces are the list, and
+                  a namespace created or labeled later receives its copy without a change
+                  to this identity. A copy is kept exactly like one listed in
+                  secretReplicas: it is deleted once its namespace stops matching, and
+                  deleting the namespace deletes the copy with it. A terminating
+                  namespace is not selected. In the certificate Secret's own namespace,
+                  a copy that would be the certificate Secret itself is skipped. As with
+                  secretReplicas, deleting the ClusterCertIdentity leaves every copy in
+                  place, in every namespace it selected; clear this selector and let the
+                  copies be deleted before deleting the identity to remove them.
+
+                  Anyone who can label a namespace to match can obtain the identity's
+                  private key, so choose labels only trusted parties may set. For the
+                  same reason the selector has the shape of a label selector but accepts
+                  only requirements a namespace meets by carrying a label, never by
+                  lacking one, and it must not be empty. It must be set together with
+                  secretReplicaName.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions are further requirements on namespace
+                      labels.
+                    items:
+                      description: |-
+                        NamespaceSelectorRequirement is one requirement on a namespace label
+                        (spec.secretReplicaNamespaceSelector.matchExpressions).
+                      properties:
+                        key:
+                          description: key is the label key the requirement applies
+                            to.
+                          maxLength: 317
+                          minLength: 1
+                          type: string
+                        operator:
+                          description: |-
+                            operator is In, met when the namespace carries the label with one of
+                            values, or Exists, met when it carries the label with any value. NotIn
+                            and DoesNotExist are not accepted: they would select a namespace for
+                            lacking a label, which anyone able to create a namespace can arrange.
+                          enum:
+                          - In
+                          - Exists
+                          type: string
+                        values:
+                          description: values are the label values accepted by operator
+                            In.
+                          items:
+                            maxLength: 63
+                            type: string
+                          maxItems: 50
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                      x-kubernetes-validations:
+                      - message: values must be non-empty for operator In and empty
+                          for operator Exists
+                        rule: 'self.operator == ''In'' ? (has(self.values) && size(self.values)
+                          > 0) : (!has(self.values) || size(self.values) == 0)'
+                    maxItems: 20
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels selects namespaces carrying each of these labels with the
+                      given value.
+                    maxProperties: 20
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: secretReplicaNamespaceSelector must not be empty; an empty
+                    selector would copy the private key into every namespace
+                  rule: (has(self.matchLabels) && size(self.matchLabels) > 0) || (has(self.matchExpressions)
+                    && size(self.matchExpressions) > 0)
               secretReplicas:
                 description: |-
                   secretReplicas are Secrets the controller keeps as read-only copies of
@@ -293,6 +384,9 @@ spec:
               rule: '!has(self.secretReplicas) || !has(self.certSecretNamespace) ||
                 self.secretReplicas.all(r, r.namespace != self.certSecretNamespace
                 || r.name != self.certSecretName)'
+            - message: secretReplicaNamespaceSelector and secretReplicaName must be
+                set together
+              rule: has(self.secretReplicaNamespaceSelector) == has(self.secretReplicaName)
           status:
             description: status defines the observed state of ClusterCertIdentity
             properties:
@@ -536,7 +630,8 @@ spec:
               secretReplicas:
                 description: |-
                   secretReplicas are the copies of the certificate Secret the controller
-                  wrote for spec.secretReplicas, by UID. Only a Secret recorded here is
+                  wrote for spec.secretReplicas and spec.secretReplicaNamespaceSelector,
+                  by UID. Only a Secret recorded here is
                   ever deleted, and only while it still has the recorded UID.
                 items:
                   description: SecretReplicaStatus records one Secret replica the

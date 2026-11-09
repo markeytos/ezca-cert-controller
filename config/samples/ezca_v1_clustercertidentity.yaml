@@ -33,6 +33,16 @@ spec:
   #     name: my-app-cert
   #   - namespace: my-app-test-slot
   #     name: my-app-cert
+  # Optional: also copy the certificate Secret, as secretReplicaName, into every
+  # namespace carrying these labels. A namespace opts in by being labeled; a
+  # copy whose namespace stops matching is deleted, and deleting the namespace
+  # deletes its copy. Anyone who can label a namespace to match can read the
+  # private key, so pick labels only trusted parties may set. matchExpressions
+  # accepts only In and Exists. Deleting this identity leaves the copies behind.
+  # secretReplicaNamespaceSelector:
+  #   matchLabels:
+  #     ezca.keytos.io/bootstrap-certificate: sample-cluster-cert-identity
+  # secretReplicaName: my-app-cert
   # Optional Entra ID app registration to rotate the certificate onto. tenantID,
   # appID, and appObjectID must be set together; omit all three for a
   # certificate-only identity. appObjectID is the app registration's directory

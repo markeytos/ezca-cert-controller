@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
@@ -52,6 +53,7 @@ type ClusterCertIdentityReconciler struct {
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ezca.keytos.io,resources=clustercertidentities/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile renews the identity's certificate before it expires and rotates it
 // onto the configured Entra ID app registration.
@@ -90,6 +92,7 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	originalStatus := cci.Status.DeepCopy()
 	result, reconcileErr := r.reconcile(ctx, &cci, tel)
+	r.warnIfExpiring(ctx, &cci, r.now(), tel, &result)
 
 	// Only write status when it actually changed, so a steady-state reconcile
 	// does not trigger itself through the ClusterCertIdentity watch.
@@ -114,10 +117,14 @@ func (r *ClusterCertIdentityReconciler) Reconcile(ctx context.Context, req ctrl.
 // copies the active certificate into the Secret replicas, then optionally
 // mirrors it into Azure Key Vault.
 func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezcav1.ClusterCertIdentity, tel *telemetry.Telemetry) (ctrl.Result, error) {
-	// Copies dropped from spec.secretReplicas are deleted even while the
+	// Copies no longer listed or selected are deleted even while the
 	// certificate Secret is unusable.
 	rs := &replicaSync{}
-	r.pruneSecretReplicas(ctx, cci, rs)
+	desired, err := r.desiredSecretReplicas(ctx, cci)
+	if err != nil {
+		rs.add(err)
+	}
+	r.pruneSecretReplicas(ctx, cci, desired, err == nil, rs)
 
 	secretNS := cci.Spec.CertSecretNamespace
 	if secretNS == "" {
@@ -125,7 +132,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	}
 	if secretNS == "" {
 		setDegraded(cci, "NamespaceUnresolved", "Could not resolve the certificate Secret namespace; set spec.certSecretNamespace or POD_NAMESPACE")
-		blockSecretReplicas(cci, rs)
+		blockSecretReplicas(desired, rs)
 		result := ctrl.Result{}
 		reportSecretReplicas(ctx, cci, rs, tel, &result)
 		return result, nil
@@ -137,7 +144,8 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 		if apierrors.IsNotFound(err) {
 			setDegraded(cci, "CertificateNotBootstrapped",
 				fmt.Sprintf("Certificate Secret %s not found; an administrator must bootstrap it", secretName))
-			blockSecretReplicas(cci, rs)
+			reportLostCertificate(cci, secretName, tel)
+			blockSecretReplicas(desired, rs)
 			result := ctrl.Result{RequeueAfter: time.Minute}
 			reportSecretReplicas(ctx, cci, rs, tel, &result)
 			return result, nil
@@ -146,7 +154,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 	}
 	if isSecretReplica(&secret) {
 		refuseReplicaSecret(cci, &secret)
-		blockSecretReplicas(cci, rs)
+		blockSecretReplicas(desired, rs)
 		var result ctrl.Result
 		reportSecretReplicas(ctx, cci, rs, tel, &result)
 		return result, nil
@@ -154,8 +162,9 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 
 	chain, key, err := parseSecret(&secret)
 	if err != nil {
+		tel.TrackError(err, "Failed to parse certificate Secret", identityProps(cci))
 		setDegraded(cci, "InvalidCertificate", fmt.Sprintf("Certificate Secret %s is invalid: %v", secretName, err))
-		blockSecretReplicas(cci, rs)
+		blockSecretReplicas(desired, rs)
 		result := ctrl.Result{RequeueAfter: time.Minute}
 		reportSecretReplicas(ctx, cci, rs, tel, &result)
 		return result, nil
@@ -165,7 +174,7 @@ func (r *ClusterCertIdentityReconciler) reconcile(ctx context.Context, cci *ezca
 
 	result, coreErr := reconcileCertState(ctx, r, cci, &secret, chain, key, now, tel)
 
-	r.syncSecretReplicas(ctx, cci, secretName, tel, rs)
+	r.syncSecretReplicas(ctx, cci, secretName, desired, tel, rs)
 	reportSecretReplicas(ctx, cci, rs, tel, &result)
 	syncKeyVaultBestEffort(ctx, r, cci, &secret, now, tel, &result, coreErr)
 	return result, coreErr
@@ -176,6 +185,8 @@ func (r *ClusterCertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ezcav1.ClusterCertIdentity{}, builder.WithPredicates(specOrDeletionChanged)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretToRequests)).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.namespaceToRequests),
+			builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		Named("clustercertidentity").
 		Complete(r)
 }
@@ -183,10 +194,10 @@ func (r *ClusterCertIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error
 // secretToRequests maps a changed Secret to the ClusterCertIdentities that
 // reference it, so external edits to the bootstrapped certificate trigger a
 // reconcile, and a changed or deleted Secret at a replica's name to the
-// identities that list or recorded that replica, so the copy is restored or
-// its removal finished. The Secret's own markers are not consulted: they can
-// be stripped or forged, and an identity that neither lists nor recorded a
-// copy has nothing to do for it.
+// identities that list, select, or recorded that replica, so the copy is
+// restored or its removal finished. The Secret's own markers are not
+// consulted: they can be stripped or forged, and an identity that neither
+// lists, selects, nor recorded a copy has nothing to do for it.
 func (r *ClusterCertIdentityReconciler) secretToRequests(ctx context.Context, obj client.Object) []reconcile.Request {
 	secret, ok := obj.(*corev1.Secret)
 	if !ok {
@@ -203,7 +214,34 @@ func (r *ClusterCertIdentityReconciler) secretToRequests(ctx context.Context, ob
 		if ns == "" {
 			ns = r.DefaultNamespace
 		}
-		if (ns == secret.Namespace && cci.Spec.CertSecretName == secret.Name) || replicaTracked(cci, client.ObjectKeyFromObject(secret)) {
+		if ns == secret.Namespace && cci.Spec.CertSecretName == secret.Name {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+			continue
+		}
+		if tracked, err := r.replicaTracked(ctx, cci, client.ObjectKeyFromObject(secret)); err == nil && tracked {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
+		}
+	}
+	return reqs
+}
+
+// namespaceToRequests maps a created, relabeled, or deleted Namespace to the
+// ClusterCertIdentities whose secretReplicaNamespaceSelector selects it, so
+// the copy is written, and to those that recorded a copy in it, so a copy
+// whose namespace no longer matches is deleted.
+func (r *ClusterCertIdentityReconciler) namespaceToRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		return nil
+	}
+	var list ezcav1.ClusterCertIdentityList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		cci := &list.Items[i]
+		if namespaceSelected(cci, ns) || replicaRecordedIn(cci, ns.Name) {
 			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}})
 		}
 	}

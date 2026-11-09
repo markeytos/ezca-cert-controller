@@ -171,6 +171,19 @@ func (c notFoundSecretClient) Get(ctx context.Context, key client.ObjectKey, obj
 	return c.Client.Get(ctx, key, obj, opts...)
 }
 
+// namespaceListFailingClient fails every Namespace list, as an RBAC problem or
+// an API server outage would.
+type namespaceListFailingClient struct {
+	client.Client
+}
+
+func (c namespaceListFailingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.NamespaceList); ok {
+		return errors.New("namespaces is forbidden")
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
 // alreadyExistsClient answers every Secret create with AlreadyExists, as the
 // API server does when the cache has not yet seen a Secret that exists.
 type alreadyExistsClient struct {
@@ -2472,6 +2485,278 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 			}}
 			Expect(reconciler.secretToRequests(ctx, replica)).NotTo(ContainElement(
 				reconcile.Request{NamespacedName: types.NamespacedName{Name: "owner-identity"}}))
+		})
+
+		Describe("namespace selector", func() {
+			const (
+				selectorLabel = "ezca.keytos.io/bootstrap-certificate"
+				mapNS         = "sel-map-ns"
+			)
+
+			createLabeledNamespace := func(name, value string) {
+				Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+					Name: name, Labels: map[string]string{selectorLabel: value},
+				}})).To(Succeed())
+			}
+
+			setNamespaceLabel := func(name, value string) {
+				var ns corev1.Namespace
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name}, &ns)).To(Succeed())
+				if value == "" {
+					delete(ns.Labels, selectorLabel)
+				} else {
+					if ns.Labels == nil {
+						ns.Labels = map[string]string{}
+					}
+					ns.Labels[selectorLabel] = value
+				}
+				Expect(k8sClient.Update(ctx, &ns)).To(Succeed())
+			}
+
+			setSelector := func(cci *ezcav1.ClusterCertIdentity, value, name string) {
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cci.Spec.SecretReplicaNamespaceSelector = &ezcav1.SecretReplicaNamespaceSelector{MatchLabels: map[string]string{selectorLabel: value}}
+				cci.Spec.SecretReplicaName = name
+				Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+			}
+
+			It("copies into every selected namespace and follows the labels", func() {
+				createLabeledNamespace("sel-a", "sel-follow")
+				createLabeledNamespace("sel-b", "sel-follow")
+				createNamespace("sel-later")
+				createLabeledNamespace("sel-other", "something-else")
+				certPEM, keyPEM, _ := genCert("sel-follow.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-follow-src", certPEM, keyPEM)
+				cci := createIdentity("sel-follow", "sel-follow-src", ezcav1.CloudPublic, false)
+				setSelector(cci, "sel-follow", replicaName)
+				reconcileIdentity(cci)
+
+				for _, ns := range []string{"sel-a", "sel-b"} {
+					replica := getSecret(ns, replicaName)
+					Expect(replica.Data).To(Equal(map[string][]byte{tlsCertKey: certPEM, tlsKeyKey: keyPEM}))
+					Expect(replica.Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "sel-follow"))
+				}
+				Expect(secretExists("sel-later", replicaName)).To(BeFalse())
+				Expect(secretExists("sel-other", replicaName)).To(BeFalse())
+				Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+
+				// Labeling a namespace later opts it in; unlabeling opts it out.
+				setNamespaceLabel("sel-later", "sel-follow")
+				setNamespaceLabel("sel-b", "")
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-later", replicaName)).To(BeTrue())
+				Expect(secretExists("sel-b", replicaName)).To(BeFalse())
+				Expect(cci.Status.SecretReplicas).To(ConsistOf(
+					ezcav1.SecretReplicaStatus{Namespace: "sel-a", Name: replicaName, UID: getSecret("sel-a", replicaName).UID},
+					ezcav1.SecretReplicaStatus{Namespace: "sel-later", Name: replicaName, UID: getSecret("sel-later", replicaName).UID}))
+
+				// Dropping the selector deletes the selected copies.
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cci.Spec.SecretReplicaNamespaceSelector = nil
+				cci.Spec.SecretReplicaName = ""
+				Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-a", replicaName)).To(BeFalse())
+				Expect(secretExists("sel-later", replicaName)).To(BeFalse())
+				Expect(replicasCondition(cci)).To(BeNil())
+			})
+
+			It("keeps a copy both listed and selected once, and keeps it while either still wants it", func() {
+				createLabeledNamespace("sel-both", "sel-both")
+				certPEM, keyPEM, _ := genCert("sel-both.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-both-src", certPEM, keyPEM)
+				cci := createIdentity("sel-both", "sel-both-src", ezcav1.CloudPublic, false)
+				setReplicas(cci, ezcav1.SecretReplica{Namespace: "sel-both", Name: replicaName})
+				setSelector(cci, "sel-both", replicaName)
+				reconcileIdentity(cci)
+				Expect(cci.Status.SecretReplicas).To(HaveLen(1))
+
+				setReplicas(cci)
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-both", replicaName)).To(BeTrue())
+			})
+
+			It("skips the certificate Secret itself when its namespace is selected", func() {
+				certPEM, keyPEM, _ := genCert("sel-self.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-self-src", certPEM, keyPEM)
+				setNamespaceLabel(namespace, "sel-self")
+				DeferCleanup(setNamespaceLabel, namespace, "")
+				cci := createIdentity("sel-self", "sel-self-src", ezcav1.CloudPublic, false)
+				setSelector(cci, "sel-self", "sel-self-src")
+				reconcileIdentity(cci)
+				Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+				Expect(getSecret(namespace, "sel-self-src").Labels).NotTo(HaveKey(secretReplicaLabel))
+				Expect(cci.Status.SecretReplicas).To(BeEmpty())
+			})
+
+			It("reports synced when the selector matches no namespace", func() {
+				certPEM, keyPEM, _ := genCert("sel-none.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-none-src", certPEM, keyPEM)
+				cci := createIdentity("sel-none", "sel-none-src", ezcav1.CloudPublic, false)
+				setSelector(cci, "sel-none", replicaName)
+				reconcileIdentity(cci)
+				Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			})
+
+			It("does not take over a copy another identity selects", func() {
+				createLabeledNamespace("sel-taken", "sel-taken")
+				certPEM, keyPEM, _ := genCert("sel-taken.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-taken-src", certPEM, keyPEM)
+				a := createIdentity("sel-taken-a", "sel-taken-src", ezcav1.CloudPublic, false)
+				b := createIdentity("sel-taken-b", "sel-taken-src", ezcav1.CloudPublic, false)
+				setSelector(a, "sel-taken", replicaName)
+				reconcileIdentity(a)
+				// Lose a's record, so only its selector still claims the copy.
+				a.Status.SecretReplicas = nil
+				Expect(k8sClient.Status().Update(ctx, a)).To(Succeed())
+
+				setReplicas(b, ezcav1.SecretReplica{Namespace: "sel-taken", Name: replicaName})
+				reconcileIdentity(b)
+				Expect(replicasCondition(b).Message).To(ContainSubstring(`ClusterCertIdentity "sel-taken-a"`))
+				Expect(getSecret("sel-taken", replicaName).Annotations).To(HaveKeyWithValue(secretReplicaOfAnnotation, "sel-taken-a"))
+			})
+
+			It("maps namespaces and Secrets to the identities selecting or recording them", func() {
+				certPEM, keyPEM, _ := genCert("sel-map.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-map-src", certPEM, keyPEM)
+				createLabeledNamespace(mapNS, "sel-map")
+				cci := createIdentity("sel-map", "sel-map-src", ezcav1.CloudPublic, false)
+				setSelector(cci, "sel-map", replicaName)
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "sel-map"}}
+
+				labeled := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: mapNS, Labels: map[string]string{selectorLabel: "sel-map"}}}
+				Expect(reconciler.namespaceToRequests(ctx, labeled)).To(ContainElement(req))
+				unlabeled := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: mapNS}}
+				Expect(reconciler.namespaceToRequests(ctx, unlabeled)).NotTo(ContainElement(req))
+
+				Expect(reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: replicaName, Namespace: mapNS}})).To(ContainElement(req))
+				Expect(reconciler.secretToRequests(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "other-name", Namespace: mapNS}})).NotTo(ContainElement(req))
+
+				// Once a copy is recorded, its namespace maps even unlabeled, so
+				// the copy can be deleted.
+				reconcileIdentity(cci)
+				Expect(reconciler.namespaceToRequests(ctx, unlabeled)).To(ContainElement(req))
+			})
+
+			It("never selects a terminating namespace", func() {
+				cci := &ezcav1.ClusterCertIdentity{Spec: ezcav1.ClusterCertIdentitySpec{
+					SecretReplicaNamespaceSelector: &ezcav1.SecretReplicaNamespaceSelector{MatchLabels: map[string]string{selectorLabel: "x"}},
+					SecretReplicaName:              replicaName,
+				}}
+				ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns", Labels: map[string]string{selectorLabel: "x"}}}
+				Expect(namespaceSelected(cci, ns)).To(BeTrue())
+				deleting := metav1.NewTime(now)
+				ns.DeletionTimestamp = &deleting
+				Expect(namespaceSelected(cci, ns)).To(BeFalse())
+			})
+
+			It("requires the selector and name together, and a non-empty selector", func() {
+				certPEM, keyPEM, _ := genCert("sel-valid.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-valid-src", certPEM, keyPEM)
+				cci := createIdentity("sel-valid", "sel-valid-src", ezcav1.CloudPublic, false)
+
+				update := func(sel *ezcav1.SecretReplicaNamespaceSelector, name string) error {
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+					cci.Spec.SecretReplicaNamespaceSelector = sel
+					cci.Spec.SecretReplicaName = name
+					return k8sClient.Update(ctx, cci)
+				}
+				expectRejected := func(err error, msg string) {
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring(msg))
+				}
+				expr := func(op metav1.LabelSelectorOperator, values ...string) *ezcav1.SecretReplicaNamespaceSelector {
+					return &ezcav1.SecretReplicaNamespaceSelector{MatchExpressions: []ezcav1.NamespaceSelectorRequirement{{
+						Key: selectorLabel, Operator: op, Values: values,
+					}}}
+				}
+
+				expectRejected(update(&ezcav1.SecretReplicaNamespaceSelector{MatchLabels: map[string]string{selectorLabel: "x"}}, ""), "must be set together")
+				expectRejected(update(&ezcav1.SecretReplicaNamespaceSelector{}, replicaName), "must not be empty")
+				expectRejected(update(&ezcav1.SecretReplicaNamespaceSelector{MatchLabels: map[string]string{}}, replicaName), "must not be empty")
+				// Operators that select a namespace for lacking a label would let
+				// anyone who can create a namespace receive the private key.
+				expectRejected(update(expr(metav1.LabelSelectorOpDoesNotExist), replicaName), "Unsupported value")
+				expectRejected(update(expr(metav1.LabelSelectorOpNotIn, "x"), replicaName), "Unsupported value")
+				expectRejected(update(expr(metav1.LabelSelectorOpIn), replicaName), "values must be non-empty for operator In")
+				expectRejected(update(expr(metav1.LabelSelectorOpExists, "x"), replicaName), "empty for operator Exists")
+
+				Expect(update(expr(metav1.LabelSelectorOpExists), replicaName)).To(Succeed())
+				Expect(update(expr(metav1.LabelSelectorOpIn, "a", "b"), replicaName)).To(Succeed())
+			})
+
+			It("refuses operators other than In and Exists even if the API admits them", func() {
+				_, err := replicaNamespaceSelector(&ezcav1.SecretReplicaNamespaceSelector{
+					MatchExpressions: []ezcav1.NamespaceSelectorRequirement{{Key: selectorLabel, Operator: metav1.LabelSelectorOpDoesNotExist}},
+				})
+				Expect(err).To(MatchError(ContainSubstring("is not In or Exists")))
+				_, err = replicaNamespaceSelector(&ezcav1.SecretReplicaNamespaceSelector{})
+				Expect(err).To(MatchError(ContainSubstring("must not be empty")))
+			})
+
+			It("still deletes unlisted copies, but keeps selected ones, while the selector cannot be applied", func() {
+				createLabeledNamespace("sel-badsel", "sel-badsel")
+				certPEM, keyPEM, _ := genCert("sel-badsel.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-badsel-src", certPEM, keyPEM)
+				cci := createIdentity("sel-badsel", "sel-badsel-src", ezcav1.CloudPublic, false)
+				setReplicas(cci, ezcav1.SecretReplica{Namespace: "sel-badsel", Name: "listed"})
+				setSelector(cci, "sel-badsel", replicaName)
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-badsel", "listed")).To(BeTrue())
+				Expect(secretExists("sel-badsel", replicaName)).To(BeTrue())
+
+				// The API admits a label key the selector parser rejects.
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cci.Spec.SecretReplicas = nil
+				cci.Spec.SecretReplicaNamespaceSelector = &ezcav1.SecretReplicaNamespaceSelector{MatchLabels: map[string]string{"not a valid key!": "x"}}
+				Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+				res := reconcileIdentity(cci)
+				Expect(secretExists("sel-badsel", "listed")).To(BeFalse())
+				Expect(secretExists("sel-badsel", replicaName)).To(BeTrue())
+				Expect(res.RequeueAfter).To(BeNumerically("<=", replicaFailureRequeue))
+				cond := replicasCondition(cci)
+				Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				Expect(cond.Message).To(ContainSubstring("invalid secretReplicaNamespaceSelector"))
+			})
+
+			It("still deletes unlisted copies, but keeps selected ones, while namespaces cannot be listed", func() {
+				createLabeledNamespace("sel-nolist", "sel-nolist")
+				certPEM, keyPEM, _ := genCert("sel-nolist.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-nolist-src", certPEM, keyPEM)
+				cci := createIdentity("sel-nolist", "sel-nolist-src", ezcav1.CloudPublic, false)
+				setReplicas(cci, ezcav1.SecretReplica{Namespace: "sel-nolist", Name: "listed"})
+				setSelector(cci, "sel-nolist", replicaName)
+				reconcileIdentity(cci)
+
+				setReplicas(cci)
+				reconciler.Client = namespaceListFailingClient{Client: k8sClient}
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-nolist", "listed")).To(BeFalse())
+				Expect(secretExists("sel-nolist", replicaName)).To(BeTrue())
+				Expect(cci.Status.SecretReplicas).To(ConsistOf(
+					ezcav1.SecretReplicaStatus{Namespace: "sel-nolist", Name: replicaName, UID: getSecret("sel-nolist", replicaName).UID}))
+				Expect(replicasCondition(cci).Message).To(ContainSubstring("failed to list namespaces"))
+			})
+
+			It("deletes the copy in a terminating namespace and does not try to recreate it", func() {
+				createLabeledNamespace("sel-term", "sel-term")
+				certPEM, keyPEM, _ := genCert("sel-term.ezca.io", now.Add(-10*day), now.Add(90*day))
+				createSecret("sel-term-src", certPEM, keyPEM)
+				cci := createIdentity("sel-term", "sel-term-src", ezcav1.CloudPublic, false)
+				setSelector(cci, "sel-term", replicaName)
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-term", replicaName)).To(BeTrue())
+
+				// envtest runs no namespace controller, so the namespace stays
+				// terminating, and the API server refuses new Secrets in it.
+				var ns corev1.Namespace
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sel-term"}, &ns)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, &ns)).To(Succeed())
+				reconcileIdentity(cci)
+				Expect(secretExists("sel-term", replicaName)).To(BeFalse())
+				Expect(cci.Status.SecretReplicas).To(BeEmpty())
+				Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeSecretReplicasSynced)).To(BeTrue())
+			})
 		})
 
 		It("maps an unmarked Secret at a listed copy's name to the identity listing it", func() {

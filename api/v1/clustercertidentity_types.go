@@ -241,6 +241,7 @@ type CertIdentitySpecBase struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || has(self.appID)",message="additionalApps requires the Entra app fields (tenantID, appID, appObjectID)"
 // +kubebuilder:validation:XValidation:rule="!has(self.additionalApps) || !has(self.appObjectID) || self.additionalApps.all(a, a.appObjectID != self.appObjectID)",message="additionalApps must not repeat the primary appObjectID"
 // +kubebuilder:validation:XValidation:rule="!has(self.secretReplicas) || !has(self.certSecretNamespace) || self.secretReplicas.all(r, r.namespace != self.certSecretNamespace || r.name != self.certSecretName)",message="secretReplicas must not name the certificate Secret itself"
+// +kubebuilder:validation:XValidation:rule="has(self.secretReplicaNamespaceSelector) == has(self.secretReplicaName)",message="secretReplicaNamespaceSelector and secretReplicaName must be set together"
 type ClusterCertIdentitySpec struct {
 	CertIdentitySpecBase `json:",inline"`
 
@@ -257,7 +258,7 @@ type ClusterCertIdentitySpec struct {
 	// reference lets the referencing ManagedCredential issue certificates as
 	// this identity's Entra app; this allowlist bounds which namespaces may do
 	// so. When empty, no ManagedCredential may reference this identity. It does
-	// not govern secretReplicas.
+	// not govern secretReplicas or secretReplicaNamespaceSelector.
 	// +optional
 	// +kubebuilder:validation:items:MinLength=1
 	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
@@ -287,6 +288,83 @@ type ClusterCertIdentitySpec struct {
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=200
 	SecretReplicas []SecretReplica `json:"secretReplicas,omitempty"`
+
+	// secretReplicaNamespaceSelector selects namespaces that each receive a
+	// copy of the certificate Secret named secretReplicaName, in addition to
+	// the copies listed in secretReplicas. A namespace opts in by carrying
+	// the selected labels, so the labels on the namespaces are the list, and
+	// a namespace created or labeled later receives its copy without a change
+	// to this identity. A copy is kept exactly like one listed in
+	// secretReplicas: it is deleted once its namespace stops matching, and
+	// deleting the namespace deletes the copy with it. A terminating
+	// namespace is not selected. In the certificate Secret's own namespace,
+	// a copy that would be the certificate Secret itself is skipped. As with
+	// secretReplicas, deleting the ClusterCertIdentity leaves every copy in
+	// place, in every namespace it selected; clear this selector and let the
+	// copies be deleted before deleting the identity to remove them.
+	//
+	// Anyone who can label a namespace to match can obtain the identity's
+	// private key, so choose labels only trusted parties may set. For the
+	// same reason the selector has the shape of a label selector but accepts
+	// only requirements a namespace meets by carrying a label, never by
+	// lacking one, and it must not be empty. It must be set together with
+	// secretReplicaName.
+	// +optional
+	SecretReplicaNamespaceSelector *SecretReplicaNamespaceSelector `json:"secretReplicaNamespaceSelector,omitempty"`
+
+	// secretReplicaName is the name of the copy written into each namespace
+	// secretReplicaNamespaceSelector selects. It must be set together with
+	// secretReplicaNamespaceSelector.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	SecretReplicaName string `json:"secretReplicaName,omitempty"`
+}
+
+// SecretReplicaNamespaceSelector selects the namespaces that receive a copy of
+// a ClusterCertIdentity's certificate Secret
+// (spec.secretReplicaNamespaceSelector). A namespace is selected when it meets
+// every matchLabels entry and every matchExpressions requirement.
+// +kubebuilder:validation:XValidation:rule="(has(self.matchLabels) && size(self.matchLabels) > 0) || (has(self.matchExpressions) && size(self.matchExpressions) > 0)",message="secretReplicaNamespaceSelector must not be empty; an empty selector would copy the private key into every namespace"
+type SecretReplicaNamespaceSelector struct {
+	// matchLabels selects namespaces carrying each of these labels with the
+	// given value.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=20
+	MatchLabels map[string]string `json:"matchLabels,omitempty"`
+
+	// matchExpressions are further requirements on namespace labels.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=20
+	MatchExpressions []NamespaceSelectorRequirement `json:"matchExpressions,omitempty"`
+}
+
+// NamespaceSelectorRequirement is one requirement on a namespace label
+// (spec.secretReplicaNamespaceSelector.matchExpressions).
+// +kubebuilder:validation:XValidation:rule="self.operator == 'In' ? (has(self.values) && size(self.values) > 0) : (!has(self.values) || size(self.values) == 0)",message="values must be non-empty for operator In and empty for operator Exists"
+type NamespaceSelectorRequirement struct {
+	// key is the label key the requirement applies to.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=317
+	Key string `json:"key"`
+
+	// operator is In, met when the namespace carries the label with one of
+	// values, or Exists, met when it carries the label with any value. NotIn
+	// and DoesNotExist are not accepted: they would select a namespace for
+	// lacking a label, which anyone able to create a namespace can arrange.
+	// +required
+	// +kubebuilder:validation:Enum=In;Exists
+	Operator metav1.LabelSelectorOperator `json:"operator"`
+
+	// values are the label values accepted by operator In.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=50
+	// +kubebuilder:validation:items:MaxLength=63
+	Values []string `json:"values,omitempty"`
 }
 
 // SecretReplica names one Secret kept as a copy of a ClusterCertIdentity's
@@ -412,7 +490,8 @@ type ClusterCertIdentityStatus struct {
 	CertIdentityStatusBase `json:",inline"`
 
 	// secretReplicas are the copies of the certificate Secret the controller
-	// wrote for spec.secretReplicas, by UID. Only a Secret recorded here is
+	// wrote for spec.secretReplicas and spec.secretReplicaNamespaceSelector,
+	// by UID. Only a Secret recorded here is
 	// ever deleted, and only while it still has the recorded UID.
 	// +listType=map
 	// +listMapKey=namespace
