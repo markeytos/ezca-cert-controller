@@ -24,9 +24,12 @@ import (
 
 	"github.com/microsoft/ApplicationInsights-Go/appinsights"
 	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ezcav1 "github.com/markeytos/ezca-cert-controller/api/v1"
 	"github.com/markeytos/ezca-cert-controller/internal/pki"
@@ -110,6 +113,87 @@ func (c *capturingClient) errorMessages() []string {
 		}
 	}
 	return msgs
+}
+
+func TestRegistrationRetries(t *testing.T) {
+	for name, v := range map[string]struct {
+		annotations map[string]string
+		want        int
+	}{
+		"no annotation":  {nil, 0},
+		"a count":        {map[string]string{registrationRetriesAnnotation: "2"}, 2},
+		"not a number":   {map[string]string{registrationRetriesAnnotation: "two"}, maxRegistrationRetries},
+		"a negative one": {map[string]string{registrationRetriesAnnotation: "-1"}, maxRegistrationRetries},
+	} {
+		t.Run(name, func(t *testing.T) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Annotations: v.annotations}}
+			if got := registrationRetries(secret); got != v.want {
+				t.Errorf("registrationRetries() = %d, want %d", got, v.want)
+			}
+		})
+	}
+}
+
+func TestHandlePropagationTimeoutOnALostKey(t *testing.T) {
+	keyNotFound := errors.New("AADSTS700027: key not found")
+	stagedSecret := func(retries string) *corev1.Secret {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "identity-cert", Namespace: "ezca"},
+			Data: map[string][]byte{
+				tlsCertKey: []byte("active"), tlsKeyKey: []byte("active key"),
+				tlsCertPendingKey: []byte("staged"), tlsKeyPendingKey: []byte("staged key"),
+			},
+		}
+		if retries != "" {
+			secret.Annotations = map[string]string{registrationRetriesAnnotation: retries}
+		}
+		return secret
+	}
+
+	for name, v := range map[string]struct {
+		retries          string
+		wantStaged       bool
+		wantRetries      string
+		wantTrackedError string
+	}{
+		"a retry left drops the staged certificate and counts the retry on the Secret": {
+			"2", false, "3", "Renewed certificate never reached the app registration; renewing again with a new key",
+		},
+		"no retry left keeps the staged certificate for an administrator": {
+			"3", true, "3", "Renewed certificate has not propagated in Entra ID",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			secret := stagedSecret(v.retries)
+			kube := clientfake.NewClientBuilder().WithObjects(secret).Build()
+			r := &CertIdentityReconciler{ReconcilerBase: ReconcilerBase{Client: kube}}
+			identity := &ezcav1.CertIdentity{}
+			fake := &capturingClient{}
+
+			if _, err := handlePropagationTimeout(ctx, r, identity, secret, "staged-thumbprint", "app-id", keyNotFound, true, time.Minute, telemetry.NewWithClient(fake)); err != nil {
+				t.Fatal(err)
+			}
+
+			var stored corev1.Secret
+			if err := kube.Get(ctx, types.NamespacedName{Name: "identity-cert", Namespace: "ezca"}, &stored); err != nil {
+				t.Fatal(err)
+			}
+			if _, staged := stored.Data[tlsCertPendingKey]; staged != v.wantStaged {
+				t.Errorf("Secret holds a staged certificate: %v, want %v", staged, v.wantStaged)
+			}
+			if got := stored.Annotations[registrationRetriesAnnotation]; got != v.wantRetries {
+				t.Errorf("retries annotation = %q, want %q", got, v.wantRetries)
+			}
+			if got := fake.errorMessages(); len(got) != 1 || got[0] != v.wantTrackedError {
+				t.Errorf("reported %q, want %q", got, v.wantTrackedError)
+			}
+			degraded := meta.IsStatusConditionTrue(identity.Status.Conditions, typeDegradedCertIdentity)
+			if degraded != v.wantStaged {
+				t.Errorf("Degraded = %v, want %v", degraded, v.wantStaged)
+			}
+		})
+	}
 }
 
 func TestExpiryWarningTime(t *testing.T) {

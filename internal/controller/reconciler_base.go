@@ -183,8 +183,9 @@ type PropagationTiming struct {
 	// spread across it.
 	Grace time.Duration
 	// Timeout is how long after adding a key the certificate may still fail
-	// to authenticate before the identity reports Degraded. It must exceed
-	// Grace.
+	// to authenticate before the identity reports Degraded, or, while the app
+	// reports the key as not found, renews again with a new key. It must
+	// exceed Grace.
 	Timeout time.Duration
 }
 

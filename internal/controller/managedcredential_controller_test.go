@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -306,6 +307,31 @@ var _ = Describe("ManagedCredential Controller", func() {
 		Expect(mc.Status.NotAfter).NotTo(BeNil())
 	})
 
+	It("starts the renewal retries over when it issues into a Secret that counted them", func() {
+		createParent("mcp-retried", "mcp-retried-sec")
+		_, _, issued := genCertSANs("retried.ezca.io", []string{"retried.ezca.io"}, now, now.Add(90*24*time.Hour))
+		issuerClient.chain = []*x509.Certificate{issued}
+		retriedSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "mc-retried-sec",
+				Namespace:   namespace,
+				Annotations: map[string]string{registrationRetriesAnnotation: strconv.Itoa(maxRegistrationRetries)},
+			},
+			Type: corev1.SecretTypeTLS,
+			Data: map[string][]byte{tlsCertKey: {}, tlsKeyKey: {}},
+		}
+		Expect(k8sClient.Create(ctx, retriedSecret)).To(Succeed())
+
+		mc := newManagedCredential("mc-retried", "mc-retried-sec", "mcp-retried", "CN=retried.ezca.io", []string{"retried.ezca.io"})
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		reconcileMC("mc-retried")
+
+		Expect(issuerClient.called).To(BeTrue())
+		Expect(secretLeaf("mc-retried-sec").Equal(issued)).To(BeTrue())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-retried-sec"}, retriedSecret)).To(Succeed())
+		Expect(retriedSecret.Annotations).NotTo(HaveKey(registrationRetriesAnnotation))
+	})
+
 	It("bootstraps from a namespaced CertIdentity in the same namespace", func() {
 		createParentCertIdentity("ci-parent", "ci-parent-sec")
 		_, _, issued := genCertSANs("cisub.ezca.io", []string{"cisub.ezca.io"}, now, now.Add(90*24*time.Hour))
@@ -551,6 +577,56 @@ var _ = Describe("ManagedCredential Controller", func() {
 		chain, _, err := parseSecret(&secret)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(chain[0].NotAfter).To(BeTemporally("==", renewed.NotAfter))
+	})
+
+	It("renews again with a new key when the app still reports a staged key as not found by the propagation timeout", func() {
+		const cn = "mclost.ezca.io"
+		certPEM, keyPEM, activeCert := genCertSANs(cn, []string{cn}, now.Add(-90*24*time.Hour), now.Add(10*24*time.Hour))
+		createSecret("mc-lost-sec", certPEM, keyPEM)
+		_, _, lostCert := genCertSANs(cn, []string{cn}, now, now.Add(365*24*time.Hour))
+		ezcaClient.newChain = []*x509.Certificate{lostCert}
+
+		mc := newManagedCredential("mc-lost", "mc-lost-sec", "mcp-none", "CN="+cn, []string{cn})
+		tnt, app, obj := ownTntID, ownAppID, "lost-obj"
+		mc.Spec.TenantID = &tnt
+		mc.Spec.AppID = &app
+		mc.Spec.AppObjectID = &obj
+		Expect(k8sClient.Create(ctx, mc)).To(Succeed())
+		name := types.NamespacedName{Namespace: namespace, Name: "mc-lost"}
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		mc.Status.ManagedKeyCredentials = []ezcav1.ManagedKeyCredential{{
+			Thumbprint: pki.Thumbprint(activeCert),
+			KeyID:      ownKeyID,
+			NotAfter:   metav1.Time{Time: activeCert.NotAfter},
+		}}
+		Expect(k8sClient.Status().Update(ctx, mc)).To(Succeed())
+
+		reconcileMC("mc-lost")
+		Expect(entraClient.added).To(Equal([][]byte{lostCert.Raw}))
+
+		// Past the timeout the app still lacks the key: the staged certificate
+		// is dropped while the active one keeps serving.
+		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
+		clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+		reconcileMC("mc-lost")
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(mc.Status.PendingThumbprint).To(BeEmpty())
+		var lostSecret corev1.Secret
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "mc-lost-sec"}, &lostSecret)).To(Succeed())
+		Expect(lostSecret.Annotations).To(HaveKeyWithValue(registrationRetriesAnnotation, "1"))
+		Expect(secretLeaf("mc-lost-sec").Equal(activeCert)).To(BeTrue())
+
+		// The next pass renews, not re-issues, with a new key.
+		_, _, renewedCert := genCertSANs(cn, []string{cn}, clockNow, clockNow.Add(365*24*time.Hour))
+		ezcaClient.newChain = []*x509.Certificate{renewedCert}
+		ezcaClient.called = false
+		clockNow = clockNow.Add(time.Second)
+		reconcileMC("mc-lost")
+		Expect(ezcaClient.called).To(BeTrue())
+		Expect(issuerClient.called).To(BeFalse())
+		Expect(entraClient.added).To(Equal([][]byte{lostCert.Raw, renewedCert.Raw}))
+		Expect(k8sClient.Get(ctx, name, mc)).To(Succeed())
+		Expect(mc.Status.PendingThumbprint).To(Equal(pki.Thumbprint(renewedCert)))
 	})
 
 	It("renews an externally provisioned certificate with no identityRef", func() {

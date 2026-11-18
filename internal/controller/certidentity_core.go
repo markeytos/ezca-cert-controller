@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +71,17 @@ const (
 	// certificate until the staged one can authenticate.
 	tlsCertPendingKey = "tls.crt.pending"
 	tlsKeyPendingKey  = "tls.key.pending"
+	// registrationRetriesAnnotation counts, on the certificate Secret, the
+	// renewals of its active certificate that were dropped and renewed again
+	// because an app registration still reported their key as not found (see
+	// abandonLostRegistration). It is written in the same update that drops
+	// the staged certificate. A status field would be overwritten by the
+	// reconcile that update triggers, which can still read the identity's
+	// status from before the drop, whereas a stale copy of the Secret fails to
+	// update. The controller removes it whenever it replaces the active
+	// certificate, and a Secret bootstrapped again starts without it; an
+	// active certificate replaced by hand keeps it until it is removed too.
+	registrationRetriesAnnotation = "ezca.keytos.io/registration-retries"
 
 	// maxRequeueAfter bounds how long the controller waits before re-checking a
 	// certificate, so managed-credential cleanup also runs at least this often.
@@ -88,6 +100,13 @@ const (
 	// promoted. One successful token only shows that one token-endpoint
 	// replica holds the new key.
 	propagationVerifications = 3
+	// maxRegistrationRetries is how many times a renewal whose key never
+	// reached an app registration is dropped and renewed again with a new key
+	// before the identity stays Degraded for an administrator. The bound keeps
+	// a key that can never authenticate (for instance under a wrong
+	// appObjectID) from having EZCA issue a certificate, and the app gain a
+	// key, every propagation timeout.
+	maxRegistrationRetries = 3
 	// expiryWarningInterval is how often an identity whose certificate is close
 	// to expiry (see expiryWarningTime) is reported again while it stays that
 	// way.
@@ -103,7 +122,8 @@ const (
 	DefaultPropagationGrace = time.Hour
 	// DefaultPropagationTimeout is the default for how long propagation may take
 	// before the controller surfaces a Degraded condition (it keeps retrying
-	// afterwards).
+	// afterwards), and before a key the app still reports as not found is
+	// treated as lost and the certificate renewed again.
 	DefaultPropagationTimeout = 2 * time.Hour
 )
 
@@ -482,14 +502,11 @@ func promoteIfReady(ctx context.Context, d reconcilerDeps, obj certIdentity, sec
 			continue
 		}
 		// Not usable yet: start the count over. Keep checking until the
-		// propagation timeout; beyond it, fail loudly (checks continue, so the
-		// certificate can still self-heal).
+		// propagation timeout; past it, either renew again or report Degraded.
 		status.PendingVerifications = 0
 		status.PendingLastVerified = &metav1.Time{Time: now}
 		if now.Sub(anchor) > timing.Timeout {
-			tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityPropsForApp(obj, appID))
-			setDegraded(obj, "PropagationTimeout", fmt.Sprintf("Renewed certificate not usable by app %s after %s: %v", appID, timing.Timeout, verr))
-			return ctrl.Result{RequeueAfter: interval}, nil
+			return handlePropagationTimeout(ctx, d, obj, secret, pendingThumbprint, appID, verr, activeValid, interval, tel)
 		}
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type:    typeProgressingCertIdentity,
@@ -992,11 +1009,12 @@ func conditionError(err error) string {
 }
 
 // writeActiveSecret rewrites the active tls.crt/tls.key with the given chain
-// and key.
+// and key, starting the new active certificate's renewal retries over.
 func writeActiveSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Secret, chain []*x509.Certificate, key *rsa.PrivateKey) error {
 	if err := setTLSData(secret, tlsCertKey, tlsKeyKey, chain, key); err != nil {
 		return err
 	}
+	delete(secret.Annotations, registrationRetriesAnnotation)
 	return d.kubeClient().Update(ctx, secret)
 }
 
@@ -1012,21 +1030,104 @@ func writePendingSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Se
 // discardPendingCert removes the staged certificate from the Secret and clears
 // the pending status fields, so the next reconcile falls back to the active
 // certificate. Used when the staged certificate can never be promoted (its data
-// is unusable, or it is outside its validity window).
+// is unusable, it is outside its validity window, or its key never reached an
+// app registration).
 func discardPendingCert(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret) error {
 	delete(secret.Data, tlsCertPendingKey)
 	delete(secret.Data, tlsKeyPendingKey)
+	// The pending status is cleared only once the Secret no longer holds the
+	// staged certificate: clearing it first would have the next pass re-stage
+	// that certificate as if it had just been added, restarting its
+	// propagation windows.
+	if err := d.kubeClient().Update(ctx, secret); err != nil {
+		return err
+	}
 	clearPending(obj.StatusBase())
-	return d.kubeClient().Update(ctx, secret)
+	return nil
 }
 
-// promoteSecret moves the staged certificate into the active tls.crt/tls.key
-// and removes the pending keys.
+// handlePropagationTimeout handles a staged certificate that still fails to
+// authenticate as appID a propagation timeout after its key was added. While
+// the active certificate is valid and the app reports the key as not found,
+// the key is treated as lost and the certificate renewed again, up to
+// maxRegistrationRetries times. Otherwise the identity reports Degraded and
+// keeps checking, so the certificate can still self-heal.
+func handlePropagationTimeout(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, pendingThumbprint, appID string, verr error, activeValid bool, interval time.Duration, tel *telemetry.Telemetry) (ctrl.Result, error) {
+	retries := registrationRetries(secret)
+	keyNotFound := isCredentialPropagating(verr)
+	if activeValid && keyNotFound && retries < maxRegistrationRetries {
+		return abandonLostRegistration(ctx, d, obj, secret, pendingThumbprint, appID, verr, retries+1, tel)
+	}
+	message := fmt.Sprintf("Renewed certificate not usable by app %s after %s: %v", appID, d.propagation().Timeout, verr)
+	if activeValid && keyNotFound {
+		message += fmt.Sprintf(". It was already renewed again with a new key %d times; to renew it again, remove %s, %s and the %s annotation from Secret %s/%s",
+			retries, tlsCertPendingKey, tlsKeyPendingKey, registrationRetriesAnnotation, secret.Namespace, secret.Name)
+	}
+	tel.TrackError(verr, "Renewed certificate has not propagated in Entra ID", identityPropsForApp(obj, appID))
+	setDegraded(obj, "PropagationTimeout", message)
+	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// abandonLostRegistration drops a staged certificate that an app still
+// reports as not found (AADSTS700027) a propagation timeout after addKey
+// returned its keyId, so the next pass renews with a new key. Graph can accept
+// a credential write and then lose it to a concurrent write to the same app,
+// and with the key recorded nothing would add it again: the identity would
+// wait until its active certificate expired, when no certificate the app
+// trusts is left to sign the addKey proof. The key's record stays in
+// managedKeyCredentials, so a key that did land is still removed once the
+// certificate expires. The active certificate keeps serving, so the retry is
+// reported as progress rather than Degraded, with an error tracked for
+// alerting.
+func abandonLostRegistration(ctx context.Context, d reconcilerDeps, obj certIdentity, secret *corev1.Secret, pendingThumbprint, appID string, verr error, retryNumber int, tel *telemetry.Telemetry) (ctrl.Result, error) {
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[registrationRetriesAnnotation] = strconv.Itoa(retryNumber)
+	if err := discardPendingCert(ctx, d, obj, secret); err != nil {
+		return ctrl.Result{}, err
+	}
+	tel.TrackError(verr, "Renewed certificate never reached the app registration; renewing again with a new key", identityPropsForApp(obj, appID))
+	logf.FromContext(ctx).Info("Discarding staged certificate the app registration does not hold; renewing again with a new key",
+		"thumbprint", pendingThumbprint, "appID", appID, "retry", retryNumber, "maxRetries", maxRegistrationRetries)
+	recoverFromDegraded(obj, true)
+	status := obj.StatusBase()
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:   typeProgressingCertIdentity,
+		Status: metav1.ConditionTrue,
+		Reason: "RegistrationLost",
+		Message: fmt.Sprintf(
+			"Renewed certificate %s still could not authenticate as app %s %s after it was added (%v); renewing again with a new key (retry %d of %d)",
+			pendingThumbprint, appID, d.propagation().Timeout, verr, retryNumber, maxRegistrationRetries),
+	})
+	return ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+// registrationRetries returns how many renewals of the Secret's active
+// certificate were dropped and renewed again (registrationRetriesAnnotation).
+// A value the controller could not have written counts as every retry used,
+// so a damaged annotation never lifts the bound.
+func registrationRetries(secret *corev1.Secret) int {
+	value, ok := secret.Annotations[registrationRetriesAnnotation]
+	if !ok {
+		return 0
+	}
+	retries, err := strconv.Atoi(value)
+	if err != nil || retries < 0 {
+		return maxRegistrationRetries
+	}
+	return retries
+}
+
+// promoteSecret moves the staged certificate into the active tls.crt/tls.key,
+// removes the pending keys, and starts the new active certificate's renewal
+// retries over.
 func promoteSecret(ctx context.Context, d reconcilerDeps, secret *corev1.Secret) error {
 	secret.Data[tlsCertKey] = secret.Data[tlsCertPendingKey]
 	secret.Data[tlsKeyKey] = secret.Data[tlsKeyPendingKey]
 	delete(secret.Data, tlsCertPendingKey)
 	delete(secret.Data, tlsKeyPendingKey)
+	delete(secret.Annotations, registrationRetriesAnnotation)
 	return d.kubeClient().Update(ctx, secret)
 }
 
