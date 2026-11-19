@@ -137,7 +137,9 @@ controller:
       pullPolicy: IfNotPresent
 
     ## Tune how long a renewed certificate is given to propagate across Entra ID
-    ## before it is promoted into the Secret (defaults shown), e.g.:
+    ## before it is promoted into the Secret, and how long an app may report its
+    ## key as not found before it is renewed again with a new key (defaults
+    ## shown), e.g.:
     ##   - --propagation-grace=1h
     ##   - --propagation-timeout=2h
     args:

@@ -88,7 +88,8 @@ func main() {
 			"The checks that the certificate authenticates are spread across it.")
 	flag.DurationVar(&propagation.Timeout, "propagation-timeout", controller.DefaultPropagationTimeout,
 		"How long a renewed certificate may fail to authenticate after being added to an app registration "+
-			"before the identity reports Degraded. Must exceed --propagation-grace.")
+			"before the identity reports Degraded, or, while the app reports its key as not found, is renewed "+
+			"again with a new key. Must exceed --propagation-grace.")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 

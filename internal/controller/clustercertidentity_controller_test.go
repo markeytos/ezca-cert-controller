@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"time"
 
 	randv2 "math/rand/v2"
@@ -615,9 +616,11 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		// Stage the renewed certificate.
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
+		ezcaClient.called = false
 
-		// Still not authenticating well past the propagation timeout.
-		entraClient.verifyErr = errors.New("AADSTS700027: key not found")
+		// Still not authenticating well past the propagation timeout, with an
+		// error that does not say the app lacks the key.
+		entraClient.verifyErr = errors.New("dial tcp: lookup login.microsoftonline.com: i/o timeout")
 		clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
 		res, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
@@ -626,10 +629,15 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeTrue())
 		cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
 		Expect(cond.Reason).To(Equal("PropagationTimeout"))
+		// No retry was spent, so there are none to restart.
+		Expect(cond.Message).NotTo(ContainSubstring(registrationRetriesAnnotation))
 
-		// It keeps checking (so it can still self-heal), and the old certificate
-		// keeps serving.
+		// It keeps checking (so it can still self-heal), keeps the staged
+		// certificate rather than renewing again, and the old certificate keeps
+		// serving.
 		Expect(res.RequeueAfter).To(Equal(verifyInterval))
+		Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(parsedNew)))
+		Expect(ezcaClient.called).To(BeFalse())
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
 
 		// The next check passes: Degraded clears right away rather than lingering
@@ -643,6 +651,268 @@ var _ = Describe("ClusterCertIdentity Controller", func() {
 		Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
 		Expect(cci.Status.PendingVerifications).To(Equal(int32(1)))
 		Expect(activeLeaf().Equal(oldCert)).To(BeTrue())
+	})
+
+	Context("when the app still reports a staged key as not found by the propagation timeout", func() {
+		keyNotFound := errors.New("AADSTS700027: key not found")
+
+		// secretLeaf returns the certificate the Secret holds under dataKey, or
+		// nil when it holds none.
+		secretLeaf := func(secretName, dataKey string) *x509.Certificate {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, &s)).To(Succeed())
+			if len(s.Data[dataKey]) == 0 {
+				return nil
+			}
+			chain, err := pki.ParseCertChainPEM(s.Data[dataKey])
+			Expect(err).NotTo(HaveOccurred())
+			return chain[0]
+		}
+		// secretRetries returns the renewal retries the Secret records.
+		secretRetries := func(secretName string) string {
+			var s corev1.Secret
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, &s)).To(Succeed())
+			return s.Annotations[registrationRetriesAnnotation]
+		}
+
+		It("drops the staged certificate and renews again with a new key", func() {
+			certPEM, keyPEM, oldCert := genCert("lostkey.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("lostkey-secret", certPEM, keyPEM)
+			cci := createIdentity("lostkey-identity", "lostkey-secret", ezcav1.CloudPublic, true)
+			_, _, lostCert := genCert("lostkey.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{lostCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+
+			// Stage the renewed certificate; Graph returns a keyId for it.
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entraClient.added).To(HaveLen(1))
+
+			// Past the timeout the app still lacks the key: the staged certificate
+			// is dropped, and its record kept so a key that did land is still
+			// removed when it expires.
+			entraClient.verifyErr = keyNotFound
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			res, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(time.Second))
+			Expect(secretLeaf("lostkey-secret", tlsCertPendingKey)).To(BeNil())
+			Expect(secretLeaf("lostkey-secret", tlsCertKey).Equal(oldCert)).To(BeTrue())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.PendingThumbprint).To(BeEmpty())
+			Expect(secretRetries("lostkey-secret")).To(Equal("1"))
+			Expect(managedCredentialFor(&cci.Status.CertIdentityStatusBase, pki.Thumbprint(lostCert))).NotTo(BeNil())
+			// The old certificate is still serving, so the retry is progress, not
+			// Degraded, which would fail a deploy waiting on the identity.
+			cond := meta.FindStatusCondition(cci.Status.Conditions, typeProgressingCertIdentity)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("RegistrationLost"))
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+
+			// The next pass renews with a new key and adds that one to the app.
+			_, _, renewedCert := genCert("lostkey.ezca.io", clockNow, clockNow.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{renewedCert}
+			ezcaClient.called = false
+			entraClient.verifyErr = nil
+			addedAt := clockNow.Add(time.Second)
+			clockNow = addedAt
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ezcaClient.called).To(BeTrue())
+			Expect(entraClient.added).To(HaveLen(2))
+			Expect(entraClient.added[1]).To(Equal(renewedCert.Raw))
+			Expect(secretLeaf("lostkey-secret", tlsCertPendingKey).Equal(renewedCert)).To(BeTrue())
+
+			// Once its key propagates it is promoted, which starts the retries over
+			// for the next rotation.
+			settle(req, addedAt)
+			Expect(secretLeaf("lostkey-secret", tlsCertKey).Equal(renewedCert)).To(BeTrue())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeAvailableCertIdentity)).To(BeTrue())
+			Expect(secretRetries("lostkey-secret")).To(BeEmpty())
+			Expect(managedCredentialFor(&cci.Status.CertIdentityStatusBase, pki.Thumbprint(lostCert))).NotTo(BeNil())
+		})
+
+		It("keeps the staged certificate when removing it from the Secret fails", func() {
+			certPEM, keyPEM, _ := genCert("discardfail.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("discardfail-secret", certPEM, keyPEM)
+			cci := createIdentity("discardfail-identity", "discardfail-secret", ezcav1.CloudPublic, true)
+			_, _, stagedCert := genCert("discardfail.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{stagedCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			failing := true
+			reconciler.Client = secretWriteFailingClient{Client: k8sClient, fail: &failing}
+			entraClient.verifyErr = keyNotFound
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).To(HaveOccurred())
+
+			// The status still tracks the staged certificate from when it was
+			// added, so the next pass retries the drop instead of waiting out
+			// another timeout, and no retry was spent.
+			Expect(secretLeaf("discardfail-secret", tlsCertPendingKey).Equal(stagedCert)).To(BeTrue())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(cci.Status.PendingThumbprint).To(Equal(pki.Thumbprint(stagedCert)))
+			Expect(cci.Status.PendingSince.Time).To(BeTemporally("==", now))
+			Expect(secretRetries("discardfail-secret")).To(BeEmpty())
+
+			failing = false
+			clockNow = clockNow.Add(verifyInterval)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretLeaf("discardfail-secret", tlsCertPendingKey)).To(BeNil())
+			Expect(secretRetries("discardfail-secret")).To(Equal("1"))
+		})
+
+		It("clears an earlier PropagationTimeout when it renews again", func() {
+			certPEM, keyPEM, _ := genCert("degradedlost.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("degradedlost-secret", certPEM, keyPEM)
+			cci := createIdentity("degradedlost-identity", "degradedlost-secret", ezcav1.CloudPublic, true)
+			_, _, stagedCert := genCert("degradedlost.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{stagedCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The first check past the timeout fails for another reason.
+			entraClient.verifyErr = errors.New("dial tcp: lookup login.microsoftonline.com: i/o timeout")
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity).Reason).To(Equal("PropagationTimeout"))
+
+			// The next one reports the key as not found: renewing again is
+			// progress, so the Degraded that would fail a deploy clears.
+			entraClient.verifyErr = keyNotFound
+			clockNow = clockNow.Add(verifyInterval)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretLeaf("degradedlost-secret", tlsCertPendingKey)).To(BeNil())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(cci.Status.Conditions, typeDegradedCertIdentity)).To(BeFalse())
+			Expect(meta.FindStatusCondition(cci.Status.Conditions, typeProgressingCertIdentity).Reason).To(Equal("RegistrationLost"))
+		})
+
+		It("renews again when an additional app still reports the staged key as not found", func() {
+			const extraAppID, extraObjectID = "44444444-4444-4444-4444-444444444444", "obj-4"
+			extraApp := &fakeEntra{}
+			reconciler.NewEntraClient = func(_, appID string, _ entra.Cloud, _ *x509.Certificate, _ *rsa.PrivateKey) (entraManager, error) {
+				if appID == extraAppID {
+					return extraApp, nil
+				}
+				return entraClient, nil
+			}
+			certPEM, keyPEM, _ := genCert("extralost.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("extralost-secret", certPEM, keyPEM)
+			cci := createIdentity("extralost-identity", "extralost-secret", ezcav1.CloudPublic, true)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cci.Spec.AdditionalApps = []ezcav1.AdditionalAppSpec{{AppID: extraAppID, AppObjectID: extraObjectID}}
+			Expect(k8sClient.Update(ctx, cci)).To(Succeed())
+			_, _, lostCert := genCert("extralost.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{lostCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extraApp.added).To(HaveLen(1))
+
+			// The primary app holds the key; the additional app lost it.
+			extraApp.verifyErr = keyNotFound
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretLeaf("extralost-secret", tlsCertPendingKey)).To(BeNil())
+
+			_, _, renewedCert := genCert("extralost.ezca.io", clockNow, clockNow.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{renewedCert}
+			clockNow = clockNow.Add(time.Second)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(extraApp.added).To(HaveLen(2))
+			Expect(extraApp.added[1]).To(Equal(renewedCert.Raw))
+			Expect(entraClient.added).To(HaveLen(2))
+		})
+
+		It("keeps the staged certificate once it has renewed again maxRegistrationRetries times", func() {
+			certPEM, keyPEM, _ := genCert("retries.ezca.io", now.Add(-90*day), now.Add(10*day))
+			createSecret("retries-secret", certPEM, keyPEM)
+			cci := createIdentity("retries-identity", "retries-secret", ezcav1.CloudPublic, true)
+			_, _, stagedCert := genCert("retries.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{stagedCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			entraClient.verifyErr = keyNotFound
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			statusBeforeRetries := cci.Status.DeepCopy()
+
+			for retry := 1; retry <= maxRegistrationRetries; retry++ {
+				clockNow = clockNow.Add(DefaultPropagationTimeout + time.Minute)
+				_, err = reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(secretLeaf("retries-secret", tlsCertPendingKey)).To(BeNil(), "retry %d must drop the staged certificate", retry)
+				Expect(secretRetries("retries-secret")).To(Equal(strconv.Itoa(retry)))
+
+				// The reconcile the dropped certificate's Secret update triggers can
+				// still read the identity's status from before the retry, and its
+				// status write must not undo the count.
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+				cci.Status = *statusBeforeRetries.DeepCopy()
+				Expect(k8sClient.Status().Update(ctx, cci)).To(Succeed())
+
+				_, _, stagedCert = genCert("retries.ezca.io", clockNow, clockNow.Add(100*day))
+				ezcaClient.newChain = []*x509.Certificate{stagedCert}
+				clockNow = clockNow.Add(time.Second)
+				_, err = reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(secretLeaf("retries-secret", tlsCertPendingKey).Equal(stagedCert)).To(BeTrue())
+			}
+			Expect(entraClient.added).To(HaveLen(1 + maxRegistrationRetries))
+
+			// The last renewal's key is also missing: no retry is left, so the
+			// staged certificate stays for an administrator and nothing is renewed.
+			ezcaClient.called = false
+			clockNow = clockNow.Add(DefaultPropagationTimeout + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretLeaf("retries-secret", tlsCertPendingKey).Equal(stagedCert)).To(BeTrue())
+			Expect(ezcaClient.called).To(BeFalse())
+			Expect(entraClient.added).To(HaveLen(1 + maxRegistrationRetries))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("PropagationTimeout"))
+			// It tells an administrator how to have it renewed again.
+			Expect(cond.Message).To(ContainSubstring(registrationRetriesAnnotation))
+		})
+
+		It("keeps the staged certificate once the active certificate has expired", func() {
+			certPEM, keyPEM, _ := genCert("expiredlost.ezca.io", now.Add(-91*day), now.Add(-time.Hour))
+			createSecret("expiredlost-secret", certPEM, keyPEM)
+			cci := createIdentity("expiredlost-identity", "expiredlost-secret", ezcav1.CloudPublic, true)
+			_, _, stagedCert := genCert("expiredlost.ezca.io", now, now.Add(100*day))
+			ezcaClient.newChain = []*x509.Certificate{stagedCert}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cci.Name}}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// No certificate the app trusts is left to sign an addKey proof for a
+			// new key, so dropping the staged one could only lose it.
+			ezcaClient.called = false
+			entraClient.verifyErr = keyNotFound
+			clockNow = now.Add(DefaultPropagationTimeout + time.Minute)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(secretLeaf("expiredlost-secret", tlsCertPendingKey).Equal(stagedCert)).To(BeTrue())
+			Expect(ezcaClient.called).To(BeFalse())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cci.Name}, cci)).To(Succeed())
+			cond := meta.FindStatusCondition(cci.Status.Conditions, typeDegradedCertIdentity)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("PropagationTimeout"))
+		})
 	})
 
 	It("promotes as soon as the staged certificate authenticates when the active one has expired", func() {
